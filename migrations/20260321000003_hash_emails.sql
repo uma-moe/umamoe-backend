@@ -1,0 +1,3 @@
+-- Email hashing backfill is performed by the application at startup (backfill_email_hashes).
+-- The HMAC key (JWT_SECRET) is not available in SQL, so the work is done in Rust.
+-- This migration is intentionally a no-op; it serves only as a version marker.

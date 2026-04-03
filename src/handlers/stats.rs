@@ -1,18 +1,16 @@
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Path, State},
     response::Json,
     routing::{get, post},
     Router,
 };
 use serde_json::{json, Value};
 use sqlx::Row;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use crate::errors::AppError;
 use crate::models::{
-    DailyStatsResponse, DailyVisitRequest, FriendlistReportResponse, RollingStats, StatsResponse,
-    TodayStats, TotalStats,
+    DailyVisitRequest, DataFreshness, FriendlistReportResponse, StatsResponse, TodayActivity,
 };
 use crate::AppState;
 
@@ -20,26 +18,17 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/daily-visit", post(track_daily_visit))
         .route("/", get(get_stats))
-        .route("/daily", get(get_daily_stats))
-        .route("/today", get(get_today_stats_endpoint))
         .route("/friendlist/:id", post(report_friendlist_full))
 }
 
 // New efficient daily visit tracking (only increments counter once per day per user)
 pub async fn track_daily_visit(
     State(state): State<AppState>,
-    Json(payload): Json<DailyVisitRequest>,
+    Json(_payload): Json<DailyVisitRequest>,
 ) -> Result<Json<Value>, AppError> {
-    // Parse the date
-    let target_date = match chrono::NaiveDate::parse_from_str(&payload.date, "%Y-%m-%d") {
-        Ok(date) => date,
-        Err(_) => {
-            return Ok(Json(json!({
-                "success": false,
-                "error": "Invalid date format"
-            })));
-        }
-    };
+    // Use server's current date instead of trusting client-provided date
+    // This prevents incorrect stats from clients with wrong system clocks
+    let target_date = chrono::Utc::now().date_naive();
 
     // Call the database function to increment the daily counter
     let result = sqlx::query_scalar::<_, i32>("SELECT increment_daily_visitor_count($1)")
@@ -65,28 +54,19 @@ pub async fn track_daily_visit(
 
 pub async fn get_stats(
     State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<StatsResponse>, AppError> {
-    let _days = params
-        .get("days")
-        .and_then(|d| d.parse::<i32>().ok())
-        .unwrap_or(30);
-
-    // Check cache first - cache for 1 hour
     let cache_key = "stats:main";
     if let Some(cached) = crate::cache::get::<StatsResponse>(cache_key) {
         return Ok(Json(cached));
     }
 
-    // Use materialized view for instant results (no counting needed!)
-    // This query returns in <1ms instead of 1+ seconds
-    let stats_row = sqlx::query(
+    let row = sqlx::query(
         r#"
-        SELECT 
-            COALESCE(trainer_count, 0) as total_accounts_tracked,
-            COALESCE(circles_count, 0) as total_circles_tracked,
-            COALESCE(team_stadium_count, 0) as total_characters,
-            COALESCE(unique_visitors_7_day, 0) as unique_visitors_7_day
+        SELECT
+            COALESCE(tasks_24h, 0)    AS tasks_24h,
+            COALESCE(accounts_24h, 0) AS accounts_24h,
+            COALESCE(accounts_7d, 0)  AS accounts_7d,
+            COALESCE(umas_tracked, 0) AS umas_tracked
         FROM stats_counts
         LIMIT 1
         "#,
@@ -94,74 +74,20 @@ pub async fn get_stats(
     .fetch_one(&state.db)
     .await?;
 
-    let unique_visitors_7_day = stats_row.get::<f64, _>("unique_visitors_7_day");
-    let total_accounts_tracked = stats_row.get::<i64, _>("total_accounts_tracked");
-    let total_circles_tracked = stats_row.get::<i64, _>("total_circles_tracked");
-    let total_characters = stats_row.get::<i64, _>("total_characters");
-
-    // Fixed values for everything else
-    let today_stats = TodayStats {
-        total_visitors: 0,
-        unique_visitors: 0,
-        inheritance_uploads: 0,
-        total_inheritance_records: 0,
-        total_support_card_records: 0,
-    };
-
-    let rolling_averages = RollingStats {
-        visitors_7_day: 0.0,
-        visitors_30_day: 0.0,
-        unique_visitors_7_day,
-        unique_visitors_30_day: 0.0,
-        uploads_7_day: 0.0,
-        uploads_30_day: 0.0,
-    };
-
-    let daily_data = vec![];
-
-    let total_stats = TotalStats {
-        total_records: 0,
-        inheritance_records: 0,
-        support_card_records: 0,
-        total_votes: 0,
-        total_visitors: 0,
-        total_accounts_tracked,
-        total_circles_tracked,
-        total_characters,
-    };
-
     let response = StatsResponse {
-        today: today_stats,
-        rolling_averages,
-        daily_data,
-        totals: total_stats,
+        today: TodayActivity {
+            tasks_24h: row.get::<i64, _>("tasks_24h"),
+        },
+        freshness: DataFreshness {
+            accounts_24h: row.get::<i64, _>("accounts_24h"),
+            accounts_7d: row.get::<i64, _>("accounts_7d"),
+            umas_tracked: row.get::<i64, _>("umas_tracked"),
+        },
     };
 
-    // Cache for 1 hour
-    let _ = crate::cache::set(cache_key, &response, std::time::Duration::from_secs(3600));
+    let _ = crate::cache::set(cache_key, &response, std::time::Duration::from_secs(300));
 
     Ok(Json(response))
-}
-
-pub async fn get_daily_stats(
-    State(_state): State<AppState>,
-    Query(_params): Query<HashMap<String, String>>,
-) -> Result<Json<Vec<DailyStatsResponse>>, AppError> {
-    // Return empty array for now
-    Ok(Json(vec![]))
-}
-
-pub async fn get_today_stats_endpoint(
-    State(_state): State<AppState>,
-) -> Result<Json<TodayStats>, AppError> {
-    // Return fixed values
-    Ok(Json(TodayStats {
-        total_visitors: 0,
-        unique_visitors: 0,
-        inheritance_uploads: 0,
-        total_inheritance_records: 0,
-        total_support_card_records: 0,
-    }))
 }
 
 pub async fn report_friendlist_full(

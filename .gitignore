@@ -5,3 +5,6 @@ Cargo.lock
 affinity_migration.sql
 data/affinity_definitions.json
 data/single_mode_wins_saddle.json
+affinity.py
+checker.js
+filter.py

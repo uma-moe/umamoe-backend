@@ -1,4 +1,4 @@
-use crate::models::common::deserialize_vec_string_from_query;
+use crate::models::common::{deserialize_vec_string_from_query, deserialize_vec_i32_from_query, option_naive_datetime_as_utc};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
@@ -23,12 +23,18 @@ pub struct UnifiedSearchParams {
     pub search_type: Option<String>, // "inheritance", "support_cards", or "all" (default)
 
     // Inheritance filtering
-    #[serde(default)]
-    pub main_parent_id: Option<i32>,
-    #[serde(default)]
-    pub parent_left_id: Option<i32>,
-    #[serde(default)]
-    pub parent_right_id: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub main_parent_id: Vec<i32>,
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub exclude_main_parent_id: Vec<i32>, // Excludes main parent IDs
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub parent_id: Vec<i32>, // Matches against both left and right parent positions
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub parent_left_id: Vec<i32>, // Matches left parent only
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub parent_right_id: Vec<i32>, // Matches right parent only
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub exclude_parent_id: Vec<i32>, // Excludes from both left and right parent positions
     #[serde(default)]
     pub parent_rank: Option<i32>,
     #[serde(default)]
@@ -128,6 +134,10 @@ pub struct UnifiedSearchParams {
     #[serde(default)]
     pub player_chara_id_2: Option<i32>, // Second character ID for dual-parent training (p2)
 
+    // Win saddle filtering
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub main_win_saddle: Vec<i32>,
+
     // Desired main character filter
     #[serde(default)]
     pub desired_main_chara_id: Option<i32>, // Filter inheritances where main parent is this character (p0 parent)
@@ -138,6 +148,7 @@ pub struct UnifiedAccountRecord {
     pub account_id: String,
     pub trainer_name: String,
     pub follower_num: Option<i32>,
+    #[serde(serialize_with = "option_naive_datetime_as_utc::serialize")]
     pub last_updated: Option<NaiveDateTime>,
     pub inheritance: Option<super::inheritance::Inheritance>,
     pub support_card: Option<super::support_cards::SupportCard>, // Single best support card, not array

@@ -36,6 +36,10 @@ tower_governor = "0.4"
 governor = "0.6"
 dashmap = "6.0"
 
+# Cryptography (email hashing)
+hmac = "0.12"
+hex = "0.4"
+
 # Environment
 dotenvy = "0.15"
 
@@ -43,3 +47,11 @@ dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["json"] }
 serde_qs = "0.15.0"
 url = "2.5.7"
+
+# Authentication
+jsonwebtoken = "9"
+oauth2 = "5"
+rand = "0.8"
+sha2 = "0.10"
+urlencoding = "2"
+async-trait = "0.1"

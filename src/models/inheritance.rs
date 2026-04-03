@@ -22,6 +22,51 @@ pub struct Inheritance {
     pub main_white_factors: Vec<i32>,
     pub main_white_count: i32,
     #[sqlx(default)]
+    #[serde(default)]
+    pub left_blue_factors: i32,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub left_pink_factors: i32,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub left_green_factors: i32,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub left_white_factors: Vec<i32>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub left_white_count: i32,
+
+    #[sqlx(default)]
+    #[serde(default)]
+    pub right_blue_factors: i32,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub right_pink_factors: i32,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub right_green_factors: i32,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub right_white_factors: Vec<i32>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub right_white_count: i32,
+
+    #[sqlx(default)]
+    #[serde(default)]
+    pub main_win_saddles: Vec<i32>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub left_win_saddles: Vec<i32>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub right_win_saddles: Vec<i32>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub race_results: Vec<i32>,
+
+    #[sqlx(default)]
     pub blue_stars_sum: i32,
     #[sqlx(default)]
     pub pink_stars_sum: i32,

@@ -1,5 +1,10 @@
+pub mod auth;
 pub mod circles;
+pub mod docs;
+pub mod profile;
+pub mod rankings;
 pub mod search;
 pub mod sharing;
 pub mod stats;
 pub mod tasks;
+pub mod version;
