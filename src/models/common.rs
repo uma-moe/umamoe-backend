@@ -1,7 +1,5 @@
 // Custom deserializer for Vec<String> that handles both single string and sequence
-pub fn deserialize_vec_string_from_query<'de, D>(
-    deserializer: D,
-) -> Result<Vec<String>, D::Error>
+pub fn deserialize_vec_string_from_query<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -40,9 +38,7 @@ where
 }
 
 // Custom deserializer for Vec<i32> that handles both single i32 and sequence
-pub fn deserialize_vec_i32_from_query<'de, D>(
-    deserializer: D,
-) -> Result<Vec<i32>, D::Error>
+pub fn deserialize_vec_i32_from_query<'de, D>(deserializer: D) -> Result<Vec<i32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -78,7 +74,8 @@ where
         {
             // Support comma-separated values like "102201,100602,102302"
             if value.contains(',') {
-                let result: Vec<i32> = value.split(',')
+                let result: Vec<i32> = value
+                    .split(',')
                     .filter(|s| !s.trim().is_empty())
                     .filter_map(|s| s.trim().parse::<i32>().ok())
                     .collect();
@@ -88,7 +85,8 @@ where
                     Ok(result)
                 }
             } else {
-                value.parse::<i32>()
+                value
+                    .parse::<i32>()
                     .map(|v| vec![v])
                     .map_err(|_| E::custom(format!("invalid i32 string: {}", value)))
             }

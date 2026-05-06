@@ -15,8 +15,8 @@ ALTER TABLE user_fan_rankings_monthly_archive
 -- 2. Drop all dependent objects in correct order
 DROP MATERIALIZED VIEW IF EXISTS user_fan_rankings_gains;
 DROP MATERIALIZED VIEW IF EXISTS user_fan_rankings_alltime;
-DROP MATERIALIZED VIEW IF EXISTS user_fan_rankings_monthly;
 DROP VIEW IF EXISTS user_fan_rankings_monthly;
+DROP MATERIALIZED VIEW IF EXISTS user_fan_rankings_monthly;
 DROP MATERIALIZED VIEW IF EXISTS user_fan_rankings_monthly_current;
 
 

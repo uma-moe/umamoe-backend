@@ -39,6 +39,30 @@ components:
         details:
           type: string
       required: [error, status]
+
+    VersionResponse:
+      type: object
+      properties:
+        app_version:
+          type: string
+        resource_version:
+          type: string
+        updated_at:
+          type: string
+          description: ISO 8601 timestamp
+
+    VersionHistoryResponse:
+      type: object
+      properties:
+        current:
+          $ref: "#/components/schemas/VersionResponse"
+          description: Latest version entry
+        history:
+          type: array
+          description: All previous version entries (newest first)
+          items:
+            $ref: "#/components/schemas/VersionResponse"
+
     SearchResponse:
       type: object
       properties:
@@ -221,11 +245,6 @@ components:
           format: date-time
           nullable: true
           description: Timestamp of the last live_points update. When this is on or after today's JST midnight, `monthly_rank` and `monthly_point` are replaced with the live values (GREATEST of live and monthly).
-        last_live_update:
-          type: string
-          format: date-time
-          nullable: true
-          description: Timestamp of the last live_points update. When this is on or after today's JST midnight, `monthly_rank` and `monthly_point` are replaced with the live values (GREATEST of live and monthly).
 
     CircleMemberFansMonthly:
       type: object
@@ -320,6 +339,37 @@ components:
         total_pages:
           type: integer
           format: int64
+
+    RankThreshold:
+      type: object
+      properties:
+        rank_index:
+          type: integer
+          description: "Numeric rank index (1=D, 2=D+, ... 11=SS)"
+        name:
+          type: string
+          description: "Tier name (D, D+, C, C+, B, B+, A, A+, S, S+, SS)"
+        ranking_from:
+          type: integer
+          nullable: true
+          description: "First ranking position in this tier (null for D)"
+        ranking_to:
+          type: integer
+          nullable: true
+          description: "Last ranking position in this tier (null for D+ and D)"
+        current_min_fans:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Current minimum fans needed to reach this tier (null for D+ and D)"
+
+    RankThresholdsResponse:
+      type: object
+      properties:
+        thresholds:
+          type: array
+          items:
+            $ref: "#/components/schemas/RankThreshold"
 
     # ── Rankings ───────────────────────────────────────────────
     UserFanRankingMonthly:
@@ -1027,6 +1077,20 @@ paths:
               schema:
                 $ref: "#/components/schemas/CircleListResponse"
 
+  /api/v4/circles/rank-thresholds:
+    get:
+      tags: [Circles]
+      summary: Get fan requirements for each circle rank tier
+      operationId: getCircleRankThresholds
+      description: Returns the ranking ranges and current minimum fan counts for each circle rank tier (D through SS).
+      responses:
+        "200":
+          description: Rank tier thresholds
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RankThresholdsResponse"
+
   # ── Rankings ────────────────────────────────────────────────
   /api/v4/rankings/monthly:
     get:
@@ -1196,15 +1260,31 @@ paths:
   /api/ver:
     get:
       tags: [System]
-      summary: Get server version info
+      summary: Get current server version
       operationId: getVersion
       responses:
         "200":
-          description: Version information
+          description: Current version info
           content:
             application/json:
               schema:
-                type: object
+                $ref: "#/components/schemas/VersionResponse"
         "404":
-          description: Version file not found
+          description: No version entries found
+
+  /api/ver/history:
+    get:
+      tags: [System]
+      summary: Get version history
+      operationId: getVersionHistory
+      description: Returns the current version as top-level fields and all previous versions in the history array.
+      responses:
+        "200":
+          description: Current version with full history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VersionHistoryResponse"
+        "404":
+          description: No version entries found
 

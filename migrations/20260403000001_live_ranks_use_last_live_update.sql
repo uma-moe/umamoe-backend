@@ -3,6 +3,8 @@
 -- guarding against the monthly reset window where monthly_point may briefly exceed live_points.
 -- When stale, fall back to monthly_point only.
 
+ALTER TABLE circles ADD COLUMN IF NOT EXISTS last_live_update timestamp without time zone;
+
 DROP MATERIALIZED VIEW IF EXISTS circle_live_ranks;
 
 CREATE MATERIALIZED VIEW circle_live_ranks AS

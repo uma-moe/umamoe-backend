@@ -6,8 +6,36 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::AppState;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ApiKeyRecord {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub name: String,
+}
+
+pub fn hash_api_key(raw_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub async fn resolve_api_key(
+    db: &sqlx::PgPool,
+    raw_key: &str,
+) -> Result<Option<ApiKeyRecord>, sqlx::Error> {
+    let key_hash = hash_api_key(raw_key);
+
+    sqlx::query_as::<_, ApiKeyRecord>(
+        "SELECT id, user_id, name FROM api_keys WHERE key_hash = $1 AND revoked = FALSE",
+    )
+    .bind(&key_hash)
+    .fetch_optional(db)
+    .await
+}
 
 /// Middleware layer that optionally resolves an `X-API-Key` header.
 ///
@@ -41,24 +69,14 @@ pub async fn api_key_tracking_middleware(
         let endpoint = normalize_endpoint(&method.to_string(), &path);
 
         tokio::spawn(async move {
-            let mut hasher = Sha256::new();
-            hasher.update(raw_key.as_bytes());
-            let key_hash = format!("{:x}", hasher.finalize());
-
-            // Look up the key (non-revoked only)
-            let row = sqlx::query_as::<_, ApiKeyRow>(
-                "SELECT id, user_id, name FROM api_keys WHERE key_hash = $1 AND revoked = FALSE",
-            )
-            .bind(&key_hash)
-            .fetch_optional(&db)
-            .await;
+            let row = resolve_api_key(&db, &raw_key).await;
 
             match row {
                 Ok(Some(key)) => {
                     info!(
                         "🔑 API key '{}' (user {}) → {} (ip: {})",
                         key.name,
-                        key.id,
+                        key.user_id,
                         endpoint,
                         ip.as_deref().unwrap_or("unknown"),
                     );
@@ -126,12 +144,4 @@ fn is_numeric(s: &str) -> bool {
 
 fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
-}
-
-#[derive(sqlx::FromRow)]
-struct ApiKeyRow {
-    id: uuid::Uuid,
-    #[allow(dead_code)]
-    user_id: uuid::Uuid,
-    name: String,
 }

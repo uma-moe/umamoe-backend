@@ -55,3 +55,7 @@ rand = "0.8"
 sha2 = "0.10"
 urlencoding = "2"
 async-trait = "0.1"
+
+# Streaming / SSE
+futures = "0.3"
+tokio-stream = "0.1"

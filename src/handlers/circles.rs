@@ -78,6 +78,65 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(get_circle))
         .route("/list", get(list_circles))
+        .route("/rank-thresholds", get(get_rank_thresholds))
+}
+
+fn rollover_active_sql() -> &'static str {
+    "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') < (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')"
+}
+
+fn today_start_utc_sql() -> &'static str {
+    "(date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp"
+}
+
+fn valid_live_sql(alias: &str) -> String {
+    format!("{}.live_rank > 0 AND {}.live_points > 0", alias, alias)
+}
+
+fn effective_points_sql(alias: &str) -> String {
+    let valid_live = valid_live_sql(alias);
+
+    format!(
+        "CASE \
+            WHEN {} AND {} THEN {}.live_points \
+            WHEN {} THEN COALESCE({}.last_month_point, {}.monthly_point) \
+            WHEN {}.last_live_update >= {} AND {} THEN COALESCE(GREATEST({}.live_points, {}.monthly_point), {}.live_points, {}.monthly_point) \
+            ELSE {}.monthly_point \
+        END",
+        rollover_active_sql(),
+        valid_live,
+        alias,
+        rollover_active_sql(),
+        alias,
+        alias,
+        alias,
+        today_start_utc_sql(),
+        valid_live,
+        alias,
+        alias,
+        alias,
+        alias,
+        alias,
+    )
+}
+
+fn rank_fallback_sql(alias: &str) -> String {
+    let valid_live = valid_live_sql(alias);
+
+    format!(
+        "CASE \
+            WHEN {} AND {} THEN {}.live_rank \
+            WHEN {} THEN COALESCE({}.last_month_rank, {}.monthly_rank) \
+            ELSE {}.monthly_rank \
+        END",
+        rollover_active_sql(),
+        valid_live,
+        alias,
+        rollover_active_sql(),
+        alias,
+        alias,
+        alias,
+    )
 }
 
 /// GET /api/circles - Get circle information and member fan counts
@@ -98,24 +157,23 @@ pub async fn get_circle(
         ));
     }
 
-    let mut circle = if let Some(viewer_id) = params.viewer_id {
+    let circle = if let Some(viewer_id) = params.viewer_id {
         // Query by viewer_id - first check if viewer exists in circle_member_fans_monthly
-        let member_record = sqlx::query!(
+        let member_record = sqlx::query_scalar::<_, i64>(
             r#"
             SELECT circle_id 
             FROM circle_member_fans_monthly 
             WHERE viewer_id = $1 
             LIMIT 1
             "#,
-            viewer_id
         )
+        .bind(viewer_id)
         .fetch_optional(&state.db)
         .await?;
 
         match member_record {
-            Some(record) => {
+            Some(circle_id) => {
                 // Viewer found, get their circle
-                let circle_id = record.circle_id;
                 fetch_circle_by_id(&state.db, circle_id).await?
             }
             None => {
@@ -136,25 +194,10 @@ pub async fn get_circle(
     };
 
     // Get all members and their fan counts for this circle
-    let members = fetch_circle_members(&state.db, circle.circle_id, params.year, params.month).await?;
+    let members =
+        fetch_circle_members(&state.db, circle.circle_id, params.year, params.month).await?;
 
-    let fresh = circle.last_live_update
-        .map(|t| t >= jst_midnight_utc())
-        .unwrap_or(false);
-    let points = if fresh {
-        circle.live_points.unwrap_or(0).max(circle.monthly_point.unwrap_or(0))
-    } else {
-        circle.monthly_point.unwrap_or(0)
-    };
-    if fresh {
-        circle.monthly_point = Some(points);
-        // Prefer live_rank when live_points are at least as high as monthly_point
-        if circle.live_points.unwrap_or(0) >= circle.monthly_point.unwrap_or(0) {
-            if let Some(lr) = circle.live_rank {
-                circle.monthly_rank = Some(lr);
-            }
-        }
-    }
+    let points = circle.monthly_point.unwrap_or(0);
     let club_rank = Some(compute_club_rank(circle.monthly_rank, Some(points)));
     let rank = circle.monthly_rank;
 
@@ -189,7 +232,8 @@ pub async fn get_circle(
         Some(0)
     };
 
-    let yesterday_fans_to_lower_tier = if let Some(boundary) = lower_tier_boundary(y_rank, y_points) {
+    let yesterday_fans_to_lower_tier = if let Some(boundary) = lower_tier_boundary(y_rank, y_points)
+    {
         match fetch_boundary_points_yesterday(&state.db, boundary).await? {
             Some(bp) => Some((y_points - bp).max(0)),
             None => Some(0),
@@ -199,9 +243,13 @@ pub async fn get_circle(
     };
 
     Ok(Json(CircleResponse {
-        circle, members, club_rank,
-        fans_to_next_tier, fans_to_lower_tier,
-        yesterday_fans_to_next_tier, yesterday_fans_to_lower_tier,
+        circle,
+        members,
+        club_rank,
+        fans_to_next_tier,
+        fans_to_lower_tier,
+        yesterday_fans_to_next_tier,
+        yesterday_fans_to_lower_tier,
     }))
 }
 
@@ -229,7 +277,7 @@ pub async fn list_circles(
 
     // If search query is present, add MatchingCircles CTE to optimize search
     let mut join_matching_circles = String::new();
-    
+
     if let Some(query) = &params.query {
         // Skip very short queries that would match too many results
         let query_trimmed = query.trim();
@@ -238,19 +286,22 @@ pub async fn list_circles(
             let search_exact = query_trimmed.replace("'", "''");
             let is_number = query_trimmed.parse::<i64>().is_ok();
 
-        let mut union_parts = Vec::new();
+            let mut union_parts = Vec::new();
 
-        // 1. Search by Circle Name
-        union_parts.push(format!("SELECT circle_id FROM circles WHERE name ILIKE '{}'", search_pattern));
+            // 1. Search by Circle Name
+            union_parts.push(format!(
+                "SELECT circle_id FROM circles WHERE name ILIKE '{}'",
+                search_pattern
+            ));
 
-        // 2. Search by Leader Name
-        union_parts.push(format!(
+            // 2. Search by Leader Name
+            union_parts.push(format!(
             "SELECT c.circle_id FROM circles c JOIN trainer t ON c.leader_viewer_id::text = t.account_id WHERE t.name ILIKE '{}'", 
             search_pattern
         ));
 
-        // 3. Search by Member Name
-        union_parts.push(format!(
+            // 3. Search by Member Name
+            union_parts.push(format!(
             r#"
             SELECT cm.circle_id 
             FROM circle_member_fans_monthly cm 
@@ -262,15 +313,21 @@ pub async fn list_circles(
             search_pattern
         ));
 
-        if is_number {
-            // 4. Search by Circle ID
-            union_parts.push(format!("SELECT circle_id FROM circles WHERE circle_id = {}", search_exact));
-            
-            // 5. Search by Leader ID
-            union_parts.push(format!("SELECT circle_id FROM circles WHERE leader_viewer_id = {}", search_exact));
-            
-            // 6. Search by Member ID
-            union_parts.push(format!(
+            if is_number {
+                // 4. Search by Circle ID
+                union_parts.push(format!(
+                    "SELECT circle_id FROM circles WHERE circle_id = {}",
+                    search_exact
+                ));
+
+                // 5. Search by Leader ID
+                union_parts.push(format!(
+                    "SELECT circle_id FROM circles WHERE leader_viewer_id = {}",
+                    search_exact
+                ));
+
+                // 6. Search by Member ID
+                union_parts.push(format!(
                 r#"
                 SELECT circle_id 
                 FROM circle_member_fans_monthly 
@@ -280,11 +337,15 @@ pub async fn list_circles(
                 "#,
                 search_exact
             ));
-        }
+            }
 
-        with_parts.push(format!("MatchingCircles AS ({})", union_parts.join(" UNION ")));
+            with_parts.push(format!(
+                "MatchingCircles AS ({})",
+                union_parts.join(" UNION ")
+            ));
 
-        join_matching_circles = "INNER JOIN MatchingCircles mc ON c.circle_id = mc.circle_id".to_string();
+            join_matching_circles =
+                "INNER JOIN MatchingCircles mc ON c.circle_id = mc.circle_id".to_string();
         } // end of query_trimmed.len() >= 2 check
     }
 
@@ -294,18 +355,22 @@ pub async fn list_circles(
         format!("WITH {}", with_parts.join(", "))
     };
 
-    let join_global_ranks = "";
-    let rank_column = "CASE WHEN c.last_live_update >= (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp AND COALESCE(c.live_points, 0) >= COALESCE(c.monthly_point, 0) THEN COALESCE(c.live_rank, c.monthly_rank) ELSE c.monthly_rank END";
-    let yesterday_rank_column = "c.yesterday_rank";
+    let join_global_ranks = "LEFT JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id";
+    let points_column = effective_points_sql("c");
+    let rank_column = format!(
+        "COALESCE(lr.live_rank::integer, {})",
+        rank_fallback_sql("c")
+    );
+    let yesterday_rank_column = "COALESCE(lr.live_yesterday_rank::integer, c.yesterday_rank)";
 
     // Build dynamic query
     let mut count_query = format!(
-        "{} SELECT COUNT(*) FROM circles c {} LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id {} WHERE 1=1", 
-        with_clause, 
+        "{} SELECT COUNT(*) FROM circles c {} LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id {} WHERE 1=1",
+        with_clause,
         join_global_ranks,
         join_matching_circles
     );
-    
+
     let mut select_query = format!(
         r#"
         {}
@@ -321,7 +386,7 @@ pub async fn list_circles(
             c.created_at,
             c.last_updated,
             {} as monthly_rank,
-            c.monthly_point,
+            {} as monthly_point,
             c.last_month_rank,
             c.last_month_point,
             c.archived,
@@ -339,6 +404,7 @@ pub async fn list_circles(
         "#,
         with_clause,
         rank_column,
+        points_column,
         yesterday_rank_column,
         join_global_ranks,
         join_matching_circles
@@ -368,7 +434,7 @@ pub async fn list_circles(
 
     // Max rank filter (lower rank number is better)
     if let Some(max_rank) = params.max_rank {
-        conditions.push(format!("COALESCE(c.live_rank, c.monthly_rank) <= {}", max_rank));
+        conditions.push(format!("{} <= {}", rank_column, max_rank));
     }
 
     // Add conditions to queries
@@ -387,17 +453,23 @@ pub async fn list_circles(
     let sort_dir = params.sort_dir.as_deref().unwrap_or("asc");
 
     let order_clause = match sort_by {
-        "name" => format!(" ORDER BY c.name {}, c.circle_id ASC", sort_dir.to_uppercase()),
+        "name" => format!(
+            " ORDER BY c.name {}, c.circle_id ASC",
+            sort_dir.to_uppercase()
+        ),
         "member_count" => format!(
             " ORDER BY c.member_count {} NULLS LAST, c.circle_id ASC",
             sort_dir.to_uppercase()
         ),
-        "rank" | "monthly_rank" => " ORDER BY CASE WHEN c.last_live_update >= (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp THEN GREATEST(COALESCE(c.live_points, 0), COALESCE(c.monthly_point, 0)) ELSE COALESCE(c.monthly_point, 0) END DESC NULLS LAST, c.circle_id ASC".to_string(),
+        "rank" | "monthly_rank" => {
+            format!(" ORDER BY {} ASC NULLS LAST, c.circle_id ASC", rank_column)
+        }
         "monthly_point" => format!(
-            " ORDER BY CASE WHEN c.last_live_update >= (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp THEN GREATEST(COALESCE(c.live_points, 0), COALESCE(c.monthly_point, 0)) ELSE COALESCE(c.monthly_point, 0) END {} NULLS LAST, c.circle_id ASC",
+            " ORDER BY {} {} NULLS LAST, c.circle_id ASC",
+            points_column,
             sort_dir.to_uppercase()
         ),
-        _ => " ORDER BY CASE WHEN c.last_live_update >= (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp THEN GREATEST(COALESCE(c.live_points, 0), COALESCE(c.monthly_point, 0)) ELSE COALESCE(c.monthly_point, 0) END DESC NULLS LAST, c.circle_id ASC".to_string(),
+        _ => format!(" ORDER BY {} ASC NULLS LAST, c.circle_id ASC", rank_column),
     };
 
     select_query.push_str(&order_clause);
@@ -410,24 +482,12 @@ pub async fn list_circles(
 
     let circles_with_rank: Vec<CircleWithRank> = circles
         .into_iter()
-        .map(|mut circle| {
-            let fresh = circle.last_live_update
-                .map(|t| t >= jst_midnight_utc())
-                .unwrap_or(false);
-            let effective_points = if fresh {
-                circle.live_points.unwrap_or(0).max(circle.monthly_point.unwrap_or(0))
-            } else {
-                circle.monthly_point.unwrap_or(0)
-            };
-            if fresh {
-                circle.monthly_point = Some(effective_points);
-                if circle.live_points.unwrap_or(0) >= circle.monthly_point.unwrap_or(0) {
-                    if let Some(lr) = circle.live_rank {
-                        circle.monthly_rank = Some(lr);
-                    }
-                }
-            }
-            let club_rank = Some(compute_club_rank(circle.monthly_rank, Some(effective_points)));
+        .map(|circle| {
+            let effective_points = circle.monthly_point.unwrap_or(0);
+            let club_rank = Some(compute_club_rank(
+                circle.monthly_rank,
+                Some(effective_points),
+            ));
             CircleWithRank { circle, club_rank }
         })
         .collect();
@@ -447,14 +507,57 @@ pub async fn list_circles(
     }))
 }
 
-/// Returns today's JST midnight as a naive UTC timestamp, for freshness comparisons
-/// against `last_live_update` (stored as UTC, timezone-naive).
-fn jst_midnight_utc() -> chrono::NaiveDateTime {
-    use chrono::{FixedOffset, Utc};
-    let jst = FixedOffset::east_opt(9 * 3600).unwrap();
-    let now_jst = Utc::now().with_timezone(&jst);
-    // today 00:00:00 JST → subtract 9h to get the equivalent UTC moment
-    now_jst.date_naive().and_hms_opt(0, 0, 0).unwrap() - chrono::Duration::hours(9)
+#[derive(Debug, Serialize)]
+pub struct RankThreshold {
+    pub rank_index: i32,
+    pub name: String,
+    pub ranking_from: Option<i32>,
+    pub ranking_to: Option<i32>,
+    pub current_min_fans: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RankThresholdsResponse {
+    pub thresholds: Vec<RankThreshold>,
+}
+
+/// GET /api/v4/circles/rank-thresholds - Get the fan requirements for each circle rank tier
+pub async fn get_rank_thresholds(
+    State(state): State<AppState>,
+) -> Result<Json<RankThresholdsResponse>, AppError> {
+    let tiers: Vec<(&str, i32, Option<i32>, Option<i32>)> = vec![
+        ("SS", 11, Some(1), Some(10)),
+        ("S+", 10, Some(11), Some(30)),
+        ("S", 9, Some(31), Some(100)),
+        ("A+", 8, Some(101), Some(500)),
+        ("A", 7, Some(501), Some(1000)),
+        ("B+", 6, Some(1001), Some(3000)),
+        ("B", 5, Some(3001), Some(5000)),
+        ("C+", 4, Some(5001), Some(7000)),
+        ("C", 3, Some(7001), Some(10000)),
+        ("D+", 2, Some(10001), None),
+        ("D", 1, None, None),
+    ];
+
+    let mut thresholds = Vec::new();
+
+    for (name, rank_index, ranking_from, ranking_to) in tiers {
+        let current_min_fans = if let Some(boundary) = ranking_to {
+            fetch_boundary_points(&state.db, boundary).await?
+        } else {
+            None
+        };
+
+        thresholds.push(RankThreshold {
+            rank_index,
+            name: name.to_string(),
+            ranking_from,
+            ranking_to,
+            current_min_fans,
+        });
+    }
+
+    Ok(Json(RankThresholdsResponse { thresholds }))
 }
 
 /// Convert a ranking position and monthly points to club rank index (1-11)
@@ -525,19 +628,21 @@ fn lower_tier_boundary(rank: Option<i32>, points: i64) -> Option<i32> {
 
 /// Fetch the effective current points of the circle at the given boundary rank
 async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
+    let points_column = effective_points_sql("c");
+
     let result: Option<i64> = sqlx::query_scalar(
+        &format!(
         r#"
-        SELECT CASE
-            WHEN c.last_live_update >= (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp
-            THEN GREATEST(COALESCE(c.live_points, 0), COALESCE(c.monthly_point, 0))
-            ELSE COALESCE(c.monthly_point, 0)
-        END
+        SELECT {}
         FROM circles c
         JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id
-        WHERE lr.live_rank <= $1 AND (c.live_points IS NOT NULL OR c.monthly_point IS NOT NULL)
+        WHERE lr.live_rank <= $1
+          AND (c.live_points IS NOT NULL OR c.last_month_point IS NOT NULL OR c.monthly_point IS NOT NULL)
         ORDER BY lr.live_rank DESC
         LIMIT 1
         "#,
+        points_column
+        ),
     )
     .bind(boundary_rank)
     .fetch_optional(pool)
@@ -547,7 +652,10 @@ async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Opti
 }
 
 /// Fetch the yesterday_points of the circle at the given boundary rank (using yesterday's rankings)
-async fn fetch_boundary_points_yesterday(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
+async fn fetch_boundary_points_yesterday(
+    pool: &PgPool,
+    boundary_rank: i32,
+) -> Result<Option<i64>, AppError> {
     let result: Option<i64> = sqlx::query_scalar(
         r#"
         SELECT c.yesterday_points
@@ -567,7 +675,13 @@ async fn fetch_boundary_points_yesterday(pool: &PgPool, boundary_rank: i32) -> R
 
 /// Fetch circle by ID
 async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, AppError> {
-    let circle = sqlx::query_as::<_, Circle>(
+    let points_column = effective_points_sql("c");
+    let rank_column = format!(
+        "COALESCE(lr.live_rank::integer, {})",
+        rank_fallback_sql("c")
+    );
+
+    let circle = sqlx::query_as::<_, Circle>(&format!(
         r#"
         SELECT 
             c.circle_id,
@@ -580,27 +694,24 @@ async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, App
             c.policy,
             c.created_at,
             c.last_updated,
-            CASE
-                WHEN c.last_live_update >= (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp
-                 AND COALESCE(c.live_points, 0) >= COALESCE(c.monthly_point, 0)
-                THEN COALESCE(c.live_rank, c.monthly_rank)
-                ELSE c.monthly_rank
-            END as monthly_rank,
-            c.monthly_point,
+            {} as monthly_rank,
+            {} as monthly_point,
             c.last_month_rank,
             c.last_month_point,
             c.archived,
             c.yesterday_updated,
             c.yesterday_points,
-            c.yesterday_rank,
+            COALESCE(lr.live_yesterday_rank::integer, c.yesterday_rank) as yesterday_rank,
             c.live_points,
             c.live_rank,
             c.last_live_update
         FROM circles c
         LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id
+        LEFT JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id
         WHERE c.circle_id = $1
         "#,
-    )
+        rank_column, points_column,
+    ))
     .bind(circle_id)
     .fetch_optional(pool)
     .await?
@@ -618,7 +729,7 @@ async fn fetch_circle_members(
 ) -> Result<Vec<CircleMemberFansMonthly>, AppError> {
     use chrono::{Datelike, Duration, FixedOffset, Utc};
     use std::collections::HashMap;
-    
+
     // Default to current date in JST minus 1 day if not provided
     // This means the month flips at midnight JST on the 2nd (giving time for data collection)
     let (target_year, target_month) = if year.is_none() || month.is_none() {
@@ -626,21 +737,32 @@ async fn fetch_circle_members(
         let now_jst = Utc::now().with_timezone(&jst_offset) - Duration::days(1);
         (
             year.unwrap_or(now_jst.year()),
-            month.unwrap_or(now_jst.month() as i32)
+            month.unwrap_or(now_jst.month() as i32),
         )
     } else {
         (year.unwrap(), month.unwrap())
     };
 
-    // PostgreSQL returns integer arrays as Vec<i32>, but query_as! infers Vec<i64>
-    // We need to handle the conversion manually
-    let records = sqlx::query!(
+    #[derive(sqlx::FromRow)]
+    struct MemberRecord {
+        id: i32,
+        circle_id: i64,
+        viewer_id: i64,
+        trainer_name: Option<String>,
+        year: i32,
+        month: i32,
+        daily_fans: Vec<i64>,
+        last_updated: Option<chrono::NaiveDateTime>,
+        next_month_start: Option<i64>,
+    }
+
+    let records = sqlx::query_as::<_, MemberRecord>(
         r#"
         SELECT 
             cm.id,
             cm.circle_id,
             cm.viewer_id,
-            t.name as "trainer_name?",
+            t.name as trainer_name,
             cm.year,
             cm.month,
             cm.daily_fans,
@@ -653,16 +775,16 @@ async fn fetch_circle_members(
                   AND cm2.month = CASE WHEN cm.month = 12 THEN 1 ELSE cm.month + 1 END
                   AND cm2.daily_fans[1] > 0
                 LIMIT 1
-            ) as "next_month_start?"
+            ) as next_month_start
         FROM circle_member_fans_monthly cm
         LEFT JOIN trainer t ON cm.viewer_id::text = t.account_id
         WHERE cm.circle_id = $1 AND cm.year = $2 AND cm.month = $3
         ORDER BY cm.viewer_id
         "#,
-        circle_id,
-        target_year,
-        target_month
     )
+    .bind(circle_id)
+    .bind(target_year)
+    .bind(target_month)
     .fetch_all(pool)
     .await?;
 
@@ -693,21 +815,27 @@ async fn fetch_circle_members(
         .filter(|m| {
             // Has at least one non-zero value, and the first element is zero
             // (meaning they joined after day 1)
-            !m.daily_fans.is_empty()
-                && m.daily_fans[0] == 0
-                && m.daily_fans.iter().any(|&v| v > 0)
+            !m.daily_fans.is_empty() && m.daily_fans[0] == 0 && m.daily_fans.iter().any(|&v| v > 0)
         })
         .map(|m| m.viewer_id)
         .collect();
 
     if !viewer_ids_with_leading_zeros.is_empty() {
         // Query for records in OTHER circles for these viewers in the same month
-        let previous_records = sqlx::query!(
+        #[derive(sqlx::FromRow)]
+        struct PreviousCircleRecord {
+            viewer_id: i64,
+            circle_id: i64,
+            circle_name: String,
+            daily_fans: Vec<i64>,
+        }
+
+        let previous_records = sqlx::query_as::<_, PreviousCircleRecord>(
             r#"
             SELECT 
                 cm.viewer_id,
                 cm.circle_id,
-                c.name as "circle_name!",
+                c.name as circle_name,
                 cm.daily_fans
             FROM circle_member_fans_monthly cm
             JOIN circles c ON cm.circle_id = c.circle_id
@@ -715,12 +843,12 @@ async fn fetch_circle_members(
               AND cm.year = $2
               AND cm.month = $3
               AND cm.circle_id != $4
-            "#,
-            &viewer_ids_with_leading_zeros,
-            target_year,
-            target_month,
-            circle_id
+                        "#,
         )
+                .bind(&viewer_ids_with_leading_zeros)
+                .bind(target_year)
+                .bind(target_month)
+                .bind(circle_id)
         .fetch_all(pool)
         .await?;
 
@@ -728,10 +856,11 @@ async fn fetch_circle_members(
         // A member could theoretically have been in multiple circles in one month
         let mut prev_map: HashMap<i64, Vec<(i64, String, Vec<i64>)>> = HashMap::new();
         for rec in previous_records {
-            prev_map
-                .entry(rec.viewer_id)
-                .or_default()
-                .push((rec.circle_id, rec.circle_name, rec.daily_fans));
+            prev_map.entry(rec.viewer_id).or_default().push((
+                rec.circle_id,
+                rec.circle_name,
+                rec.daily_fans,
+            ));
         }
 
         // Merge previous circle data into current members
@@ -780,14 +909,14 @@ async fn fetch_circle_members(
 async fn add_viewer_to_tasks(pool: &PgPool, viewer_id: i64) -> Result<(), AppError> {
     // Insert into tasks table with viewer_id in task_data
     // account_id is for the worker that processes the task, so we leave it NULL
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO tasks (task_type, task_data, status, created_at, updated_at)
         VALUES ('fetch_circle', $1, 'pending', NOW(), NOW())
         ON CONFLICT DO NOTHING
         "#,
-        serde_json::json!({ "viewer_id": viewer_id })
     )
+    .bind(serde_json::json!({ "viewer_id": viewer_id }))
     .execute(pool)
     .await?;
 

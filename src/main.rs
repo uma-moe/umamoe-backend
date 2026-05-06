@@ -2,10 +2,7 @@ use axum::{http::StatusCode, response::Json, routing::get, Router};
 use sqlx::PgPool;
 use std::net::SocketAddr;
 use tower::ServiceBuilder;
-use tower_http::{
-    cors::{Any, CorsLayer},
-    trace::TraceLayer,
-};
+use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
@@ -16,8 +13,13 @@ mod errors;
 mod handlers;
 mod middleware;
 mod models;
+mod notify;
 
-use handlers::{auth as auth_handlers, circles, docs, profile, rankings, search, sharing, stats, tasks, version};
+use handlers::{
+    affinity, auth as auth_handlers, circles, docs, partner, profile, rankings, search, sharing,
+    stats, tasks, version,
+};
+use notify::TaskNotifier;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,6 +27,7 @@ pub struct AppState {
     pub search_client: reqwest::Client,
     pub search_url: String,
     pub oauth_redirect_base: String,
+    pub task_notifier: TaskNotifier,
 }
 
 #[tokio::main]
@@ -68,16 +71,17 @@ async fn main() -> anyhow::Result<()> {
         let migrator = sqlx::migrate!("./migrations");
 
         // Determine which migrations are already applied so we can log only the new ones.
-        let applied: std::collections::HashSet<i64> = sqlx::query_scalar(
-            "SELECT version FROM _sqlx_migrations WHERE success = true"
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+        let applied: std::collections::HashSet<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = true")
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
 
-        let pending: Vec<_> = migrator.migrations.iter()
+        let pending: Vec<_> = migrator
+            .migrations
+            .iter()
             .filter(|m| !applied.contains(&m.version))
             .collect();
 
@@ -124,8 +128,8 @@ async fn main() -> anyhow::Result<()> {
     // Hash any remaining plaintext emails (one-time backfill, idempotent)
     backfill_email_hashes(&pool).await;
 
-    let search_url = std::env::var("SEARCH_SERVICE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3002".to_string());
+    let search_url =
+        std::env::var("SEARCH_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3002".to_string());
     info!("Search service URL: {}", search_url);
 
     let search_client = reqwest::Client::builder()
@@ -136,11 +140,18 @@ async fn main() -> anyhow::Result<()> {
     let oauth_redirect_base = std::env::var("OAUTH_REDIRECT_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
 
+    // Postgres LISTEN/NOTIFY dispatcher used by the partner-lookup SSE
+    // endpoint. The trigger that emits these notifications is created in the
+    // `add_partner_inheritance` migration.
+    let task_notifier = TaskNotifier::new();
+    notify::spawn_listener(database_url.clone(), task_notifier.clone());
+
     let state = AppState {
         db: pool.clone(),
         search_client,
         search_url,
         oauth_redirect_base,
+        task_notifier,
     };
 
     // Start background task to refresh materialized views every hour
@@ -165,10 +176,15 @@ async fn main() -> anyhow::Result<()> {
     let is_development = std::env::var("DEBUG_MODE").unwrap_or_default() == "true";
 
     let cors = if is_development {
-        info!("🔓 Development mode: Using permissive CORS");
+        info!("🔓 Development mode: Using permissive CORS with credentials");
+        let dev_origins: Vec<_> = std::env::var("ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "http://localhost:4200,http://localhost:3000".to_string())
+            .split(',')
+            .filter_map(|o| o.trim().parse().ok())
+            .collect();
         CorsLayer::new()
-            .allow_origin(Any)
-            .allow_credentials(false) // Can't use credentials with allow_origin(Any)
+            .allow_origin(dev_origins)
+            .allow_credentials(true)
     } else {
         let allowed_origins = std::env::var("ALLOWED_ORIGINS")
             .unwrap_or_else(|_| "https://honse.moe,https://www.honse.moe,https://uma.moe,https://www.uma.moe,http://honse.moe,http://www.honse.moe,http://uma.moe,http://www.uma.moe".to_string());
@@ -231,11 +247,13 @@ async fn main() -> anyhow::Result<()> {
         axum::http::header::REFERER,
         axum::http::header::ORIGIN,
         "CF-Turnstile-Token".parse().unwrap(),
+        "X-Turnstile-Token".parse().unwrap(),
+        "X-Browser-Proof".parse().unwrap(),
         "X-API-Key".parse().unwrap(),
     ]);
 
     // Build the application with proper routing and middleware
-    // Public endpoints (no Turnstile, permissive CORS)
+    // Public-read endpoints still require an API key or browser proof to prevent scraping.
     let public_routes = Router::new()
         .nest("/api/v4/circles", circles::router())
         .nest("/api/v4/rankings", rankings::router())
@@ -247,7 +265,11 @@ async fn main() -> anyhow::Result<()> {
                     state.clone(),
                     middleware::api_key::api_key_tracking_middleware,
                 ))
-                .layer(CorsLayer::permissive()), // Allow all origins for public API
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::turnstile::api_protection_middleware,
+                ))
+                .layer(cors.clone()),
         )
         .with_state(state.clone());
 
@@ -255,11 +277,14 @@ async fn main() -> anyhow::Result<()> {
     let protected_routes = Router::new()
         .route("/api/health", get(health_check))
         .route("/api/ver", get(version::get_version))
+        .route("/api/ver/history", get(version::get_version_history))
         .nest("/api/docs", docs::router())
         .nest("/api/stats", stats::router())
         .nest("/api/tasks", tasks::router())
         .nest("/api/v3/tasks", tasks::router())
+        .nest("/api/v4/partner", partner::router())
         .nest("/api/v3", search::router())
+        .nest("/api/v4/affinity", affinity::router())
         .nest("/api/auth", auth_handlers::public_router())
         .nest("/api/auth", auth_handlers::authenticated_router())
         .nest("/", sharing::router())
@@ -270,7 +295,10 @@ async fn main() -> anyhow::Result<()> {
                     state.clone(),
                     middleware::api_key::api_key_tracking_middleware,
                 ))
-                //.layer(axum::middleware::from_fn(middleware::turnstile_verification_middleware))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::turnstile::api_protection_middleware,
+                ))
                 .layer(cors),
         )
         .with_state(state);
@@ -285,12 +313,10 @@ async fn main() -> anyhow::Result<()> {
         .parse::<u16>()
         .expect("PORT must be a valid number");
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-
     info!("🚀 Server starting on http://{}:{}", host, port);
 
     // Start the server using Axum 0.7 syntax
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -354,7 +380,10 @@ async fn backfill_email_hashes(pool: &PgPool) {
             .execute(pool)
             .await
         {
-            warn!("⚠️  backfill_email_hashes: failed to update user {}: {}", row.id, e);
+            warn!(
+                "⚠️  backfill_email_hashes: failed to update user {}: {}",
+                row.id, e
+            );
         }
     }
 
@@ -367,7 +396,10 @@ async fn backfill_email_hashes(pool: &PgPool) {
     {
         Ok(rows) => rows,
         Err(e) => {
-            warn!("⚠️  backfill_email_hashes: could not query user_identities: {}", e);
+            warn!(
+                "⚠️  backfill_email_hashes: could not query user_identities: {}",
+                e
+            );
             return;
         }
     };
@@ -380,13 +412,19 @@ async fn backfill_email_hashes(pool: &PgPool) {
             .execute(pool)
             .await
         {
-            warn!("⚠️  backfill_email_hashes: failed to update identity {}: {}", row.id, e);
+            warn!(
+                "⚠️  backfill_email_hashes: failed to update identity {}: {}",
+                row.id, e
+            );
         }
     }
 
     let total = users.len() + identities.len();
     if total > 0 {
-        warn!("✅ backfill_email_hashes: hashed {} plaintext email(s)", total);
+        warn!(
+            "✅ backfill_email_hashes: hashed {} plaintext email(s)",
+            total
+        );
     }
 }
 
@@ -401,7 +439,8 @@ async fn clear_stale_live_task(pool: PgPool) {
             "UPDATE circles \
              SET live_points = NULL, live_rank = NULL \
              WHERE (live_points IS NOT NULL OR live_rank IS NOT NULL) \
-               AND (last_updated IS NULL OR last_updated < NOW() - INTERVAL '4 hours')"
+               AND (last_live_update IS NULL OR last_live_update < \
+                   (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp)"
         )
         .execute(&pool)
         .await
@@ -471,7 +510,7 @@ async fn refresh_user_rankings_task(pool: PgPool) {
                  SELECT 1 FROM user_fan_rankings_monthly_archive a \
                  WHERE a.year = cm.year AND a.month = cm.month \
                  LIMIT 1 \
-             )"
+             )",
         )
         .fetch_all(&pool)
         .await
@@ -505,7 +544,7 @@ async fn refresh_user_rankings_task(pool: PgPool) {
                  SELECT 1 FROM circle_ranks_monthly_archive a \
                  WHERE a.year = cmf.year AND a.month = cmf.month \
                  LIMIT 1 \
-             )"
+             )",
         )
         .fetch_all(&pool)
         .await
@@ -570,13 +609,19 @@ async fn refresh_mat_view(pool: &PgPool, view_name: &str) {
     let sql_full = format!("REFRESH MATERIALIZED VIEW {}", view_name);
 
     match sqlx::query(&sql_concurrent).execute(pool).await {
-        Ok(_) => info!("✅ {} refreshed in {:.1}s", view_name, start.elapsed().as_secs_f64()),
-        Err(_) => {
-            match sqlx::query(&sql_full).execute(pool).await {
-                Ok(_) => info!("✅ {} refreshed (non-concurrent) in {:.1}s", view_name, start.elapsed().as_secs_f64()),
-                Err(e) => warn!("⚠️ Failed to refresh {}: {}", view_name, e),
-            }
-        }
+        Ok(_) => info!(
+            "✅ {} refreshed in {:.1}s",
+            view_name,
+            start.elapsed().as_secs_f64()
+        ),
+        Err(_) => match sqlx::query(&sql_full).execute(pool).await {
+            Ok(_) => info!(
+                "✅ {} refreshed (non-concurrent) in {:.1}s",
+                view_name,
+                start.elapsed().as_secs_f64()
+            ),
+            Err(e) => warn!("⚠️ Failed to refresh {}: {}", view_name, e),
+        },
     }
 }
 
@@ -588,7 +633,6 @@ async fn cache_cleanup_task() {
     tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
 
     loop {
-
         // Clean up expired entries
         cache::cleanup_expired();
 
@@ -614,7 +658,6 @@ async fn ensure_daily_stats_task(pool: PgPool) {
     info!("📅 Starting daily stats ensure background task (runs every hour)");
 
     loop {
-
         // Ensure today's entry exists (insert with 0 if not present)
         let result = sqlx::query(
             r#"
@@ -663,7 +706,10 @@ async fn ensure_daily_stats_task(pool: PgPool) {
         match backfill_result {
             Ok(r) => {
                 if r.rows_affected() > 0 {
-                    info!("📅 Backfilled {} missing daily_stats entries", r.rows_affected());
+                    info!(
+                        "📅 Backfilled {} missing daily_stats entries",
+                        r.rows_affected()
+                    );
                 }
             }
             Err(e) => warn!("⚠️ Failed to backfill daily_stats: {}", e),

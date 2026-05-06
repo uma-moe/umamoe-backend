@@ -1,4 +1,6 @@
-use crate::models::common::{deserialize_vec_string_from_query, deserialize_vec_i32_from_query, option_naive_datetime_as_utc};
+use crate::models::common::{
+    deserialize_vec_i32_from_query, deserialize_vec_string_from_query, option_naive_datetime_as_utc,
+};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 
@@ -141,6 +143,24 @@ pub struct UnifiedSearchParams {
     // Desired main character filter
     #[serde(default)]
     pub desired_main_chara_id: Option<i32>, // Filter inheritances where main parent is this character (p0 parent)
+
+    // P2 legacy affinity inputs (pass-through to search service)
+    #[serde(default)]
+    pub p2_main_chara_id: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub p2_win_saddle: Vec<i32>,
+    #[serde(default)]
+    pub affinity_p2: Option<i32>,
+
+    // Lineage white spark scoring (boosts inheritance rate)
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub lineage_white: Vec<i32>,
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub main_legacy_white: Vec<i32>,
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub left_legacy_white: Vec<i32>,
+    #[serde(default, deserialize_with = "deserialize_vec_i32_from_query")]
+    pub right_legacy_white: Vec<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,4 +172,8 @@ pub struct UnifiedAccountRecord {
     pub last_updated: Option<NaiveDateTime>,
     pub inheritance: Option<super::inheritance::Inheritance>,
     pub support_card: Option<super::support_cards::SupportCard>, // Single best support card, not array
+    /// Set on bookmark listings: true when the inheritance has changed since
+    /// the user bookmarked it. Omitted from search responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_stale: Option<bool>,
 }

@@ -181,20 +181,18 @@ async fn get_profile(
     .unwrap_or(None);
 
     // 7) Inheritance
-    let inheritance = sqlx::query_as::<_, Inheritance>(
-        "SELECT * FROM inheritance WHERE account_id = $1",
-    )
-    .bind(&account_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let inheritance =
+        sqlx::query_as::<_, Inheritance>("SELECT * FROM inheritance WHERE account_id = $1")
+            .bind(&account_id)
+            .fetch_optional(&state.db)
+            .await?;
 
     // 8) Support card
-    let support_card = sqlx::query_as::<_, SupportCard>(
-        "SELECT * FROM support_card WHERE account_id = $1",
-    )
-    .bind(&account_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let support_card =
+        sqlx::query_as::<_, SupportCard>("SELECT * FROM support_card WHERE account_id = $1")
+            .bind(&account_id)
+            .fetch_optional(&state.db)
+            .await?;
 
     // 9) Team stadium members
     let team_stadium = sqlx::query_as::<_, TeamStadiumMember>(

@@ -1,6 +1,8 @@
+pub mod affinity;
 pub mod auth;
 pub mod circles;
 pub mod docs;
+pub mod partner;
 pub mod profile;
 pub mod rankings;
 pub mod search;

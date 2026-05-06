@@ -8,3 +8,6 @@ data/single_mode_wins_saddle.json
 affinity.py
 checker.js
 filter.py
+trainers.dump.filepart
+.gitignore
+account_id_analysis.py

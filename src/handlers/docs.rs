@@ -1,8 +1,4 @@
-use axum::{
-    response::Html,
-    routing::get,
-    Router,
-};
+use axum::{response::Html, routing::get, Router};
 
 const SWAGGER_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">

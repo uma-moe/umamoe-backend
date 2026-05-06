@@ -58,11 +58,7 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
         }
 
         // 2) Try API key from X-API-Key header
-        if let Some(raw_key) = parts
-            .headers
-            .get("X-API-Key")
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(raw_key) = parts.headers.get("X-API-Key").and_then(|v| v.to_str().ok()) {
             let mut hasher = Sha256::new();
             hasher.update(raw_key.as_bytes());
             let key_hash = format!("{:x}", hasher.finalize());
@@ -87,5 +83,27 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             message: "Missing or invalid authentication (provide Authorization: Bearer <jwt> or X-API-Key header)".into(),
             status: StatusCode::UNAUTHORIZED,
         })
+    }
+}
+
+/// Like [`AuthenticatedUser`] but does not reject when no credentials are
+/// supplied. Returns `Some(user)` if a valid JWT or API key is present,
+/// `None` otherwise. Useful for endpoints that have anonymous fallback
+/// behaviour (e.g. partner lookup without persistence).
+#[derive(Debug, Clone)]
+pub struct OptionalUser(pub Option<AuthenticatedUser>);
+
+#[async_trait]
+impl FromRequestParts<AppState> for OptionalUser {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        match AuthenticatedUser::from_request_parts(parts, state).await {
+            Ok(user) => Ok(OptionalUser(Some(user))),
+            Err(_) => Ok(OptionalUser(None)),
+        }
     }
 }

@@ -52,9 +52,7 @@ pub async fn track_daily_visit(
     }
 }
 
-pub async fn get_stats(
-    State(state): State<AppState>,
-) -> Result<Json<StatsResponse>, AppError> {
+pub async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, AppError> {
     let cache_key = "stats:main";
     if let Some(cached) = crate::cache::get::<StatsResponse>(cache_key) {
         return Ok(Json(cached));

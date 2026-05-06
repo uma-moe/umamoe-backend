@@ -3,6 +3,7 @@ pub mod auth;
 mod circles;
 mod common;
 mod inheritance;
+mod partner;
 pub mod profile;
 mod rankings;
 mod search;
@@ -14,6 +15,7 @@ mod tasks;
 // Re-export everything from each module except common (items from common are imported directly where needed)
 pub use circles::*;
 pub use inheritance::*;
+pub use partner::*;
 pub use rankings::*;
 pub use search::*;
 pub use sharing::*;

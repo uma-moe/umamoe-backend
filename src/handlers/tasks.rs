@@ -5,11 +5,22 @@ use axum::{
     Router,
 };
 use serde_json::json;
+use sqlx::PgPool;
 use validator::Validate;
 
 use crate::errors::AppError;
 use crate::models::{CreateTaskRequest, TaskResponse, TrainerSubmissionRequest};
 use crate::AppState;
+
+/// Reset the tasks id sequence if it falls behind (e.g. after manual inserts).
+/// Called once on the first sequence-collision retry so subsequent inserts succeed.
+async fn fix_task_sequence(pool: &PgPool) {
+    let _ = sqlx::query(
+        "SELECT setval(pg_get_serial_sequence('tasks','id'), COALESCE((SELECT MAX(id) FROM tasks),0)+1, false)"
+    )
+    .execute(pool)
+    .await;
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -46,24 +57,32 @@ async fn submit_trainer_id(
         "action": "search"
     });
 
-    // Insert task into database
-    let task = sqlx::query_as::<_, crate::models::Task>(
-        r#"
-        INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
-        VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
-        RETURNING id, task_type, task_data, priority, status, created_at, updated_at, worker_id, error_message, account_id
-        "#
-    )
-    .bind("friend/search")
-    .bind(task_data)
-    .bind(1i32)
-    .bind(None::<String>)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to insert task: {}", e);
-        AppError::DatabaseError("Failed to create task".to_string())
-    })?;
+    // Insert task into database (retry once if the id sequence is out of sync)
+    let task = {
+        let q = || {
+            sqlx::query_as::<_, crate::models::Task>(
+                r#"
+                INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
+                VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
+                RETURNING id, task_type, task_data, priority, status, created_at, updated_at, worker_id, error_message, account_id
+                "#
+            )
+            .bind("friend/search")
+            .bind(&task_data)
+            .bind(1i32)
+            .bind(None::<String>)
+        };
+        match q().fetch_one(&state.db).await {
+            Ok(t) => t,
+            Err(_) => {
+                fix_task_sequence(&state.db).await;
+                q().fetch_one(&state.db).await.map_err(|e| {
+                    tracing::error!("Failed to insert task: {}", e);
+                    AppError::DatabaseError("Failed to create task".to_string())
+                })?
+            }
+        }
+    };
 
     Ok(Json(TaskResponse {
         id: task.id,
@@ -89,24 +108,32 @@ async fn create_task(
 
     let priority = payload.priority.unwrap_or(0);
 
-    // Insert task into database
-    let task = sqlx::query_as::<_, crate::models::Task>(
-        r#"
-        INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
-        VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
-        RETURNING id, task_type, task_data, priority, status, created_at, updated_at, worker_id, error_message, account_id
-        "#
-    )
-    .bind(payload.task_type)
-    .bind(payload.task_data)
-    .bind(priority)
-    .bind(payload.account_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to insert task: {}", e);
-        AppError::DatabaseError("Failed to create task".to_string())
-    })?;
+    // Insert task into database (retry once if the id sequence is out of sync)
+    let task = {
+        let q = || {
+            sqlx::query_as::<_, crate::models::Task>(
+                r#"
+                INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
+                VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
+                RETURNING id, task_type, task_data, priority, status, created_at, updated_at, worker_id, error_message, account_id
+                "#
+            )
+            .bind(&payload.task_type)
+            .bind(&payload.task_data)
+            .bind(priority)
+            .bind(&payload.account_id)
+        };
+        match q().fetch_one(&state.db).await {
+            Ok(t) => t,
+            Err(_) => {
+                fix_task_sequence(&state.db).await;
+                q().fetch_one(&state.db).await.map_err(|e| {
+                    tracing::error!("Failed to insert task: {}", e);
+                    AppError::DatabaseError("Failed to create task".to_string())
+                })?
+            }
+        }
+    };
 
     Ok(Json(TaskResponse {
         id: task.id,
@@ -142,23 +169,29 @@ async fn report_trainer_unavailable(
         "id": trainer_id
     });
 
-    // Create high-priority friend search task
-    sqlx::query(
-        r#"
-        INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
-        VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
-        "#,
-    )
-    .bind("friend/search")
-    .bind(&task_data)
-    .bind(0i32) // High priority for forced updates
-    .bind(None::<String>)
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        tracing::error!("Failed to create task: {}", e);
-        AppError::DatabaseError("Failed to create task".to_string())
-    })?;
+    // Create high-priority friend search task (retry once if the id sequence is out of sync)
+    let q = || {
+        sqlx::query(
+            r#"
+            INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
+            VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
+            "#,
+        )
+        .bind("friend/search")
+        .bind(&task_data)
+        .bind(0i32) // High priority for forced updates
+        .bind(None::<String>)
+    };
+    match q().execute(&state.db).await {
+        Ok(_) => {}
+        Err(_) => {
+            fix_task_sequence(&state.db).await;
+            q().execute(&state.db).await.map_err(|e| {
+                tracing::error!("Failed to create task: {}", e);
+                AppError::DatabaseError("Failed to create task".to_string())
+            })?;
+        }
+    }
 
     Ok(Json(json!({
         "success": true,

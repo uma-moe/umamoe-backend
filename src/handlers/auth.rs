@@ -17,22 +17,18 @@ use uuid::Uuid;
 use crate::errors::AppError;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::models::auth::{
-    ApiKeyResponse, CreateApiKeyRequest, CreateApiKeyResponse, IdentityResponse,
+    ApiKeyResponse, BookmarkEntry, CreateApiKeyRequest, CreateApiKeyResponse, IdentityResponse,
     LinkAccountRequest, LinkResponse, LinkedAccountResponse, UserResponse, VerifyAccountRequest,
     VerifyResponse,
 };
+use crate::models::{Inheritance, SupportCard, UnifiedAccountRecord};
 use crate::AppState;
 
 // ── Types ───────────────────────────────────────────────────────
 
 /// OAuth client with auth URL and token URL configured (type-state).
-type OAuthClient = BasicClient<
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointSet,
->;
+type OAuthClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 /// Simple error type for the OAuth HTTP client adapter.
 #[derive(Debug)]
@@ -50,6 +46,10 @@ impl std::error::Error for OAuthHttpError {}
 
 pub fn public_router() -> Router<AppState> {
     Router::new()
+        .route(
+            "/browser-proof",
+            post(crate::middleware::turnstile::exchange_browser_proof),
+        )
         .route("/login/:provider", get(login))
         .route("/callback/:provider", get(callback))
 }
@@ -67,6 +67,12 @@ pub fn authenticated_router() -> Router<AppState> {
         .route("/link/:account_id", delete(unlink_account))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/:key_id", delete(revoke_api_key))
+        .route("/bookmarks", get(list_bookmarks))
+        .route("/bookmarks/bulk-delete", post(bulk_remove_bookmarks))
+        .route(
+            "/bookmarks/:account_id",
+            post(add_bookmark).delete(remove_bookmark),
+        )
 }
 
 // ── OAuth helpers ───────────────────────────────────────────────
@@ -111,27 +117,31 @@ fn build_oauth_client(
     state: &AppState,
 ) -> Result<OAuthClient, AppError> {
     let env_prefix = provider.to_uppercase();
-    let client_id = std::env::var(format!("{}_CLIENT_ID", env_prefix)).map_err(|_| {
-        AppError::BadRequest(format!("{}_CLIENT_ID not configured", env_prefix))
+    let client_id = std::env::var(format!("{}_CLIENT_ID", env_prefix))
+        .map_err(|_| AppError::BadRequest(format!("{}_CLIENT_ID not configured", env_prefix)))?;
+    let client_secret = std::env::var(format!("{}_CLIENT_SECRET", env_prefix)).map_err(|_| {
+        AppError::BadRequest(format!("{}_CLIENT_SECRET not configured", env_prefix))
     })?;
-    let client_secret =
-        std::env::var(format!("{}_CLIENT_SECRET", env_prefix)).map_err(|_| {
-            AppError::BadRequest(format!("{}_CLIENT_SECRET not configured", env_prefix))
-        })?;
 
-    let redirect_url = format!("{}/api/auth/callback/{}", state.oauth_redirect_base, provider);
+    let redirect_url = format!(
+        "{}/api/auth/callback/{}",
+        state.oauth_redirect_base, provider
+    );
 
     let client = BasicClient::new(ClientId::new(client_id))
         .set_client_secret(ClientSecret::new(client_secret))
-        .set_auth_uri(AuthUrl::new(config.auth_url.to_owned()).map_err(|e| {
-            AppError::BadRequest(format!("Invalid auth URL: {}", e))
-        })?)
-        .set_token_uri(TokenUrl::new(config.token_url.to_owned()).map_err(|e| {
-            AppError::BadRequest(format!("Invalid token URL: {}", e))
-        })?)
-        .set_redirect_uri(RedirectUrl::new(redirect_url).map_err(|e| {
-            AppError::BadRequest(format!("Invalid redirect URL: {}", e))
-        })?);
+        .set_auth_uri(
+            AuthUrl::new(config.auth_url.to_owned())
+                .map_err(|e| AppError::BadRequest(format!("Invalid auth URL: {}", e)))?,
+        )
+        .set_token_uri(
+            TokenUrl::new(config.token_url.to_owned())
+                .map_err(|e| AppError::BadRequest(format!("Invalid token URL: {}", e)))?,
+        )
+        .set_redirect_uri(
+            RedirectUrl::new(redirect_url)
+                .map_err(|e| AppError::BadRequest(format!("Invalid redirect URL: {}", e)))?,
+        );
 
     Ok(client)
 }
@@ -158,10 +168,14 @@ async fn fetch_userinfo(
                 .bearer_auth(access_token)
                 .send()
                 .await
-                .map_err(|e| AppError::BadRequest(format!("Google userinfo request failed: {}", e)))?
+                .map_err(|e| {
+                    AppError::BadRequest(format!("Google userinfo request failed: {}", e))
+                })?
                 .json()
                 .await
-                .map_err(|e| AppError::BadRequest(format!("Google userinfo parse failed: {}", e)))?;
+                .map_err(|e| {
+                    AppError::BadRequest(format!("Google userinfo parse failed: {}", e))
+                })?;
 
             Ok(ProviderUserInfo {
                 provider_user_id: resp["sub"].as_str().unwrap_or_default().to_owned(),
@@ -176,15 +190,22 @@ async fn fetch_userinfo(
                 .bearer_auth(access_token)
                 .send()
                 .await
-                .map_err(|e| AppError::BadRequest(format!("Discord userinfo request failed: {}", e)))?
+                .map_err(|e| {
+                    AppError::BadRequest(format!("Discord userinfo request failed: {}", e))
+                })?
                 .json()
                 .await
-                .map_err(|e| AppError::BadRequest(format!("Discord userinfo parse failed: {}", e)))?;
+                .map_err(|e| {
+                    AppError::BadRequest(format!("Discord userinfo parse failed: {}", e))
+                })?;
 
             let discord_id = resp["id"].as_str().unwrap_or_default().to_owned();
             let avatar_hash = resp["avatar"].as_str();
             let avatar_url = avatar_hash.map(|h| {
-                format!("https://cdn.discordapp.com/avatars/{}/{}.png", discord_id, h)
+                format!(
+                    "https://cdn.discordapp.com/avatars/{}/{}.png",
+                    discord_id, h
+                )
             });
 
             Ok(ProviderUserInfo {
@@ -209,11 +230,7 @@ async fn fetch_userinfo(
     }
 }
 
-/// Generate a 60-character verification token with an embedded timestamp.
-/// The first 12 characters encode the current unix timestamp (base32),
-/// followed by 48 random alphanumeric characters. This prevents token
-/// collisions even if a user leaves an old token in their profile.
-///
+/// Generate a 60-character random verification token.
 /// Tokens are checked against the game's profanity filter to ensure
 /// users can actually save them in their profile description.
 fn generate_verification_token() -> String {
@@ -221,25 +238,10 @@ fn generate_verification_token() -> String {
     let mut rng = rand::thread_rng();
 
     loop {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut ts_part = String::with_capacity(12);
-        let mut remaining = ts;
-        for _ in 0..12 {
-            ts_part.push(CHARSET[(remaining % CHARSET.len() as u64) as usize] as char);
-            remaining /= CHARSET.len() as u64;
-        }
-
-        let random_part: String = (0..48)
-            .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
-                CHARSET[idx] as char
-            })
+        let token: String = (0..60)
+            .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
             .collect();
 
-        let token = format!("{}{}", ts_part, random_part);
         if !token_hits_profanity_filter(&token) {
             return token;
         }
@@ -253,20 +255,17 @@ fn generate_verification_token() -> String {
 /// profile description, we check start/end for those.
 fn token_hits_profanity_filter(token: &str) -> bool {
     const BLOCKED_ANYWHERE: &[&str] = &[
-        "cuck", "puta", "ubre", "naga", "69", "terf", "hate", "anal", "buta",
-        "anus", "twat", "tata", "tard", "smut", "suck", "phuq", "muff", "cbt",
-        "gay", "gei", "jcb", "jew", "pud", "baka", "damn", "debu", "gash",
-        "jerk", "bum", "xx", "jj", "3p", "sex", "cul",
+        "cuck", "puta", "ubre", "naga", "69", "terf", "hate", "anal", "buta", "anus", "twat",
+        "tata", "tard", "smut", "suck", "phuq", "muff", "cbt", "gay", "gei", "jcb", "jew", "pud",
+        "baka", "damn", "debu", "gash", "jerk", "bum", "xx", "jj", "3p", "sex", "cul", "c8",
         // include words with chars outside our charset for future-proofing
-        "spik", "binge", "sodo", "chie", "piss", "roa", "ago", "follo",
-        "k1ll", "rading", "arei", "pedo", "injun", "assi", "unti", "shota",
-        "puto", "gringo", "gaiji", "chinc", "insin", "ombo", "nabo", "kuso",
-        "kick", "keto", "jot", "omg", "omu", "poa", "boob", "bomb", "dick",
+        "spik", "binge", "sodo", "chie", "piss", "roa", "ago", "follo", "k1ll", "rading", "arei",
+        "pedo", "injun", "assi", "unti", "shota", "puto", "gringo", "gaiji", "chinc", "insin",
+        "ombo", "nabo", "kuso", "kick", "keto", "jot", "omg", "omu", "poa", "boob", "bomb", "dick",
         "cock", "isis", "aho", "ifica", "tits", "inko", "impo", "etti",
     ];
     const BLOCKED_BOUNDARY: &[&str] = &[
-        "jap", "ntr", "sag", "butt", "fuk", "ass", "sm",
-        "abo", "kill", "tit", "shine", "ho", "hit",
+        "jap", "ntr", "sag", "butt", "fuk", "ass", "sm", "abo", "kill", "tit", "shine", "ho", "hit",
     ];
 
     let lower = token.to_ascii_lowercase();
@@ -277,7 +276,57 @@ fn token_hits_profanity_filter(token: &str) -> bool {
             .any(|w| lower.starts_with(w) || lower.ends_with(w))
 }
 
+// ── Helpers ─────────────────────────────────────────────────────
+
+/// Resolve the frontend base URL for post-auth redirects.
+///
+/// If `origin` is supplied and its host matches one of the entries in
+/// `ALLOWED_ORIGINS` (the same list used by CORS), we redirect there.
+/// Otherwise we fall back to the `FRONTEND_URL` env var (default: `https://uma.moe`).
+///
+/// This prevents open-redirect attacks while still letting beta/staging
+/// deployments pass `?origin=https://beta.uma.moe`.
+fn resolve_frontend_url(origin: Option<&str>) -> String {
+    let default = std::env::var("FRONTEND_URL").unwrap_or_else(|_| "https://uma.moe".to_string());
+
+    let Some(raw) = origin else {
+        return default;
+    };
+
+    // Parse the candidate origin so we can compare hosts safely.
+    let Ok(candidate) = raw.parse::<axum::http::Uri>() else {
+        return default;
+    };
+    let candidate_host = match candidate.host() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return default,
+    };
+
+    let allowed = std::env::var("ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "https://uma.moe,https://www.uma.moe".to_string());
+
+    let is_allowed = allowed.split(',').any(|entry| {
+        let trimmed = entry.trim();
+        if let Ok(u) = trimmed.parse::<axum::http::Uri>() {
+            u.host().map(|h| h.to_ascii_lowercase()).as_deref() == Some(candidate_host.as_str())
+        } else {
+            false
+        }
+    });
+
+    if is_allowed {
+        raw.trim_end_matches('/').to_string()
+    } else {
+        default
+    }
+}
+
 // ── Handlers ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct LoginParams {
+    pub origin: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CallbackParams {
@@ -289,6 +338,7 @@ pub struct CallbackParams {
 async fn login(
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    Query(params): Query<LoginParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let config = provider_config(&provider)?;
     let client = build_oauth_client(&provider, &config, &state)?;
@@ -299,10 +349,15 @@ async fn login(
     }
     let (auth_url, csrf_state) = auth_request.url();
 
-    // Store CSRF state in cache (5 min TTL)
+    // Store CSRF state in cache (5 min TTL).
+    // Value format: "<provider>" or "<provider>|<origin>" when an origin is given.
+    let cache_val = match params.origin.as_deref() {
+        Some(origin) => format!("{}|{}", provider, origin),
+        None => provider.clone(),
+    };
     let _ = crate::cache::set(
         &format!("oauth_state:{}", csrf_state.secret()),
-        &provider,
+        &cache_val,
         std::time::Duration::from_secs(300),
     );
 
@@ -321,15 +376,25 @@ async fn callback(
     Query(params): Query<CallbackParams>,
 ) -> Result<Redirect, AppError> {
     // Validate CSRF state
-    let cached_provider: Option<String> =
-        crate::cache::get(&format!("oauth_state:{}", params.state));
-    match cached_provider {
-        Some(ref p) if p == &provider => {}
-        _ => {
+    let cached_val: Option<String> = crate::cache::get(&format!("oauth_state:{}", params.state));
+    let (cached_provider, login_origin) = match cached_val.as_deref() {
+        Some(v) => {
+            if let Some((p, o)) = v.split_once('|') {
+                (p.to_string(), Some(o.to_string()))
+            } else {
+                (v.to_string(), None)
+            }
+        }
+        None => {
             return Err(AppError::BadRequest(
                 "Invalid or expired OAuth state".into(),
             ));
         }
+    };
+    if cached_provider != provider {
+        return Err(AppError::BadRequest(
+            "Invalid or expired OAuth state".into(),
+        ));
     }
     // Invalidate used state
     crate::cache::invalidate(&format!("oauth_state:{}", params.state));
@@ -371,8 +436,7 @@ async fn callback(
     let access_token = token_response.access_token().secret().to_owned();
 
     // Fetch user profile from provider
-    let userinfo =
-        fetch_userinfo(&provider, &access_token, &state.search_client, &config).await?;
+    let userinfo = fetch_userinfo(&provider, &access_token, &state.search_client, &config).await?;
 
     if userinfo.provider_user_id.is_empty() {
         return Err(AppError::BadRequest(
@@ -429,12 +493,10 @@ async fn callback(
     } else {
         // Check if a user with the same email already exists (auto-merge by email)
         let existing_by_email = if let Some(ref email) = userinfo.email {
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM users WHERE email = $1",
-            )
-            .bind(crate::auth::hash_email(email))
-            .fetch_optional(&state.db)
-            .await?
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
+                .bind(crate::auth::hash_email(email))
+                .fetch_optional(&state.db)
+                .await?
         } else {
             None
         };
@@ -458,7 +520,6 @@ async fn callback(
 
             info!(
                 "🔗 Auto-linked {} identity to existing user {} by email",
-
                 provider, existing_uid
             );
 
@@ -512,11 +573,10 @@ async fn callback(
     );
 
     // Redirect to frontend with token
-    let frontend_url = std::env::var("FRONTEND_URL")
-        .unwrap_or_else(|_| "https://uma.moe".to_string());
+    let frontend_url = resolve_frontend_url(login_origin.as_deref());
     let redirect_url = format!(
         "{}/auth/callback?token={}",
-        frontend_url.trim_end_matches('/'),
+        frontend_url,
         urlencoding::encode(&token)
     );
 
@@ -528,13 +588,11 @@ async fn get_me(
     user: AuthenticatedUser,
     State(state): State<AppState>,
 ) -> Result<Json<UserResponse>, AppError> {
-    let row = sqlx::query_as::<_, crate::models::auth::User>(
-        "SELECT * FROM users WHERE id = $1",
-    )
-    .bind(user.user_id)
-    .fetch_optional(&state.db)
-    .await?
-    .ok_or_else(|| AppError::NotFound("User not found".into()))?;
+    let row = sqlx::query_as::<_, crate::models::auth::User>("SELECT * FROM users WHERE id = $1")
+        .bind(user.user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".into()))?;
 
     let providers = sqlx::query_scalar::<_, String>(
         "SELECT provider FROM user_identities WHERE user_id = $1 ORDER BY created_at",
@@ -606,7 +664,11 @@ async fn list_accounts(
             Some(e) => (Some(e.name), e.main_parent_id),
             None => (None, None),
         };
-        responses.push(LinkedAccountResponse::from_linked(la, trainer_name, representative_uma_id));
+        responses.push(LinkedAccountResponse::from_linked(
+            la,
+            trainer_name,
+            representative_uma_id,
+        ));
     }
 
     Ok(Json(responses))
@@ -729,12 +791,11 @@ async fn verify_account(
     for _ in 0..30 {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let status: Option<(String,)> = sqlx::query_as(
-            "SELECT verification_status FROM linked_accounts WHERE id = $1",
-        )
-        .bind(linked.id)
-        .fetch_optional(&state.db)
-        .await?;
+        let status: Option<(String,)> =
+            sqlx::query_as("SELECT verification_status FROM linked_accounts WHERE id = $1")
+                .bind(linked.id)
+                .fetch_optional(&state.db)
+                .await?;
 
         match status {
             Some((ref s,)) if s == "verified" => {
@@ -789,24 +850,21 @@ async fn unlink_account(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let result = sqlx::query(
-        "DELETE FROM linked_accounts WHERE user_id = $1 AND account_id = $2",
-    )
-    .bind(user.user_id)
-    .bind(&account_id)
-    .execute(&state.db)
-    .await?;
+    let result = sqlx::query("DELETE FROM linked_accounts WHERE user_id = $1 AND account_id = $2")
+        .bind(user.user_id)
+        .bind(&account_id)
+        .execute(&state.db)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("Linked account not found".into()));
     }
 
-    info!(
-        "🔓 User {} unlinked account {}",
-        user.user_id, account_id
-    );
+    info!("🔓 User {} unlinked account {}", user.user_id, account_id);
 
-    Ok(Json(json!({ "status": "unlinked", "account_id": account_id })))
+    Ok(Json(
+        json!({ "status": "unlinked", "account_id": account_id }),
+    ))
 }
 
 // ── Multi-SSO: connect / disconnect / list identities ───────────
@@ -839,6 +897,7 @@ async fn connect_provider(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(provider): Path<String>,
+    Query(params): Query<LoginParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Check if already connected
     let already = sqlx::query_scalar::<_, i32>(
@@ -875,10 +934,15 @@ async fn connect_provider(
     }
     let (auth_url, csrf_state) = auth_request.url();
 
-    // Store CSRF state with user_id so we know who to link
+    // Store CSRF state with user_id so we know who to link.
+    // Format: "<user_id>:<provider>" or "<user_id>:<provider>|<origin>"
+    let cache_val = match params.origin.as_deref() {
+        Some(origin) => format!("{}:{}|{}", user.user_id, provider, origin),
+        None => format!("{}:{}", user.user_id, provider),
+    };
     let _ = crate::cache::set(
         &format!("oauth_connect:{}", csrf_state.secret()),
-        &format!("{}:{}", user.user_id, provider),
+        &cache_val,
         std::time::Duration::from_secs(300),
     );
 
@@ -900,12 +964,17 @@ async fn connect_callback(
     Query(params): Query<CallbackParams>,
 ) -> Result<Redirect, AppError> {
     // Look up cached connect state
-    let cached: Option<String> =
-        crate::cache::get(&format!("oauth_connect:{}", params.state));
-    let (user_id_str, cached_provider) = cached
-        .as_deref()
-        .and_then(|v| v.split_once(':'))
+    // Format: "<user_id>:<provider>" or "<user_id>:<provider>|<origin>"
+    let cached: Option<String> = crate::cache::get(&format!("oauth_connect:{}", params.state));
+    let raw =
+        cached.ok_or_else(|| AppError::BadRequest("Invalid or expired connect state".into()))?;
+    let (user_id_str, rest) = raw
+        .split_once(':')
         .ok_or_else(|| AppError::BadRequest("Invalid or expired connect state".into()))?;
+    let (cached_provider, connect_origin) = match rest.split_once('|') {
+        Some((p, o)) => (p.to_string(), Some(o.to_string())),
+        None => (rest.to_string(), None),
+    };
 
     if cached_provider != provider {
         return Err(AppError::BadRequest("Provider mismatch".into()));
@@ -927,20 +996,24 @@ async fn connect_callback(
     let env_prefix = provider.to_uppercase();
     let client_id = std::env::var(format!("{}_CLIENT_ID", env_prefix))
         .map_err(|_| AppError::BadRequest(format!("{}_CLIENT_ID not configured", env_prefix)))?;
-    let client_secret = std::env::var(format!("{}_CLIENT_SECRET", env_prefix))
-        .map_err(|_| AppError::BadRequest(format!("{}_CLIENT_SECRET not configured", env_prefix)))?;
+    let client_secret = std::env::var(format!("{}_CLIENT_SECRET", env_prefix)).map_err(|_| {
+        AppError::BadRequest(format!("{}_CLIENT_SECRET not configured", env_prefix))
+    })?;
 
     let client = BasicClient::new(ClientId::new(client_id))
         .set_client_secret(ClientSecret::new(client_secret))
-        .set_auth_uri(AuthUrl::new(config.auth_url.to_owned()).map_err(|e| {
-            AppError::BadRequest(format!("Invalid auth URL: {}", e))
-        })?)
-        .set_token_uri(TokenUrl::new(config.token_url.to_owned()).map_err(|e| {
-            AppError::BadRequest(format!("Invalid token URL: {}", e))
-        })?)
-        .set_redirect_uri(RedirectUrl::new(redirect_url).map_err(|e| {
-            AppError::BadRequest(format!("Invalid redirect URL: {}", e))
-        })?);
+        .set_auth_uri(
+            AuthUrl::new(config.auth_url.to_owned())
+                .map_err(|e| AppError::BadRequest(format!("Invalid auth URL: {}", e)))?,
+        )
+        .set_token_uri(
+            TokenUrl::new(config.token_url.to_owned())
+                .map_err(|e| AppError::BadRequest(format!("Invalid token URL: {}", e)))?,
+        )
+        .set_redirect_uri(
+            RedirectUrl::new(redirect_url)
+                .map_err(|e| AppError::BadRequest(format!("Invalid redirect URL: {}", e)))?,
+        );
 
     // Exchange code
     let reqwest_client = state.search_client.clone();
@@ -974,11 +1047,12 @@ async fn connect_callback(
         .map_err(|e| AppError::BadRequest(format!("Token exchange failed: {}", e)))?;
 
     let access_token = token_response.access_token().secret().to_owned();
-    let userinfo =
-        fetch_userinfo(&provider, &access_token, &state.search_client, &config).await?;
+    let userinfo = fetch_userinfo(&provider, &access_token, &state.search_client, &config).await?;
 
     if userinfo.provider_user_id.is_empty() {
-        return Err(AppError::BadRequest("Provider did not return a user ID".into()));
+        return Err(AppError::BadRequest(
+            "Provider did not return a user ID".into(),
+        ));
     }
 
     // Check if this SSO identity is already linked to another user
@@ -992,11 +1066,10 @@ async fn connect_callback(
 
     if let Some(owner) = existing_owner {
         if owner != user_id {
-            let frontend_url = std::env::var("FRONTEND_URL")
-                .unwrap_or_else(|_| "https://uma.moe".to_string());
+            let frontend_url = resolve_frontend_url(connect_origin.as_deref());
             let redirect_url = format!(
                 "{}/auth/connect?error={}",
-                frontend_url.trim_end_matches('/'),
+                frontend_url,
                 urlencoding::encode("This SSO account is already linked to another user")
             );
             return Ok(Redirect::temporary(&redirect_url));
@@ -1019,17 +1092,13 @@ async fn connect_callback(
         .execute(&state.db)
         .await?;
 
-        info!(
-            "🔗 User {} connected {} identity",
-            user_id, provider
-        );
+        info!("🔗 User {} connected {} identity", user_id, provider);
     }
 
-    let frontend_url = std::env::var("FRONTEND_URL")
-        .unwrap_or_else(|_| "https://uma.moe".to_string());
+    let frontend_url = resolve_frontend_url(connect_origin.as_deref());
     let redirect_url = format!(
         "{}/auth/connect?success={}",
-        frontend_url.trim_end_matches('/'),
+        frontend_url,
         urlencoding::encode(&provider)
     );
     Ok(Redirect::temporary(&redirect_url))
@@ -1042,12 +1111,11 @@ async fn disconnect_provider(
     Path(provider): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Must keep at least one identity
-    let count = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM user_identities WHERE user_id = $1",
-    )
-    .bind(user.user_id)
-    .fetch_one(&state.db)
-    .await?;
+    let count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_identities WHERE user_id = $1")
+            .bind(user.user_id)
+            .fetch_one(&state.db)
+            .await?;
 
     if count <= 1 {
         return Err(AppError::BadRequest(
@@ -1055,13 +1123,11 @@ async fn disconnect_provider(
         ));
     }
 
-    let result = sqlx::query(
-        "DELETE FROM user_identities WHERE user_id = $1 AND provider = $2",
-    )
-    .bind(user.user_id)
-    .bind(&provider)
-    .execute(&state.db)
-    .await?;
+    let result = sqlx::query("DELETE FROM user_identities WHERE user_id = $1 AND provider = $2")
+        .bind(user.user_id)
+        .bind(&provider)
+        .execute(&state.db)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!(
@@ -1072,7 +1138,9 @@ async fn disconnect_provider(
 
     info!("🔓 User {} disconnected {}", user.user_id, provider);
 
-    Ok(Json(json!({ "status": "disconnected", "provider": provider })))
+    Ok(Json(
+        json!({ "status": "disconnected", "provider": provider }),
+    ))
 }
 
 // ── API Key management ──────────────────────────────────────────
@@ -1169,13 +1237,11 @@ async fn revoke_api_key(
     State(state): State<AppState>,
     Path(key_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let result = sqlx::query(
-        "UPDATE api_keys SET revoked = TRUE WHERE id = $1 AND user_id = $2",
-    )
-    .bind(key_id)
-    .bind(user.user_id)
-    .execute(&state.db)
-    .await?;
+    let result = sqlx::query("UPDATE api_keys SET revoked = TRUE WHERE id = $1 AND user_id = $2")
+        .bind(key_id)
+        .bind(user.user_id)
+        .execute(&state.db)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("API key not found".into()));
@@ -1184,4 +1250,269 @@ async fn revoke_api_key(
     info!("🔑 User {} revoked API key {}", user.user_id, key_id);
 
     Ok(Json(json!({ "status": "revoked", "id": key_id })))
+}
+
+// ── Bookmarks ───────────────────────────────────────────────────
+
+/// GET /api/auth/bookmarks — list bookmarked inheritances for the current user.
+///
+/// Bookmarks are keyed by `account_id` (stable per trainer), not by
+/// `inheritance_id` (regenerated on every 7-day refresh). Each record
+/// carries an `is_stale` flag that is true when the trainer's inheritance
+/// has changed since the user bookmarked it — cheap to compute because
+/// `inheritance.content_hash` is a STORED generated column.
+async fn list_bookmarks(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<UnifiedAccountRecord>>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            i.account_id,
+            t.name AS trainer_name,
+            t.follower_num,
+            t.last_updated,
+            i.inheritance_id,
+            i.main_parent_id,
+            i.parent_left_id,
+            i.parent_right_id,
+            i.parent_rank,
+            i.parent_rarity,
+            i.blue_sparks,
+            i.pink_sparks,
+            i.green_sparks,
+            i.white_sparks,
+            i.win_count,
+            i.white_count,
+            i.main_blue_factors,
+            i.main_pink_factors,
+            i.main_green_factors,
+            i.main_white_factors,
+            i.main_white_count,
+            i.left_blue_factors,
+            i.left_pink_factors,
+            i.left_green_factors,
+            i.left_white_factors,
+            i.left_white_count,
+            i.right_blue_factors,
+            i.right_pink_factors,
+            i.right_green_factors,
+            i.right_white_factors,
+            i.right_white_count,
+            i.main_win_saddles,
+            i.left_win_saddles,
+            i.right_win_saddles,
+            i.race_results,
+            i.blue_stars_sum,
+            i.pink_stars_sum,
+            i.green_stars_sum,
+            i.white_stars_sum,
+            (COALESCE(i.base_affinity, 0) + COALESCE(i.race_affinity, 0)) AS affinity_score,
+            sc.support_card_id,
+            sc.limit_break_count,
+            sc.experience,
+            (ub.bookmarked_hash IS DISTINCT FROM i.content_hash) AS is_stale
+        FROM user_bookmarks ub
+        JOIN inheritance i ON i.account_id = ub.account_id
+        JOIN trainer t ON t.account_id = i.account_id
+        LEFT JOIN support_card sc ON sc.account_id = i.account_id
+        WHERE ub.user_id = $1
+        ORDER BY ub.created_at DESC
+        "#,
+    )
+    .bind(user.user_id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let records = rows
+        .into_iter()
+        .map(|row| {
+            use sqlx::Row;
+            let account_id: String = row.get("account_id");
+            let support_card = row
+                .try_get::<Option<i32>, _>("support_card_id")
+                .ok()
+                .flatten()
+                .map(|_| SupportCard {
+                    account_id: account_id.clone(),
+                    support_card_id: row.get("support_card_id"),
+                    limit_break_count: row.get("limit_break_count"),
+                    experience: row.get("experience"),
+                });
+            let inheritance = Some(Inheritance {
+                inheritance_id: row.get("inheritance_id"),
+                account_id: account_id.clone(),
+                main_parent_id: row.get("main_parent_id"),
+                parent_left_id: row.get("parent_left_id"),
+                parent_right_id: row.get("parent_right_id"),
+                parent_rank: row.get("parent_rank"),
+                parent_rarity: row.get("parent_rarity"),
+                blue_sparks: row.get("blue_sparks"),
+                pink_sparks: row.get("pink_sparks"),
+                green_sparks: row.get("green_sparks"),
+                white_sparks: row.get("white_sparks"),
+                win_count: row.get("win_count"),
+                white_count: row.get("white_count"),
+                main_blue_factors: row.get("main_blue_factors"),
+                main_pink_factors: row.get("main_pink_factors"),
+                main_green_factors: row.get("main_green_factors"),
+                main_white_factors: row.get("main_white_factors"),
+                main_white_count: row.get("main_white_count"),
+                left_blue_factors: row.get("left_blue_factors"),
+                left_pink_factors: row.get("left_pink_factors"),
+                left_green_factors: row.get("left_green_factors"),
+                left_white_factors: row.get("left_white_factors"),
+                left_white_count: row.get("left_white_count"),
+                right_blue_factors: row.get("right_blue_factors"),
+                right_pink_factors: row.get("right_pink_factors"),
+                right_green_factors: row.get("right_green_factors"),
+                right_white_factors: row.get("right_white_factors"),
+                right_white_count: row.get("right_white_count"),
+                main_win_saddles: row.get("main_win_saddles"),
+                left_win_saddles: row.get("left_win_saddles"),
+                right_win_saddles: row.get("right_win_saddles"),
+                race_results: row.get("race_results"),
+                blue_stars_sum: row.get("blue_stars_sum"),
+                pink_stars_sum: row.get("pink_stars_sum"),
+                green_stars_sum: row.get("green_stars_sum"),
+                white_stars_sum: row.get("white_stars_sum"),
+                affinity_score: row.try_get("affinity_score").ok(),
+            });
+            UnifiedAccountRecord {
+                account_id,
+                trainer_name: row.get("trainer_name"),
+                follower_num: row.get("follower_num"),
+                last_updated: row.get("last_updated"),
+                inheritance,
+                support_card,
+                is_stale: Some(row.get::<bool, _>("is_stale")),
+            }
+        })
+        .collect();
+
+    Ok(Json(records))
+}
+
+/// POST /api/auth/bookmarks/:account_id — add a bookmark.
+///
+/// Snapshots the current `content_hash` so we can detect when the inheritance
+/// later changes. Idempotent: re-bookmarking refreshes the snapshot.
+async fn add_bookmark(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+) -> Result<Json<BookmarkEntry>, AppError> {
+    let count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_bookmarks WHERE user_id = $1")
+            .bind(user.user_id)
+            .fetch_one(&state.db)
+            .await?;
+
+    if count >= 500 {
+        return Err(AppError::BadRequest(
+            "Maximum 500 bookmarks per user".into(),
+        ));
+    }
+
+    // Verify an inheritance row exists for this account, and grab its hash
+    // (may be NULL for rows that predate the content_hash trigger).
+    let hash_row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT content_hash FROM inheritance WHERE account_id = $1")
+            .bind(&account_id)
+            .fetch_optional(&state.db)
+            .await?;
+
+    let Some((current_hash,)) = hash_row else {
+        return Err(AppError::NotFound(
+            "No inheritance found for this account".into(),
+        ));
+    };
+
+    let row = sqlx::query_as::<_, BookmarkEntry>(
+        r#"
+        INSERT INTO user_bookmarks (user_id, account_id, bookmarked_hash)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id, account_id)
+        DO UPDATE SET bookmarked_hash = EXCLUDED.bookmarked_hash
+        RETURNING id, account_id, bookmarked_hash, created_at
+        "#,
+    )
+    .bind(user.user_id)
+    .bind(&account_id)
+    .bind(&current_hash)
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(row))
+}
+
+/// DELETE /api/auth/bookmarks/:account_id — remove a bookmark
+async fn remove_bookmark(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Path(account_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = sqlx::query("DELETE FROM user_bookmarks WHERE user_id = $1 AND account_id = $2")
+        .bind(user.user_id)
+        .bind(&account_id)
+        .execute(&state.db)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("Bookmark not found".into()));
+    }
+
+    Ok(Json(
+        json!({ "status": "removed", "account_id": account_id }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BulkRemoveBookmarksRequest {
+    /// Specific account_ids to remove. Ignored when `all` is true.
+    #[serde(default)]
+    pub account_ids: Vec<String>,
+    /// When true, remove every bookmark for the user.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// POST /api/auth/bookmarks/bulk-delete — remove many bookmarks at once.
+///
+/// Body: `{ "account_ids": ["123", "456"] }` to remove specific bookmarks,
+/// or `{ "all": true }` to clear every bookmark for the user.
+async fn bulk_remove_bookmarks(
+    user: AuthenticatedUser,
+    State(state): State<AppState>,
+    Json(payload): Json<BulkRemoveBookmarksRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !payload.all && payload.account_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "Provide `account_ids` or set `all: true`".into(),
+        ));
+    }
+
+    let result = if payload.all {
+        sqlx::query("DELETE FROM user_bookmarks WHERE user_id = $1")
+            .bind(user.user_id)
+            .execute(&state.db)
+            .await?
+    } else {
+        sqlx::query("DELETE FROM user_bookmarks WHERE user_id = $1 AND account_id = ANY($2)")
+            .bind(user.user_id)
+            .bind(&payload.account_ids)
+            .execute(&state.db)
+            .await?
+    };
+
+    info!(
+        "\u{1f5d1}\u{fe0f} User {} bulk-removed {} bookmarks",
+        user.user_id,
+        result.rows_affected()
+    );
+
+    Ok(Json(json!({
+        "status": "removed",
+        "removed_count": result.rows_affected(),
+    })))
 }

@@ -179,3 +179,14 @@ pub struct ApiKeyResponse {
     #[serde(serialize_with = "naive_datetime_as_utc::serialize")]
     pub created_at: NaiveDateTime,
 }
+
+// ── Bookmark types ──────────────────────────────────────────────
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct BookmarkEntry {
+    pub id: i32,
+    pub account_id: String,
+    pub bookmarked_hash: Option<String>,
+    #[serde(serialize_with = "naive_datetime_as_utc::serialize")]
+    pub created_at: NaiveDateTime,
+}

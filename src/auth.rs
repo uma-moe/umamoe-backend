@@ -30,17 +30,16 @@ pub fn hash_email(email: &str) -> String {
 }
 
 fn secret() -> Result<&'static str, jsonwebtoken::errors::Error> {
-    JWT_SECRET
-        .get()
-        .map(|s| s.as_str())
-        .ok_or_else(|| jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat))
+    JWT_SECRET.get().map(|s| s.as_str()).ok_or_else(|| {
+        jsonwebtoken::errors::Error::from(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat)
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: Uuid,       // user id
-    pub exp: usize,      // expiry (epoch seconds)
-    pub iat: usize,      // issued at
+    pub sub: Uuid,  // user id
+    pub exp: usize, // expiry (epoch seconds)
+    pub iat: usize, // issued at
 }
 
 /// Create a signed JWT for the given user. Expires in 7 days.

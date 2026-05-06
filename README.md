@@ -120,6 +120,52 @@ The application is production-ready with:
 - CORS configuration for web deployment
 - Rate limiting and security middleware
 
+### Docker
+
+Build the production container image from the repository root:
+
+```bash
+docker build -t umamoe-backend:local .
+```
+
+Run production locally with an env file:
+
+```bash
+docker run --rm \
+   --env-file .env \
+   -e HOST=0.0.0.0 \
+   -e PORT=3001 \
+   -p 127.0.0.1:3001:3001 \
+   umamoe-backend:local
+```
+
+Run a beta instance on the next port range:
+
+```bash
+docker run --rm \
+   --env-file .env \
+   -e HOST=0.0.0.0 \
+   -e PORT=3101 \
+   -p 127.0.0.1:3101:3101 \
+   umamoe-backend:local
+```
+
+### GitHub Actions Deployment
+
+The backend workflow at `.github/workflows/deploy-backend.yml` builds a Docker image, uploads it as an artifact, copies it to the server over SSH, and restarts one of two containers:
+
+- `umamoe-backend` on port `3001`
+- `umamoe-backend-beta` on port `3101`
+
+Required repository or environment secrets:
+
+- `DEPLOY_HOST`
+- `DEPLOY_PORT` (optional, defaults to `22`)
+- `DEPLOY_SSH_KEY`
+- `DEPLOY_KNOWN_HOSTS`
+
+On the server, create `/etc/umamoe-backend/prod.env` and `/etc/umamoe-backend/beta.env` using `deploy/backend.env.example` as the template. The deploy user must be able to run `docker` and write to `/tmp/umamoe-backend-images`.
+
 ## 🤝 Contributing
 
 1. Fork the repository

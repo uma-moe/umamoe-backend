@@ -93,8 +93,8 @@ pub async fn get_monthly_rankings(
     // Everything older is in the archive table.
     let current_month_start = NaiveDate::from_ymd_opt(now_jst.year(), now_jst.month(), 1).unwrap();
     let prev_month_start = current_month_start - chrono::Months::new(1);
-    let target_date = NaiveDate::from_ymd_opt(target_year, target_month as u32, 1)
-        .unwrap_or(current_month_start);
+    let target_date =
+        NaiveDate::from_ymd_opt(target_year, target_month as u32, 1).unwrap_or(current_month_start);
 
     let table_name = if target_date >= prev_month_start {
         "user_fan_rankings_monthly_current"
@@ -117,25 +117,47 @@ pub async fn get_monthly_rankings(
 
     let where_clause = format!(
         "year = $1 AND month = $2{}",
-        if extra_condition.is_empty() { String::new() } else { format!(" AND {}", extra_condition) }
+        if extra_condition.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", extra_condition)
+        }
     );
 
     // Count — cached per search query (not per page) since it's the slow part
-    let count_cache_key = format!("rank:monthly:count:{}:{}:{}",
-        target_year, target_month, params.query.as_deref().unwrap_or("_none_"));
+    let count_cache_key = format!(
+        "rank:monthly:count:{}:{}:{}",
+        target_year,
+        target_month,
+        params.query.as_deref().unwrap_or("_none_")
+    );
     let total: i64 = if let Some(cached) = crate::cache::get::<i64>(&count_cache_key) {
         cached
     } else {
         let count_sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table_name, where_clause);
-        let count = bind_search(sqlx::query_scalar(&count_sql).bind(target_year).bind(target_month), &search_id, &search_pattern)
-            .fetch_one(&state.db)
-            .await?;
-        let _ = crate::cache::set(&count_cache_key, &count, std::time::Duration::from_secs(300));
+        let count = bind_search(
+            sqlx::query_scalar(&count_sql)
+                .bind(target_year)
+                .bind(target_month),
+            &search_id,
+            &search_pattern,
+        )
+        .fetch_one(&state.db)
+        .await?;
+        let _ = crate::cache::set(
+            &count_cache_key,
+            &count,
+            std::time::Duration::from_secs(300),
+        );
         count
     };
 
     // Data
-    let (lp, op) = if search_id.is_some() || search_pattern.is_some() { ("$4", "$5") } else { ("$3", "$4") };
+    let (lp, op) = if search_id.is_some() || search_pattern.is_some() {
+        ("$4", "$5")
+    } else {
+        ("$3", "$4")
+    };
     let data_sql = format!(
         "SELECT viewer_id, trainer_name, year, month, total_fans, monthly_gain, active_days, \
          avg_daily, avg_3d, avg_7d, avg_monthly, rank, circle_id, circle_name, next_month_start \
@@ -143,17 +165,31 @@ pub async fn get_monthly_rankings(
         table_name, where_clause, order_by, lp, op
     );
     let rankings: Vec<UserFanRankingMonthly> = bind_search_and_page(
-        sqlx::query_as(&data_sql).bind(target_year).bind(target_month),
-        &search_id, &search_pattern, limit, offset,
+        sqlx::query_as(&data_sql)
+            .bind(target_year)
+            .bind(target_month),
+        &search_id,
+        &search_pattern,
+        limit,
+        offset,
     )
     .fetch_all(&state.db)
     .await?;
 
-    let total_pages = if limit > 0 { ((total as f64) / (limit as f64)).ceil() as i64 } else { 0 };
+    let total_pages = if limit > 0 {
+        ((total as f64) / (limit as f64)).ceil() as i64
+    } else {
+        0
+    };
 
     let response = MonthlyRankingsResponse {
-        rankings, total, page, limit, total_pages,
-        year: target_year, month: target_month,
+        rankings,
+        total,
+        page,
+        limit,
+        total_pages,
+        year: target_year,
+        month: target_month,
     };
 
     Ok(Json(response))
@@ -181,24 +217,41 @@ pub async fn get_alltime_rankings(
 
     let (extra_condition, search_id, search_pattern) = parse_search_query(&params.query, "$1");
 
-    let where_clause = if extra_condition.is_empty() { "TRUE".to_string() } else { extra_condition };
+    let where_clause = if extra_condition.is_empty() {
+        "TRUE".to_string()
+    } else {
+        extra_condition
+    };
 
     // Count — cached per search query (not per page)
-    let count_cache_key = format!("rank:alltime:count:{}",
-        params.query.as_deref().unwrap_or("_none_"));
+    let count_cache_key = format!(
+        "rank:alltime:count:{}",
+        params.query.as_deref().unwrap_or("_none_")
+    );
     let total: i64 = if let Some(cached) = crate::cache::get::<i64>(&count_cache_key) {
         cached
     } else {
-        let count_sql = format!("SELECT COUNT(*) FROM user_fan_rankings_alltime WHERE {}", where_clause);
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM user_fan_rankings_alltime WHERE {}",
+            where_clause
+        );
         let count = bind_search(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
             .fetch_one(&state.db)
             .await?;
-        let _ = crate::cache::set(&count_cache_key, &count, std::time::Duration::from_secs(300));
+        let _ = crate::cache::set(
+            &count_cache_key,
+            &count,
+            std::time::Duration::from_secs(300),
+        );
         count
     };
 
     // Data
-    let (lp, op) = if search_id.is_some() || search_pattern.is_some() { ("$2", "$3") } else { ("$1", "$2") };
+    let (lp, op) = if search_id.is_some() || search_pattern.is_some() {
+        ("$2", "$3")
+    } else {
+        ("$1", "$2")
+    };
     let data_sql = format!(
         "SELECT viewer_id, trainer_name, total_fans, total_gain, active_days, \
          avg_day, avg_week, avg_month, rank, \
@@ -209,15 +262,26 @@ pub async fn get_alltime_rankings(
     );
     let rankings: Vec<UserFanRankingAlltime> = bind_search_and_page(
         sqlx::query_as(&data_sql),
-        &search_id, &search_pattern, limit, offset,
+        &search_id,
+        &search_pattern,
+        limit,
+        offset,
     )
     .fetch_all(&state.db)
     .await?;
 
-    let total_pages = if limit > 0 { ((total as f64) / (limit as f64)).ceil() as i64 } else { 0 };
+    let total_pages = if limit > 0 {
+        ((total as f64) / (limit as f64)).ceil() as i64
+    } else {
+        0
+    };
 
     let response = AlltimeRankingsResponse {
-        rankings, total, page, limit, total_pages,
+        rankings,
+        total,
+        page,
+        limit,
+        total_pages,
     };
 
     Ok(Json(response))
@@ -243,24 +307,41 @@ pub async fn get_gains_rankings(
 
     let (extra_condition, search_id, search_pattern) = parse_search_query(&params.query, "$1");
 
-    let where_clause = if extra_condition.is_empty() { "TRUE".to_string() } else { extra_condition };
+    let where_clause = if extra_condition.is_empty() {
+        "TRUE".to_string()
+    } else {
+        extra_condition
+    };
 
     // Count — cached per search query (not per page)
-    let count_cache_key = format!("rank:gains:count:{}",
-        params.query.as_deref().unwrap_or("_none_"));
+    let count_cache_key = format!(
+        "rank:gains:count:{}",
+        params.query.as_deref().unwrap_or("_none_")
+    );
     let total: i64 = if let Some(cached) = crate::cache::get::<i64>(&count_cache_key) {
         cached
     } else {
-        let count_sql = format!("SELECT COUNT(*) FROM user_fan_rankings_gains WHERE {}", where_clause);
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM user_fan_rankings_gains WHERE {}",
+            where_clause
+        );
         let count = bind_search(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
             .fetch_one(&state.db)
             .await?;
-        let _ = crate::cache::set(&count_cache_key, &count, std::time::Duration::from_secs(300));
+        let _ = crate::cache::set(
+            &count_cache_key,
+            &count,
+            std::time::Duration::from_secs(300),
+        );
         count
     };
 
     // Data
-    let (lp, op) = if search_id.is_some() || search_pattern.is_some() { ("$2", "$3") } else { ("$1", "$2") };
+    let (lp, op) = if search_id.is_some() || search_pattern.is_some() {
+        ("$2", "$3")
+    } else {
+        ("$1", "$2")
+    };
     let data_sql = format!(
         "SELECT viewer_id, trainer_name, gain_3d, gain_7d, gain_30d, rank_3d, rank_7d, rank_30d, circle_id, circle_name \
          FROM user_fan_rankings_gains WHERE {} ORDER BY {} ASC LIMIT {} OFFSET {}",
@@ -268,15 +349,26 @@ pub async fn get_gains_rankings(
     );
     let rankings: Vec<UserFanRankingGains> = bind_search_and_page(
         sqlx::query_as(&data_sql),
-        &search_id, &search_pattern, limit, offset,
+        &search_id,
+        &search_pattern,
+        limit,
+        offset,
     )
     .fetch_all(&state.db)
     .await?;
 
-    let total_pages = if limit > 0 { ((total as f64) / (limit as f64)).ceil() as i64 } else { 0 };
+    let total_pages = if limit > 0 {
+        ((total as f64) / (limit as f64)).ceil() as i64
+    } else {
+        0
+    };
 
     let response = GainsRankingsResponse {
-        rankings, total, page, limit, total_pages,
+        rankings,
+        total,
+        page,
+        limit,
+        total_pages,
         sort_by: sort_by.to_string(),
     };
 
@@ -300,7 +392,10 @@ fn parse_search_query(
             } else if q.len() >= 2 {
                 let pat = format!("%{}%", q.replace('\'', "''"));
                 return (
-                    format!("(trainer_name ILIKE {} OR circle_name ILIKE {})", param, param),
+                    format!(
+                        "(trainer_name ILIKE {} OR circle_name ILIKE {})",
+                        param, param
+                    ),
                     None,
                     Some(pat),
                 );

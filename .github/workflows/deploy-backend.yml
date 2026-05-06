@@ -1,0 +1,316 @@
+name: Build And Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: Deployment target
+        required: true
+        default: both
+        type: choice
+        options:
+          - beta
+          - production
+          - both
+      beta_host_port:
+        description: Host port for the beta backend container
+        required: true
+        default: '3101'
+        type: string
+      production_host_port:
+        description: Host port for the production backend container
+        required: true
+        default: '3001'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PLATFORM: linux/amd64
+  CACHE_SCOPE: backend-container
+  DEPLOY_USER: github
+  REMOTE_IMAGE_DIR: /tmp/umamoe-backend-images
+  PROD_CONTAINER_NAME: umamoe-backend
+  BETA_CONTAINER_NAME: umamoe-backend-beta
+  PROD_ENV_FILE: /etc/umamoe-backend/prod.env
+  BETA_ENV_FILE: /etc/umamoe-backend/beta.env
+  PROD_APP_PORT: '3001'
+  BETA_APP_PORT: '3101'
+
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      archive_name: ${{ steps.meta.outputs.archive_name }}
+      beta_host_port: ${{ steps.plan.outputs.beta_host_port }}
+      deploy_target: ${{ steps.plan.outputs.deploy_target }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      production_host_port: ${{ steps.plan.outputs.production_host_port }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Choose deployment plan
+        id: plan
+        shell: bash
+        run: |
+          deploy_target="${{ github.event.inputs.deploy_target || 'both' }}"
+          beta_host_port="${{ github.event.inputs.beta_host_port || '3101' }}"
+          production_host_port="${{ github.event.inputs.production_host_port || '3001' }}"
+
+          echo "deploy_target=$deploy_target" >> "$GITHUB_OUTPUT"
+          echo "beta_host_port=$beta_host_port" >> "$GITHUB_OUTPUT"
+          echo "production_host_port=$production_host_port" >> "$GITHUB_OUTPUT"
+
+      - name: Set image metadata
+        id: meta
+        shell: bash
+        run: |
+          image_tag="umamoe-backend:${GITHUB_SHA}"
+          archive_name="umamoe-backend-${GITHUB_SHA}.tar.gz"
+
+          echo "image_tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "archive_name=$archive_name" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          pull: true
+          load: true
+          tags: ${{ steps.meta.outputs.image_tag }}
+          cache-from: type=gha,scope=${{ env.CACHE_SCOPE }}
+          cache-to: type=gha,mode=max,scope=${{ env.CACHE_SCOPE }}
+
+      - name: Save backend image
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          docker save "${{ steps.meta.outputs.image_tag }}" | gzip -1 > "${{ runner.temp }}/${{ steps.meta.outputs.archive_name }}"
+
+      - name: Upload backend image artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image
+          path: ${{ runner.temp }}/${{ steps.meta.outputs.archive_name }}
+          if-no-files-found: error
+
+  deploy_beta:
+    if: github.event_name != 'pull_request' && contains(fromJSON('["beta", "both"]'), needs.build.outputs.deploy_target)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: beta
+
+    steps:
+      - name: Download backend image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-image
+          path: ${{ runner.temp }}
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Configure known hosts
+        shell: bash
+        env:
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy beta container
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          ARCHIVE_NAME: ${{ needs.build.outputs.archive_name }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          HOST_PORT: ${{ needs.build.outputs.beta_host_port }}
+          CONTAINER_NAME: ${{ env.BETA_CONTAINER_NAME }}
+          APP_PORT: ${{ env.BETA_APP_PORT }}
+          ENV_FILE: ${{ env.BETA_ENV_FILE }}
+        run: |
+          set -euo pipefail
+
+          remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
+
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
+          rsync -az -e "ssh -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
+
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          archive="$1"
+          image_tag="$2"
+          container_name="$3"
+          app_port="$4"
+          host_port="$5"
+          env_file="$6"
+
+          if [ ! -f "$env_file" ]; then
+            echo "Missing container env file: $env_file" >&2
+            exit 1
+          fi
+
+          gzip -dc "$archive" | docker load
+
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
+          docker run -d \
+            --name "$container_name" \
+            --restart unless-stopped \
+            --env-file "$env_file" \
+            -e HOST=0.0.0.0 \
+            -e PORT="$app_port" \
+            -e DEBUG_MODE=false \
+            -p "127.0.0.1:${host_port}:${app_port}" \
+            "$image_tag"
+
+          for _ in $(seq 1 45); do
+            running="$(docker inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+
+            if [ "$health" = "healthy" ]; then
+              rm -f "$archive"
+              docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
+              exit 0
+            fi
+
+            if [ "$running" != "true" ]; then
+              docker logs --tail=120 "$container_name" || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail=120 "$container_name" || true
+          exit 1
+          REMOTE_SCRIPT
+
+  deploy_production:
+    if: always() && github.event_name != 'pull_request' && contains(fromJSON('["production", "both"]'), needs.build.outputs.deploy_target) && (needs.deploy_beta.result == 'success' || needs.deploy_beta.result == 'skipped')
+    needs:
+      - build
+      - deploy_beta
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Download backend image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-image
+          path: ${{ runner.temp }}
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Configure known hosts
+        shell: bash
+        env:
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy production container
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+          ARCHIVE_NAME: ${{ needs.build.outputs.archive_name }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          HOST_PORT: ${{ needs.build.outputs.production_host_port }}
+          CONTAINER_NAME: ${{ env.PROD_CONTAINER_NAME }}
+          APP_PORT: ${{ env.PROD_APP_PORT }}
+          ENV_FILE: ${{ env.PROD_ENV_FILE }}
+        run: |
+          set -euo pipefail
+
+          remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
+
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
+          rsync -az -e "ssh -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
+
+          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" <<'REMOTE_SCRIPT'
+          set -euo pipefail
+
+          archive="$1"
+          image_tag="$2"
+          container_name="$3"
+          app_port="$4"
+          host_port="$5"
+          env_file="$6"
+
+          if [ ! -f "$env_file" ]; then
+            echo "Missing container env file: $env_file" >&2
+            exit 1
+          fi
+
+          gzip -dc "$archive" | docker load
+
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
+          docker run -d \
+            --name "$container_name" \
+            --restart unless-stopped \
+            --env-file "$env_file" \
+            -e HOST=0.0.0.0 \
+            -e PORT="$app_port" \
+            -e DEBUG_MODE=false \
+            -p "127.0.0.1:${host_port}:${app_port}" \
+            "$image_tag"
+
+          for _ in $(seq 1 45); do
+            running="$(docker inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+
+            if [ "$health" = "healthy" ]; then
+              rm -f "$archive"
+              docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
+              exit 0
+            fi
+
+            if [ "$running" != "true" ]; then
+              docker logs --tail=120 "$container_name" || true
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail=120 "$container_name" || true
+          exit 1
+          REMOTE_SCRIPT
