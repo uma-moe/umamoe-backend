@@ -43,8 +43,7 @@ env:
   BETA_CONTAINER_NAME: umamoe-backend-beta
   PROD_ENV_FILE: /opt/umamoe-backend/prod.env
   BETA_ENV_FILE: /opt/umamoe-backend/beta.env
-  PROD_APP_PORT: '3001'
-  BETA_APP_PORT: '3101'
+  APP_PORT: '3001'
 
 concurrency:
   group: deploy-${{ github.workflow }}-${{ github.ref }}
@@ -191,7 +190,7 @@ jobs:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
           HOST_PORT: ${{ needs.build.outputs.beta_host_port }}
           CONTAINER_NAME: ${{ env.BETA_CONTAINER_NAME }}
-          APP_PORT: ${{ env.BETA_APP_PORT }}
+          APP_PORT: ${{ env.APP_PORT }}
           ENV_FILE: ${{ env.BETA_ENV_FILE }}
         run: |
           set -euo pipefail
@@ -223,6 +222,7 @@ jobs:
           docker run -d \
             --name "$container_name" \
             --restart unless-stopped \
+            --add-host host.docker.internal:host-gateway \
             --env-file "$env_file" \
             -e HOST=0.0.0.0 \
             -e PORT="$app_port" \
@@ -327,7 +327,7 @@ jobs:
           IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
           HOST_PORT: ${{ needs.build.outputs.production_host_port }}
           CONTAINER_NAME: ${{ env.PROD_CONTAINER_NAME }}
-          APP_PORT: ${{ env.PROD_APP_PORT }}
+          APP_PORT: ${{ env.APP_PORT }}
           ENV_FILE: ${{ env.PROD_ENV_FILE }}
         run: |
           set -euo pipefail
@@ -359,6 +359,7 @@ jobs:
           docker run -d \
             --name "$container_name" \
             --restart unless-stopped \
+            --add-host host.docker.internal:host-gateway \
             --env-file "$env_file" \
             -e HOST=0.0.0.0 \
             -e PORT="$app_port" \
