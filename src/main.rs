@@ -62,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
         .map(|v| v.to_lowercase() == "true" || v == "1")
         .unwrap_or(false);
+    let ignore_migration_version_mismatch = std::env::var("IGNORE_MIGRATION_VERSION_MISMATCH")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
 
     if skip_migrations {
         warn!("⚠️ Skipping migrations due to SKIP_MIGRATIONS=true");
@@ -96,10 +99,18 @@ async fn main() -> anyhow::Result<()> {
             match migrator.run(&pool).await {
                 Ok(_) => warn!("✅ Migrations completed successfully"),
                 Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
-                    error!("⚠️  Migration version mismatch: {}", version);
-                    error!("Database has different migration state than expected");
-                    error!("Consider resetting migrations: DROP TABLE _sqlx_migrations;");
-                    return Err(anyhow::anyhow!("Migration version mismatch"));
+                    if ignore_migration_version_mismatch {
+                        warn!("⚠️  Ignoring migration version mismatch for version {}", version);
+                        warn!(
+                            "Database migration history differs from this checkout, but startup will continue"
+                        );
+                    } else {
+                        error!("⚠️  Migration version mismatch: {}", version);
+                        error!("Database has different migration state than expected");
+                        error!("Set IGNORE_MIGRATION_VERSION_MISMATCH=true to continue startup when this is intentional");
+                        error!("Consider resetting migrations: DROP TABLE _sqlx_migrations;");
+                        return Err(anyhow::anyhow!("Migration version mismatch"));
+                    }
                 }
                 Err(e) => {
                     error!("❌ Failed to run migrations: {}", e);
