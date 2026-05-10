@@ -52,6 +52,7 @@ concurrency:
 
 jobs:
   build:
+    name: Build Backend Image
     runs-on: ubuntu-latest
     outputs:
       archive_name: ${{ steps.meta.outputs.archive_name }}
@@ -117,8 +118,9 @@ jobs:
           path: ${{ runner.temp }}/${{ steps.meta.outputs.archive_name }}
           if-no-files-found: error
 
-  deploy_beta:
-    if: github.event_name != 'pull_request' && contains(fromJSON('["beta", "both"]'), needs.build.outputs.deploy_target)
+  deploy_dev:
+    name: Deploy Dev
+    if: github.event_name != 'pull_request' && contains(fromJSON('["beta", "production", "both"]'), needs.build.outputs.deploy_target)
     needs: build
     runs-on: ubuntu-latest
     environment: beta
@@ -130,22 +132,57 @@ jobs:
           name: backend-image
           path: ${{ runner.temp }}
 
+      - name: Mask deployment metadata
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          mask_value() {
+            local value="$1"
+            if [[ -n "$value" ]]; then
+              echo "::add-mask::$value"
+            fi
+          }
+
+          mask_value "$DEPLOY_HOST"
+
+          while IFS= read -r known_host_line; do
+            mask_value "$known_host_line"
+            read -r known_host _ key_body _ <<< "$known_host_line"
+            mask_value "$known_host"
+            mask_value "$key_body"
+          done <<< "$DEPLOY_KNOWN_HOSTS"
+
       - name: Start SSH agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+        shell: bash
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" >/dev/null
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          ssh-add - <<< "$DEPLOY_SSH_KEY" >/dev/null 2>&1
 
       - name: Configure known hosts
         shell: bash
         env:
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+          if [ -z "$DEPLOY_KNOWN_HOSTS" ]; then
+            echo "DEPLOY_KNOWN_HOSTS is required for deploy host verification." >&2
+            exit 1
+          fi
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
-      - name: Deploy beta container
+      - name: Deploy dev container
         shell: bash
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -161,10 +198,10 @@ jobs:
 
           remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
 
-          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
-          rsync -az -e "ssh -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
+          rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
 
-          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
             "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
@@ -216,10 +253,11 @@ jobs:
           REMOTE_SCRIPT
 
   deploy_production:
-    if: always() && github.event_name != 'pull_request' && contains(fromJSON('["production", "both"]'), needs.build.outputs.deploy_target) && (needs.deploy_beta.result == 'success' || needs.deploy_beta.result == 'skipped')
+    name: Deploy Production
+    if: always() && github.event_name != 'pull_request' && contains(fromJSON('["production", "both"]'), needs.build.outputs.deploy_target) && needs.deploy_dev.result == 'success'
     needs:
       - build
-      - deploy_beta
+      - deploy_dev
     runs-on: ubuntu-latest
     environment: production
 
@@ -230,20 +268,55 @@ jobs:
           name: backend-image
           path: ${{ runner.temp }}
 
+      - name: Mask deployment metadata
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+
+          mask_value() {
+            local value="$1"
+            if [[ -n "$value" ]]; then
+              echo "::add-mask::$value"
+            fi
+          }
+
+          mask_value "$DEPLOY_HOST"
+
+          while IFS= read -r known_host_line; do
+            mask_value "$known_host_line"
+            read -r known_host _ key_body _ <<< "$known_host_line"
+            mask_value "$known_host"
+            mask_value "$key_body"
+          done <<< "$DEPLOY_KNOWN_HOSTS"
+
       - name: Start SSH agent
-        uses: webfactory/ssh-agent@v0.9.0
-        with:
-          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+        shell: bash
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          eval "$(ssh-agent -s)" >/dev/null
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+          ssh-add - <<< "$DEPLOY_SSH_KEY" >/dev/null 2>&1
 
       - name: Configure known hosts
         shell: bash
         env:
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
+          if [ -z "$DEPLOY_KNOWN_HOSTS" ]; then
+            echo "DEPLOY_KNOWN_HOSTS is required for deploy host verification." >&2
+            exit 1
+          fi
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
 
       - name: Deploy production container
         shell: bash
@@ -261,10 +334,10 @@ jobs:
 
           remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
 
-          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
-          rsync -az -e "ssh -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
+          rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
 
-          ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
             "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
