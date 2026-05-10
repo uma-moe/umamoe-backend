@@ -24,6 +24,8 @@ use crate::AppState;
 
 const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const BROWSER_PROOF_COOKIE: &str = "uma_browser_proof";
+const BROWSER_PROOF_HEADER: &str = "X-Browser-Proof";
+const BROWSER_PROOF_TTL_HEADER: &str = "X-Browser-Proof-TTL";
 const BROWSER_PROOF_AUDIENCE: &str = "uma-api";
 const BROWSER_PROOF_TYPE: &str = "browser_proof";
 const DEFAULT_TURNSTILE_ACTION: &str = "api_request";
@@ -34,6 +36,12 @@ static RATE_LIMITS: OnceLock<DashMap<String, RateWindow>> = OnceLock::new();
 struct RateWindow {
     count: u32,
     reset_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct IssuedBrowserProof {
+    token: String,
+    ttl_seconds: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,7 +174,28 @@ pub async fn api_protection_middleware(
                     return rate_limited(retry_after);
                 }
 
-                return next.run(request).await;
+                let issued_proof = match issue_browser_proof(&headers) {
+                    Ok(proof) => Some(proof),
+                    Err(e) => {
+                        warn!(
+                            "Failed to issue browser proof after valid Turnstile token from ip {} on {}: {}",
+                            client_ip, path, e
+                        );
+                        None
+                    }
+                };
+
+                let mut response = next.run(request).await;
+                if let Some(proof) = issued_proof.as_ref() {
+                    if let Err(e) = attach_browser_proof(&mut response, proof) {
+                        warn!(
+                            "Failed to attach browser proof headers for ip {} on {}: {}",
+                            client_ip, path, e
+                        );
+                    }
+                }
+
+                return response;
             }
             Ok(false) => {
                 warn!("Turnstile token rejected from ip {} on {}", client_ip, path);
@@ -235,19 +264,8 @@ pub async fn exchange_browser_proof(
         }
     }
 
-    let user_id = bearer_token(&headers).and_then(|token| {
-        crate::auth::verify_token(token)
-            .ok()
-            .map(|claims| claims.sub)
-    });
-    let subject = user_id
-        .map(|id| format!("user:{}", id))
-        .unwrap_or_else(|| format!("anon:{}", Uuid::new_v4()));
-
-    let host = proof_host(&headers);
-    let action = expected_turnstile_action();
-    let proof = match create_browser_proof(&subject, user_id, &host, &action) {
-        Ok(token) => token,
+    let proof = match issue_browser_proof(&headers) {
+        Ok(proof) => proof,
         Err(e) => {
             error!("Failed to create browser proof: {}", e);
             return json_error(
@@ -257,17 +275,13 @@ pub async fn exchange_browser_proof(
         }
     };
 
-    info!("Issued browser proof for {} from ip {}", subject, client_ip);
+    info!("Issued browser proof for {} from ip {}", proof.subject(), client_ip);
 
     let mut response = StatusCode::NO_CONTENT.into_response();
-    let cookie = browser_proof_cookie(&proof);
-    match HeaderValue::from_str(&cookie) {
-        Ok(value) => {
-            response.headers_mut().insert(SET_COOKIE, value);
-            response
-        }
+    match attach_browser_proof(&mut response, &proof) {
+        Ok(()) => response,
         Err(e) => {
-            error!("Failed to build browser proof cookie: {}", e);
+            error!("Failed to attach browser proof to response: {}", e);
             json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "browser_proof_unavailable",
@@ -362,6 +376,42 @@ async fn siteverify(
         .map_err(|e| TurnstileError::Request(e.to_string()))
 }
 
+fn issue_browser_proof(headers: &HeaderMap) -> Result<IssuedBrowserProof, String> {
+    let user_id = bearer_token(headers).and_then(|token| {
+        crate::auth::verify_token(token)
+            .ok()
+            .map(|claims| claims.sub)
+    });
+    let subject = user_id
+        .map(|id| format!("user:{}", id))
+        .unwrap_or_else(|| format!("anon:{}", Uuid::new_v4()));
+
+    let host = proof_host(headers);
+    let action = expected_turnstile_action();
+    let token = create_browser_proof(&subject, user_id, &host, &action).map_err(|e| e.to_string())?;
+
+    Ok(IssuedBrowserProof {
+        token,
+        ttl_seconds: browser_proof_ttl_seconds(),
+    })
+}
+
+fn attach_browser_proof(
+    response: &mut Response,
+    proof: &IssuedBrowserProof,
+) -> Result<(), String> {
+    let cookie = browser_proof_cookie(&proof.token);
+    let cookie_value = HeaderValue::from_str(&cookie).map_err(|e| e.to_string())?;
+    let proof_value = HeaderValue::from_str(&proof.token).map_err(|e| e.to_string())?;
+    let ttl_value = HeaderValue::from_str(&proof.ttl_seconds.to_string()).map_err(|e| e.to_string())?;
+
+    let headers = response.headers_mut();
+    headers.insert(SET_COOKIE, cookie_value);
+    headers.insert(BROWSER_PROOF_HEADER, proof_value);
+    headers.insert(BROWSER_PROOF_TTL_HEADER, ttl_value);
+    Ok(())
+}
+
 fn create_browser_proof(
     subject: &str,
     user_id: Option<Uuid>,
@@ -451,7 +501,7 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn browser_proof_cookie(token: &str) -> String {
-    let ttl = env_usize("BROWSER_PROOF_TTL_SECONDS", 600);
+    let ttl = browser_proof_ttl_seconds();
     let secure = std::env::var("BROWSER_PROOF_COOKIE_SECURE")
         .map(|value| value != "false" && value != "0")
         .unwrap_or_else(|_| !is_development());
@@ -630,6 +680,19 @@ fn proof_secret() -> Option<String> {
                 None
             }
         })
+}
+
+impl IssuedBrowserProof {
+    fn subject(&self) -> &str {
+        self.token
+            .split('.')
+            .next()
+            .unwrap_or("browser-proof")
+    }
+}
+
+fn browser_proof_ttl_seconds() -> usize {
+    env_usize("BROWSER_PROOF_TTL_SECONDS", 600)
 }
 
 fn env_bool(name: &str) -> bool {
