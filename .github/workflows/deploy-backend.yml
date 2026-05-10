@@ -41,8 +41,8 @@ env:
   REMOTE_IMAGE_DIR: /tmp/umamoe-backend-images
   PROD_CONTAINER_NAME: umamoe-backend
   BETA_CONTAINER_NAME: umamoe-backend-beta
-  PROD_ENV_FILE: /etc/umamoe-backend/prod.env
-  BETA_ENV_FILE: /etc/umamoe-backend/beta.env
+  PROD_ENV_FILE: /opt/umamoe-backend/prod.env
+  BETA_ENV_FILE: /opt/umamoe-backend/beta.env
   PROD_APP_PORT: '3001'
   BETA_APP_PORT: '3101'
 
