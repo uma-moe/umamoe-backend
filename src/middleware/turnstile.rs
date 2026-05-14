@@ -215,6 +215,42 @@ pub async fn api_protection_middleware(
         }
     }
 
+    // Let the first browser page load bootstrap its proof on a safe read.
+    if can_bootstrap_browser_read(&method, &headers) {
+        let limit = env_u32("API_BROWSER_BOOTSTRAP_READS_PER_MINUTE", 6);
+        if let Some(retry_after) = check_rate_limit(
+            format!("browser-bootstrap:{}", client_ip),
+            limit,
+            Duration::from_secs(60),
+        ) {
+            warn!("Browser bootstrap lane rate limited for ip {} on {}", client_ip, path);
+            return rate_limited(retry_after);
+        }
+
+        let issued_proof = match issue_browser_proof(&headers) {
+            Ok(proof) => Some(proof),
+            Err(e) => {
+                warn!(
+                    "Failed to issue browser proof on bootstrap read from ip {} on {}: {}",
+                    client_ip, path, e
+                );
+                None
+            }
+        };
+
+        let mut response = next.run(request).await;
+        if let Some(proof) = issued_proof.as_ref() {
+            if let Err(e) = attach_browser_proof(&mut response, proof) {
+                warn!(
+                    "Failed to attach browser proof headers on bootstrap read for ip {} on {}: {}",
+                    client_ip, path, e
+                );
+            }
+        }
+
+        return response;
+    }
+
     warn!("Browser proof required for ip {} on {}", client_ip, path);
     json_error(StatusCode::FORBIDDEN, "browser_proof_required")
 }
@@ -529,6 +565,20 @@ fn proof_host(headers: &HeaderMap) -> String {
         .to_ascii_lowercase()
 }
 
+fn can_bootstrap_browser_read(method: &Method, headers: &HeaderMap) -> bool {
+    if *method != Method::GET && *method != Method::HEAD {
+        return false;
+    }
+
+    if let Some(origin) = header_str(headers, "Origin") {
+        return allowed_request_origin(origin);
+    }
+
+    header_str(headers, "Referer")
+        .map(allowed_request_referer)
+        .unwrap_or(false)
+}
+
 fn should_skip_api_protection(method: &Method, path: &str) -> bool {
     if *method == Method::OPTIONS || !(path.starts_with("/api/") || path.starts_with("/ingest/")) {
         return true;
@@ -610,6 +660,16 @@ fn allowed_turnstile_host(hostname: &str) -> bool {
 
 fn allowed_request_origin(origin: &str) -> bool {
     if let Ok(uri) = origin.parse::<axum::http::Uri>() {
+        if let Some(host) = uri.host() {
+            return allowed_turnstile_host(host);
+        }
+    }
+
+    false
+}
+
+fn allowed_request_referer(referer: &str) -> bool {
+    if let Ok(uri) = referer.parse::<axum::http::Uri>() {
         if let Some(host) = uri.host() {
             return allowed_turnstile_host(host);
         }

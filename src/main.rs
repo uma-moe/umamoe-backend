@@ -30,6 +30,14 @@ pub struct AppState {
     pub task_notifier: TaskNotifier,
 }
 
+fn default_search_service_url() -> String {
+    if std::path::Path::new("/.dockerenv").exists() {
+        "http://search:3002".to_string()
+    } else {
+        "http://127.0.0.1:3002".to_string()
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing - production uses WARN/ERROR only, development uses INFO
@@ -140,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
     backfill_email_hashes(&pool).await;
 
     let search_url =
-        std::env::var("SEARCH_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3002".to_string());
+        std::env::var("SEARCH_SERVICE_URL").unwrap_or_else(|_| default_search_service_url());
     info!("Search service URL: {}", search_url);
 
     let search_client = reqwest::Client::builder()
