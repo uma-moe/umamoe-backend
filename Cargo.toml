@@ -35,6 +35,7 @@ validator = { version = "0.18", features = ["derive"] }
 tower_governor = "0.4"
 governor = "0.6"
 dashmap = "6.0"
+redis = { version = "0.32", default-features = false, features = ["tokio-comp"] }
 
 # Cryptography (email hashing)
 hmac = "0.12"

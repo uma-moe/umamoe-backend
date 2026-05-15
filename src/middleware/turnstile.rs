@@ -20,7 +20,7 @@ use std::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::AppState;
+use crate::{redis_store::RedisStore, AppState};
 
 const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const BROWSER_PROOF_COOKIE: &str = "uma_browser_proof";
@@ -42,6 +42,7 @@ struct RateWindow {
 struct IssuedBrowserProof {
     token: String,
     ttl_seconds: usize,
+    subject: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +84,12 @@ pub struct BrowserProofClaims {
 enum TurnstileError {
     MissingSecret,
     Request(String),
+}
+
+#[derive(Debug)]
+enum BrowserProofError {
+    Invalid(String),
+    Store(String),
 }
 
 pub async fn api_protection_middleware(
@@ -132,7 +139,7 @@ pub async fn api_protection_middleware(
     }
 
     if let Some(proof) = extract_browser_proof(&headers) {
-        match verify_browser_proof(proof) {
+        match verify_browser_proof(proof, state.redis_store.as_ref()).await {
             Ok(claims) => {
                 let limit = browser_rate_limit(&method);
                 if let Some(retry_after) = check_rate_limit(
@@ -149,11 +156,15 @@ pub async fn api_protection_middleware(
 
                 return next.run(request).await;
             }
-            Err(e) => {
+            Err(BrowserProofError::Invalid(e)) => {
                 warn!(
                     "Invalid browser proof from ip {} on {}: {}",
                     client_ip, path, e
                 );
+            }
+            Err(BrowserProofError::Store(e)) => {
+                error!("Browser proof store unavailable: {}", e);
+                return json_error(StatusCode::SERVICE_UNAVAILABLE, "browser_proof_unavailable");
             }
         }
     }
@@ -174,7 +185,9 @@ pub async fn api_protection_middleware(
                     return rate_limited(retry_after);
                 }
 
-                let issued_proof = match issue_browser_proof(&headers) {
+                let issued_proof = match issue_browser_proof(&headers, state.redis_store.as_ref())
+                    .await
+                {
                     Ok(proof) => Some(proof),
                     Err(e) => {
                         warn!(
@@ -223,11 +236,14 @@ pub async fn api_protection_middleware(
             limit,
             Duration::from_secs(60),
         ) {
-            warn!("Browser bootstrap lane rate limited for ip {} on {}", client_ip, path);
+            warn!(
+                "Browser bootstrap lane rate limited for ip {} on {}",
+                client_ip, path
+            );
             return rate_limited(retry_after);
         }
 
-        let issued_proof = match issue_browser_proof(&headers) {
+        let issued_proof = match issue_browser_proof(&headers, state.redis_store.as_ref()).await {
             Ok(proof) => Some(proof),
             Err(e) => {
                 warn!(
@@ -256,6 +272,7 @@ pub async fn api_protection_middleware(
 }
 
 pub async fn exchange_browser_proof(
+    State(state): State<AppState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
@@ -300,7 +317,7 @@ pub async fn exchange_browser_proof(
         }
     }
 
-    let proof = match issue_browser_proof(&headers) {
+    let proof = match issue_browser_proof(&headers, state.redis_store.as_ref()).await {
         Ok(proof) => proof,
         Err(e) => {
             error!("Failed to create browser proof: {}", e);
@@ -311,13 +328,71 @@ pub async fn exchange_browser_proof(
         }
     };
 
-    info!("Issued browser proof for {} from ip {}", proof.subject(), client_ip);
+    info!(
+        "Issued browser proof for {} from ip {}",
+        proof.subject(),
+        client_ip
+    );
 
     let mut response = StatusCode::NO_CONTENT.into_response();
     match attach_browser_proof(&mut response, &proof) {
         Ok(()) => response,
         Err(e) => {
             error!("Failed to attach browser proof to response: {}", e);
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "browser_proof_unavailable",
+            )
+        }
+    }
+}
+
+pub async fn issue_internal_browser_proof(
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let client_ip = extract_client_ip(&headers, connect_info.map(|ci| ci.0));
+    let limit = env_u32("BROWSER_PROOF_INTERNAL_REQUESTS_PER_MINUTE", 120);
+    if let Some(retry_after) = check_rate_limit(
+        format!("proof-internal-ip:{}", client_ip),
+        limit,
+        Duration::from_secs(60),
+    ) {
+        warn!("Internal browser proof issuer rate limited for ip {}", client_ip);
+        return rate_limited(retry_after);
+    }
+
+    if !has_allowed_browser_context(&headers) {
+        warn!(
+            "Internal browser proof issuer rejected request without allowed origin/referer from ip {}",
+            client_ip
+        );
+        return json_error(StatusCode::FORBIDDEN, "browser_context_required");
+    }
+
+    let proof = match issue_browser_proof(&headers, state.redis_store.as_ref()).await {
+        Ok(proof) => proof,
+        Err(e) => {
+            error!("Failed to create internal browser proof: {}", e);
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "browser_proof_unavailable",
+            );
+        }
+    };
+
+    info!(
+        "Issued internal browser proof for {} from ip {}",
+        proof.subject(),
+        client_ip
+    );
+
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    match attach_browser_proof(&mut response, &proof) {
+        Ok(()) => response,
+        Err(e) => {
+            error!("Failed to attach internal browser proof to response: {}", e);
             json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "browser_proof_unavailable",
@@ -412,7 +487,10 @@ async fn siteverify(
         .map_err(|e| TurnstileError::Request(e.to_string()))
 }
 
-fn issue_browser_proof(headers: &HeaderMap) -> Result<IssuedBrowserProof, String> {
+async fn issue_browser_proof(
+    headers: &HeaderMap,
+    store: Option<&RedisStore>,
+) -> Result<IssuedBrowserProof, String> {
     let user_id = bearer_token(headers).and_then(|token| {
         crate::auth::verify_token(token)
             .ok()
@@ -424,22 +502,33 @@ fn issue_browser_proof(headers: &HeaderMap) -> Result<IssuedBrowserProof, String
 
     let host = proof_host(headers);
     let action = expected_turnstile_action();
-    let token = create_browser_proof(&subject, user_id, &host, &action).map_err(|e| e.to_string())?;
+    let ttl_seconds = browser_proof_ttl_seconds();
+    let (token, claims) = create_browser_proof(
+        &subject,
+        user_id,
+        &host,
+        &action,
+        ttl_seconds,
+        store.is_some(),
+    )?;
+
+    if let Some(store) = store {
+        store_browser_proof(store, &token, &claims, ttl_seconds).await?;
+    }
 
     Ok(IssuedBrowserProof {
         token,
-        ttl_seconds: browser_proof_ttl_seconds(),
+        ttl_seconds,
+        subject,
     })
 }
 
-fn attach_browser_proof(
-    response: &mut Response,
-    proof: &IssuedBrowserProof,
-) -> Result<(), String> {
+fn attach_browser_proof(response: &mut Response, proof: &IssuedBrowserProof) -> Result<(), String> {
     let cookie = browser_proof_cookie(&proof.token);
     let cookie_value = HeaderValue::from_str(&cookie).map_err(|e| e.to_string())?;
     let proof_value = HeaderValue::from_str(&proof.token).map_err(|e| e.to_string())?;
-    let ttl_value = HeaderValue::from_str(&proof.ttl_seconds.to_string()).map_err(|e| e.to_string())?;
+    let ttl_value =
+        HeaderValue::from_str(&proof.ttl_seconds.to_string()).map_err(|e| e.to_string())?;
 
     let headers = response.headers_mut();
     headers.insert(SET_COOKIE, cookie_value);
@@ -453,35 +542,76 @@ fn create_browser_proof(
     user_id: Option<Uuid>,
     host: &str,
     action: &str,
-) -> Result<String, jsonwebtoken::errors::Error> {
-    let Some(secret) = proof_secret() else {
-        return Err(jsonwebtoken::errors::Error::from(
-            jsonwebtoken::errors::ErrorKind::InvalidKeyFormat,
-        ));
-    };
-
+    ttl_seconds: usize,
+    allow_opaque: bool,
+) -> Result<(String, BrowserProofClaims), String> {
     let now = chrono::Utc::now().timestamp() as usize;
-    let ttl = env_usize("BROWSER_PROOF_TTL_SECONDS", 600);
     let claims = BrowserProofClaims {
         typ: BROWSER_PROOF_TYPE.to_string(),
         jti: Uuid::new_v4().to_string(),
         sub: subject.to_string(),
         uid: user_id,
         iat: now,
-        exp: now + ttl,
+        exp: now + ttl_seconds,
         aud: BROWSER_PROOF_AUDIENCE.to_string(),
         action: action.to_string(),
         host: host.to_ascii_lowercase(),
     };
 
-    encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
+    let token = if let Some(secret) = proof_secret() {
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .map_err(|error| error.to_string())?
+    } else if allow_opaque {
+        format!("uma_bp_{}", Uuid::new_v4())
+    } else {
+        return Err("browser proof signing secret is not configured".to_string());
+    };
+
+    Ok((token, claims))
 }
 
-fn verify_browser_proof(token: &str) -> Result<BrowserProofClaims, String> {
+async fn store_browser_proof(
+    store: &RedisStore,
+    token: &str,
+    claims: &BrowserProofClaims,
+    ttl_seconds: usize,
+) -> Result<(), String> {
+    let key = store.hashed_key("browser-proof", token);
+    let payload = serde_json::to_string(claims).map_err(|error| error.to_string())?;
+    store
+        .set_string_ex(&key, &payload, ttl_seconds as u64)
+        .await
+}
+
+async fn verify_browser_proof(
+    token: &str,
+    store: Option<&RedisStore>,
+) -> Result<BrowserProofClaims, BrowserProofError> {
+    if let Some(store) = store {
+        let key = store.hashed_key("browser-proof", token);
+        let Some(payload) = store
+            .get_string(&key)
+            .await
+            .map_err(BrowserProofError::Store)?
+        else {
+            return Err(BrowserProofError::Invalid(
+                "proof is not present in shared store".to_string(),
+            ));
+        };
+
+        let claims = serde_json::from_str::<BrowserProofClaims>(&payload)
+            .map_err(|error| BrowserProofError::Invalid(error.to_string()))?;
+        validate_browser_proof_claims(claims).map_err(BrowserProofError::Invalid)
+    } else {
+        verify_signed_browser_proof(token).map_err(BrowserProofError::Invalid)
+    }
+}
+
+fn verify_signed_browser_proof(token: &str) -> Result<BrowserProofClaims, String> {
     let secret = proof_secret()
         .ok_or_else(|| "browser proof signing secret is not configured".to_string())?;
     let mut validation = Validation::new(Algorithm::HS256);
@@ -494,15 +624,25 @@ fn verify_browser_proof(token: &str) -> Result<BrowserProofClaims, String> {
     )
     .map_err(|e| e.to_string())?;
 
-    let claims = data.claims;
+    validate_browser_proof_claims(data.claims)
+}
+
+fn validate_browser_proof_claims(claims: BrowserProofClaims) -> Result<BrowserProofClaims, String> {
     if claims.typ != BROWSER_PROOF_TYPE {
         return Err("wrong proof type".to_string());
+    }
+    if claims.aud != BROWSER_PROOF_AUDIENCE {
+        return Err("wrong proof audience".to_string());
     }
     if claims.action != expected_turnstile_action() {
         return Err("wrong proof action".to_string());
     }
     if !allowed_turnstile_host(&claims.host) {
         return Err("wrong proof host".to_string());
+    }
+    let now = chrono::Utc::now().timestamp() as usize;
+    if claims.exp <= now {
+        return Err("expired proof".to_string());
     }
 
     Ok(claims)
@@ -542,20 +682,25 @@ fn browser_proof_cookie(token: &str) -> String {
         .map(|value| value != "false" && value != "0")
         .unwrap_or_else(|_| !is_development());
     let secure_attr = if secure { "; Secure" } else { "" };
+    let domain_attr = std::env::var("BROWSER_PROOF_COOKIE_DOMAIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("; Domain={}", value.trim()))
+        .unwrap_or_default();
 
     format!(
-        "{}={}; Max-Age={}; Path=/{}; HttpOnly; SameSite=Lax",
-        BROWSER_PROOF_COOKIE, token, ttl, secure_attr
+        "{}={}; Max-Age={}; Path=/{}{}; HttpOnly; SameSite=Lax",
+        BROWSER_PROOF_COOKIE, token, ttl, domain_attr, secure_attr
     )
 }
 
 fn proof_host(headers: &HeaderMap) -> String {
-    if let Some(origin) = header_str(headers, "Origin") {
-        if let Ok(uri) = origin.parse::<axum::http::Uri>() {
-            if let Some(host) = uri.host() {
-                return host.to_ascii_lowercase();
-            }
-        }
+    if let Some(host) = header_uri_host(headers, "Origin") {
+        return host;
+    }
+
+    if let Some(host) = header_uri_host(headers, "Referer") {
+        return host;
     }
 
     header_str(headers, "Host")
@@ -565,11 +710,21 @@ fn proof_host(headers: &HeaderMap) -> String {
         .to_ascii_lowercase()
 }
 
+fn header_uri_host(headers: &HeaderMap, name: &str) -> Option<String> {
+    let value = header_str(headers, name)?;
+    let uri = value.parse::<axum::http::Uri>().ok()?;
+    uri.host().map(|host| host.to_ascii_lowercase())
+}
+
 fn can_bootstrap_browser_read(method: &Method, headers: &HeaderMap) -> bool {
     if *method != Method::GET && *method != Method::HEAD {
         return false;
     }
 
+    has_allowed_browser_context(headers)
+}
+
+fn has_allowed_browser_context(headers: &HeaderMap) -> bool {
     if let Some(origin) = header_str(headers, "Origin") {
         return allowed_request_origin(origin);
     }
@@ -744,10 +899,7 @@ fn proof_secret() -> Option<String> {
 
 impl IssuedBrowserProof {
     fn subject(&self) -> &str {
-        self.token
-            .split('.')
-            .next()
-            .unwrap_or("browser-proof")
+        &self.subject
     }
 }
 

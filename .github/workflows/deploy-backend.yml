@@ -39,11 +39,14 @@ env:
   CACHE_SCOPE: backend-container
   DEPLOY_USER: github
   REMOTE_IMAGE_DIR: /tmp/umamoe-backend-images
+  REMOTE_COMPOSE_FILE: /opt/umamoe-backend/backend.compose.yml
+  APP_NETWORK_NAME: umamoe-services
   PROD_CONTAINER_NAME: umamoe-backend
   BETA_CONTAINER_NAME: umamoe-backend-beta
   PROD_ENV_FILE: /opt/umamoe-backend/prod.env
   BETA_ENV_FILE: /opt/umamoe-backend/beta.env
   APP_PORT: '3001'
+  INTERNAL_APP_PORT: '3005'
 
 concurrency:
   group: deploy-${{ github.workflow }}-${{ github.ref }}
@@ -191,30 +194,48 @@ jobs:
           HOST_PORT: ${{ needs.build.outputs.beta_host_port }}
           CONTAINER_NAME: ${{ env.BETA_CONTAINER_NAME }}
           APP_PORT: ${{ env.APP_PORT }}
+          INTERNAL_APP_PORT: ${{ env.INTERNAL_APP_PORT }}
           ENV_FILE: ${{ env.BETA_ENV_FILE }}
         run: |
           set -euo pipefail
 
           remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
+          remote_compose_dir="$(dirname "$REMOTE_COMPOSE_FILE")"
 
-          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR' '$remote_compose_dir'"
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
+          rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
           image_tag="$2"
           container_name="$3"
           app_port="$4"
-          host_port="$5"
-          env_file="$6"
+          internal_app_port="$5"
+          host_port="$6"
+          env_file="$7"
+          compose_file="$8"
+          network_name="$9"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
             exit 1
           fi
+
+          if [ ! -f "$compose_file" ]; then
+            echo "Missing backend compose file: $compose_file" >&2
+            exit 1
+          fi
+
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "Docker Compose v2 is required to manage the shared Redis container." >&2
+            exit 1
+          fi
+
+          docker compose -f "$compose_file" up -d --no-recreate redis
 
           gzip -dc "$archive" | docker load
 
@@ -223,9 +244,12 @@ jobs:
             --name "$container_name" \
             --restart unless-stopped \
             --add-host host.docker.internal:host-gateway \
+            --network "$network_name" \
             --env-file "$env_file" \
             -e HOST=0.0.0.0 \
             -e PORT="$app_port" \
+            -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0 \
+            -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port" \
             -e DEBUG_MODE=false \
             -p "127.0.0.1:${host_port}:${app_port}" \
             "$image_tag"
@@ -328,30 +352,48 @@ jobs:
           HOST_PORT: ${{ needs.build.outputs.production_host_port }}
           CONTAINER_NAME: ${{ env.PROD_CONTAINER_NAME }}
           APP_PORT: ${{ env.APP_PORT }}
+          INTERNAL_APP_PORT: ${{ env.INTERNAL_APP_PORT }}
           ENV_FILE: ${{ env.PROD_ENV_FILE }}
         run: |
           set -euo pipefail
 
           remote_archive="${REMOTE_IMAGE_DIR}/${ARCHIVE_NAME}"
+          remote_compose_dir="$(dirname "$REMOTE_COMPOSE_FILE")"
 
-          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR'"
+          ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" "mkdir -p '$REMOTE_IMAGE_DIR' '$remote_compose_dir'"
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "${{ runner.temp }}/${ARCHIVE_NAME}" "$DEPLOY_USER@$DEPLOY_HOST:$remote_archive"
+          rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$HOST_PORT" "$ENV_FILE" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
           image_tag="$2"
           container_name="$3"
           app_port="$4"
-          host_port="$5"
-          env_file="$6"
+          internal_app_port="$5"
+          host_port="$6"
+          env_file="$7"
+          compose_file="$8"
+          network_name="$9"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
             exit 1
           fi
+
+          if [ ! -f "$compose_file" ]; then
+            echo "Missing backend compose file: $compose_file" >&2
+            exit 1
+          fi
+
+          if ! docker compose version >/dev/null 2>&1; then
+            echo "Docker Compose v2 is required to manage the shared Redis container." >&2
+            exit 1
+          fi
+
+          docker compose -f "$compose_file" up -d --no-recreate redis
 
           gzip -dc "$archive" | docker load
 
@@ -360,9 +402,12 @@ jobs:
             --name "$container_name" \
             --restart unless-stopped \
             --add-host host.docker.internal:host-gateway \
+            --network "$network_name" \
             --env-file "$env_file" \
             -e HOST=0.0.0.0 \
             -e PORT="$app_port" \
+            -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0 \
+            -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port" \
             -e DEBUG_MODE=false \
             -p "127.0.0.1:${host_port}:${app_port}" \
             "$image_tag"

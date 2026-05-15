@@ -14,6 +14,7 @@ mod handlers;
 mod middleware;
 mod models;
 mod notify;
+mod redis_store;
 
 use handlers::{
     affinity, auth as auth_handlers, circles, docs, partner, profile, rankings, search, sharing,
@@ -28,6 +29,7 @@ pub struct AppState {
     pub search_url: String,
     pub oauth_redirect_base: String,
     pub task_notifier: TaskNotifier,
+    pub redis_store: Option<redis_store::RedisStore>,
 }
 
 fn default_search_service_url() -> String {
@@ -108,7 +110,10 @@ async fn main() -> anyhow::Result<()> {
                 Ok(_) => warn!("✅ Migrations completed successfully"),
                 Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
                     if ignore_migration_version_mismatch {
-                        warn!("⚠️  Ignoring migration version mismatch for version {}", version);
+                        warn!(
+                            "⚠️  Ignoring migration version mismatch for version {}",
+                            version
+                        );
                         warn!(
                             "Database migration history differs from this checkout, but startup will continue"
                         );
@@ -159,6 +164,21 @@ async fn main() -> anyhow::Result<()> {
     let oauth_redirect_base = std::env::var("OAUTH_REDIRECT_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
 
+    let redis_store = match redis_store::RedisStore::from_env() {
+        Ok(Some(store)) => {
+            info!("Redis token/cache store configured");
+            Some(store)
+        }
+        Ok(None) => {
+            warn!("REDIS_URL not set; browser proofs will use local JWT fallback only");
+            None
+        }
+        Err(error) => {
+            warn!("Redis token/cache store disabled: {}", error);
+            None
+        }
+    };
+
     // Postgres LISTEN/NOTIFY dispatcher used by the partner-lookup SSE
     // endpoint. The trigger that emits these notifications is created in the
     // `add_partner_inheritance` migration.
@@ -171,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         search_url,
         oauth_redirect_base,
         task_notifier,
+        redis_store,
     };
 
     // Start background task to refresh materialized views every hour
@@ -190,6 +211,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Start background task to clean up expired cache entries every 10 minutes
     tokio::spawn(cache_cleanup_task());
+
+    let internal_proof_host = std::env::var("BROWSER_PROOF_INTERNAL_HOST")
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    let internal_proof_port = std::env::var("BROWSER_PROOF_INTERNAL_PORT")
+        .unwrap_or_else(|_| "3005".to_string())
+        .parse::<u16>()
+        .expect("BROWSER_PROOF_INTERNAL_PORT must be a valid number");
+    spawn_internal_browser_proof_server(
+        state.clone(),
+        internal_proof_host,
+        internal_proof_port,
+    )
+    .await?;
 
     // Configure CORS - more permissive for development, strict for production
     let is_development = std::env::var("DEBUG_MODE").unwrap_or_default() == "true";
@@ -269,6 +303,10 @@ async fn main() -> anyhow::Result<()> {
         "X-Turnstile-Token".parse().unwrap(),
         "X-Browser-Proof".parse().unwrap(),
         "X-API-Key".parse().unwrap(),
+    ])
+    .expose_headers([
+        "X-Browser-Proof".parse().unwrap(),
+        "X-Browser-Proof-TTL".parse().unwrap(),
     ]);
 
     // Build the application with proper routing and middleware
@@ -360,6 +398,39 @@ async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
             "health": "/api/health"
         }
     })))
+}
+
+async fn spawn_internal_browser_proof_server(
+    state: AppState,
+    host: String,
+    port: u16,
+) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route(
+            "/api/auth/browser-proof/internal",
+            axum::routing::post(middleware::turnstile::issue_internal_browser_proof),
+        )
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+    info!(
+        "🔒 Internal browser proof issuer listening on http://{}:{}",
+        host, port
+    );
+
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            error!("Internal browser proof issuer stopped: {}", error);
+        }
+    });
+
+    Ok(())
 }
 
 /// One-time startup backfill: hash any plaintext emails still in the database.
