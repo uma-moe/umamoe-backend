@@ -20,6 +20,7 @@ services:
 
 networks:
   backend:
+    external: true
     name: umamoe-services
 
 volumes:
