@@ -134,6 +134,12 @@ jobs:
           name: backend-image
           path: ${{ runner.temp }}
 
+      - name: Checkout deployment files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy/backend.compose.yml
+          sparse-checkout-cone-mode: false
+
       - name: Mask deployment metadata
         shell: bash
         env:
@@ -291,6 +297,12 @@ jobs:
         with:
           name: backend-image
           path: ${{ runner.temp }}
+
+      - name: Checkout deployment files
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: deploy/backend.compose.yml
+          sparse-checkout-cone-mode: false
 
       - name: Mask deployment metadata
         shell: bash
