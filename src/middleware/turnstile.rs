@@ -222,11 +222,14 @@ async fn authorize_browser_request(
                 {
                     Ok(proof) => Some(proof),
                     Err(e) => {
-                        warn!(
+                        error!(
                             "Failed to issue browser proof after valid Turnstile token from ip {} on {}: {}",
                             client_ip, path, e
                         );
-                        None
+                        return Err(json_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "browser_proof_unavailable",
+                        ));
                     }
                 };
 
@@ -271,11 +274,14 @@ async fn authorize_browser_request(
         let issued_proof = match issue_browser_proof(&headers, state.redis_store.as_ref()).await {
             Ok(proof) => Some(proof),
             Err(e) => {
-                warn!(
+                error!(
                     "Failed to issue browser proof on bootstrap read from ip {} on {}: {}",
                     client_ip, path, e
                 );
-                None
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "browser_proof_unavailable",
+                ));
             }
         };
 
@@ -509,6 +515,7 @@ async fn issue_browser_proof(
     headers: &HeaderMap,
     store: Option<&RedisStore>,
 ) -> Result<IssuedBrowserProof, String> {
+    let store = store.ok_or_else(|| "browser proof store is not configured".to_string())?;
     let user_id = bearer_token(headers).and_then(|token| {
         crate::auth::verify_token(token)
             .ok()
@@ -521,18 +528,10 @@ async fn issue_browser_proof(
     let host = proof_host(headers);
     let action = expected_turnstile_action();
     let ttl_seconds = browser_proof_ttl_seconds();
-    let (token, claims) = create_browser_proof(
-        &subject,
-        user_id,
-        &host,
-        &action,
-        ttl_seconds,
-        store.is_some(),
-    )?;
+    let (token, claims) =
+        create_browser_proof(&subject, user_id, &host, &action, ttl_seconds, true)?;
 
-    if let Some(store) = store {
-        store_browser_proof(store, &token, &claims, ttl_seconds).await?;
-    }
+    store_browser_proof(store, &token, &claims, ttl_seconds).await?;
 
     Ok(IssuedBrowserProof {
         token,

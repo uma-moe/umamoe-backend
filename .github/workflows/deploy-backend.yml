@@ -46,7 +46,8 @@ env:
   PROD_ENV_FILE: /opt/umamoe-backend/prod.env
   BETA_ENV_FILE: /opt/umamoe-backend/beta.env
   APP_PORT: '3001'
-  INTERNAL_APP_PORT: '3005'
+  INTERNAL_APP_PORT: '3201'
+  SEARCH_INTERNAL_PORT: '3202'
 
 concurrency:
   group: deploy-${{ github.workflow }}-${{ github.ref }}
@@ -201,6 +202,7 @@ jobs:
           CONTAINER_NAME: ${{ env.BETA_CONTAINER_NAME }}
           APP_PORT: ${{ env.APP_PORT }}
           INTERNAL_APP_PORT: ${{ env.INTERNAL_APP_PORT }}
+          SEARCH_SERVICE_URL: http://umamoe-search-beta:${{ env.SEARCH_INTERNAL_PORT }}
           ENV_FILE: ${{ env.BETA_ENV_FILE }}
         run: |
           set -euo pipefail
@@ -213,7 +215,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -225,6 +227,7 @@ jobs:
           env_file="$7"
           compose_file="$8"
           network_name="$9"
+          search_service_url="${10}"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -257,6 +260,9 @@ jobs:
             -e PORT="$app_port" \
             -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0 \
             -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port" \
+            -e SEARCH_SERVICE_URL="$search_service_url" \
+            -e REDIS_URL=redis://redis:6379/0 \
+            -e REDIS_KEY_PREFIX=umamoe \
             -e DEBUG_MODE=false \
             -p "127.0.0.1:${host_port}:${app_port}" \
             "$image_tag"
@@ -366,6 +372,7 @@ jobs:
           CONTAINER_NAME: ${{ env.PROD_CONTAINER_NAME }}
           APP_PORT: ${{ env.APP_PORT }}
           INTERNAL_APP_PORT: ${{ env.INTERNAL_APP_PORT }}
+          SEARCH_SERVICE_URL: http://umamoe-search:${{ env.SEARCH_INTERNAL_PORT }}
           ENV_FILE: ${{ env.PROD_ENV_FILE }}
         run: |
           set -euo pipefail
@@ -378,7 +385,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -390,6 +397,7 @@ jobs:
           env_file="$7"
           compose_file="$8"
           network_name="$9"
+          search_service_url="${10}"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -422,6 +430,9 @@ jobs:
             -e PORT="$app_port" \
             -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0 \
             -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port" \
+            -e SEARCH_SERVICE_URL="$search_service_url" \
+            -e REDIS_URL=redis://redis:6379/0 \
+            -e REDIS_KEY_PREFIX=umamoe \
             -e DEBUG_MODE=false \
             -p "127.0.0.1:${host_port}:${app_port}" \
             "$image_tag"

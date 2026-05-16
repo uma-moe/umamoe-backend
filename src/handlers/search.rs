@@ -602,7 +602,7 @@ pub async fn unified_search(
     }
 
     // --- Primary: search service, fallback: Postgres ---
-    let search_service_url = format!("{}/search?{}", state.search_url, query_string);
+    let search_service_url = format!("{}/search/query?{}", state.search_url, query_string);
     let search_client = state.search_client.clone();
 
     let t = std::time::Instant::now();

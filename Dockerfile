@@ -30,7 +30,7 @@ ENV HOST=0.0.0.0 \
     PORT=3001 \
     DEBUG_MODE=false
 
-EXPOSE 3001
+EXPOSE 3001 3201
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsS "http://127.0.0.1:${PORT}/api/health" >/dev/null || exit 1

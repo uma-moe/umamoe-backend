@@ -34,7 +34,7 @@ pub struct AppState {
 
 fn default_search_service_url() -> String {
     if std::path::Path::new("/.dockerenv").exists() {
-        "http://search:3002".to_string()
+        "http://umamoe-search:3202".to_string()
     } else {
         "http://127.0.0.1:3002".to_string()
     }
@@ -215,7 +215,7 @@ async fn main() -> anyhow::Result<()> {
     let internal_proof_host =
         std::env::var("BROWSER_PROOF_INTERNAL_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let internal_proof_port = std::env::var("BROWSER_PROOF_INTERNAL_PORT")
-        .unwrap_or_else(|_| "3005".to_string())
+        .unwrap_or_else(|_| "3201".to_string())
         .parse::<u16>()
         .expect("BROWSER_PROOF_INTERNAL_PORT must be a valid number");
     spawn_internal_browser_proof_server(state.clone(), internal_proof_host, internal_proof_port)
