@@ -845,10 +845,10 @@ async fn fetch_circle_members(
               AND cm.circle_id != $4
                         "#,
         )
-                .bind(&viewer_ids_with_leading_zeros)
-                .bind(target_year)
-                .bind(target_month)
-                .bind(circle_id)
+        .bind(&viewer_ids_with_leading_zeros)
+        .bind(target_year)
+        .bind(target_month)
+        .bind(circle_id)
         .fetch_all(pool)
         .await?;
 

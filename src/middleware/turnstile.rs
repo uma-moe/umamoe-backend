@@ -108,9 +108,34 @@ pub async fn api_protection_middleware(
 
     let client_ip = extract_client_ip(&headers, connect_info.map(|ci| ci.0));
 
+    match authorize_browser_request(&state, &headers, &method, &path, &client_ip).await {
+        Ok(issued_proof) => {
+            let mut response = next.run(request).await;
+            if let Some(proof) = issued_proof.as_ref() {
+                if let Err(e) = attach_browser_proof(&mut response, proof) {
+                    warn!(
+                        "Failed to attach browser proof headers for ip {} on {}: {}",
+                        client_ip, path, e
+                    );
+                }
+            }
+
+            response
+        }
+        Err(response) => response,
+    }
+}
+
+async fn authorize_browser_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &Method,
+    path: &str,
+    client_ip: &str,
+) -> Result<Option<IssuedBrowserProof>, Response> {
     if let Some(raw_key) = header_str(&headers, "X-API-Key") {
         if raw_key.trim().is_empty() {
-            return json_error(StatusCode::UNAUTHORIZED, "invalid_api_key");
+            return Err(json_error(StatusCode::UNAUTHORIZED, "invalid_api_key"));
         }
 
         match crate::middleware::api_key::resolve_api_key(&state.db, raw_key).await {
@@ -122,18 +147,21 @@ pub async fn api_protection_middleware(
                     Duration::from_secs(60),
                 ) {
                     warn!("API key {} rate limited on {}", key.id, path);
-                    return rate_limited(retry_after);
+                    return Err(rate_limited(retry_after));
                 }
 
-                return next.run(request).await;
+                return Ok(None);
             }
             Ok(None) => {
                 warn!("Invalid API key rejected from ip {} on {}", client_ip, path);
-                return json_error(StatusCode::UNAUTHORIZED, "invalid_api_key");
+                return Err(json_error(StatusCode::UNAUTHORIZED, "invalid_api_key"));
             }
             Err(e) => {
                 error!("API key lookup failed: {}", e);
-                return json_error(StatusCode::INTERNAL_SERVER_ERROR, "api_key_lookup_failed");
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_key_lookup_failed",
+                ));
             }
         }
     }
@@ -151,10 +179,10 @@ pub async fn api_protection_middleware(
                         "Browser proof subject {} rate limited on {}",
                         claims.sub, path
                     );
-                    return rate_limited(retry_after);
+                    return Err(rate_limited(retry_after));
                 }
 
-                return next.run(request).await;
+                return Ok(None);
             }
             Err(BrowserProofError::Invalid(e)) => {
                 warn!(
@@ -164,13 +192,17 @@ pub async fn api_protection_middleware(
             }
             Err(BrowserProofError::Store(e)) => {
                 error!("Browser proof store unavailable: {}", e);
-                return json_error(StatusCode::SERVICE_UNAVAILABLE, "browser_proof_unavailable");
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "browser_proof_unavailable",
+                ));
             }
         }
     }
 
     if let Some(turnstile_token) = extract_turnstile_token(&headers) {
-        match validate_turnstile_token(turnstile_token, &headers, Some(client_ip.clone())).await {
+        match validate_turnstile_token(turnstile_token, &headers, Some(client_ip.to_string())).await
+        {
             Ok(true) => {
                 let limit = browser_rate_limit(&method);
                 if let Some(retry_after) = check_rate_limit(
@@ -182,7 +214,7 @@ pub async fn api_protection_middleware(
                         "Turnstile browser lane rate limited for ip {} on {}",
                         client_ip, path
                     );
-                    return rate_limited(retry_after);
+                    return Err(rate_limited(retry_after));
                 }
 
                 let issued_proof = match issue_browser_proof(&headers, state.redis_store.as_ref())
@@ -198,32 +230,25 @@ pub async fn api_protection_middleware(
                     }
                 };
 
-                let mut response = next.run(request).await;
-                if let Some(proof) = issued_proof.as_ref() {
-                    if let Err(e) = attach_browser_proof(&mut response, proof) {
-                        warn!(
-                            "Failed to attach browser proof headers for ip {} on {}: {}",
-                            client_ip, path, e
-                        );
-                    }
-                }
-
-                return response;
+                return Ok(issued_proof);
             }
             Ok(false) => {
                 warn!("Turnstile token rejected from ip {} on {}", client_ip, path);
-                return json_error(StatusCode::FORBIDDEN, "turnstile_invalid");
+                return Err(json_error(StatusCode::FORBIDDEN, "turnstile_invalid"));
             }
             Err(TurnstileError::MissingSecret) => {
                 error!("TURNSTILE_SECRET_KEY is not set");
-                return json_error(
+                return Err(json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "turnstile_not_configured",
-                );
+                ));
             }
             Err(TurnstileError::Request(e)) => {
                 error!("Turnstile verification error: {}", e);
-                return json_error(StatusCode::SERVICE_UNAVAILABLE, "turnstile_unavailable");
+                return Err(json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "turnstile_unavailable",
+                ));
             }
         }
     }
@@ -240,7 +265,7 @@ pub async fn api_protection_middleware(
                 "Browser bootstrap lane rate limited for ip {} on {}",
                 client_ip, path
             );
-            return rate_limited(retry_after);
+            return Err(rate_limited(retry_after));
         }
 
         let issued_proof = match issue_browser_proof(&headers, state.redis_store.as_ref()).await {
@@ -254,21 +279,11 @@ pub async fn api_protection_middleware(
             }
         };
 
-        let mut response = next.run(request).await;
-        if let Some(proof) = issued_proof.as_ref() {
-            if let Err(e) = attach_browser_proof(&mut response, proof) {
-                warn!(
-                    "Failed to attach browser proof headers on bootstrap read for ip {} on {}: {}",
-                    client_ip, path, e
-                );
-            }
-        }
-
-        return response;
+        return Ok(issued_proof);
     }
 
     warn!("Browser proof required for ip {} on {}", client_ip, path);
-    json_error(StatusCode::FORBIDDEN, "browser_proof_required")
+    Err(json_error(StatusCode::FORBIDDEN, "browser_proof_required"))
 }
 
 pub async fn exchange_browser_proof(
@@ -359,7 +374,10 @@ pub async fn issue_internal_browser_proof(
         limit,
         Duration::from_secs(60),
     ) {
-        warn!("Internal browser proof issuer rate limited for ip {}", client_ip);
+        warn!(
+            "Internal browser proof issuer rate limited for ip {}",
+            client_ip
+        );
         return rate_limited(retry_after);
     }
 

@@ -212,18 +212,14 @@ async fn main() -> anyhow::Result<()> {
     // Start background task to clean up expired cache entries every 10 minutes
     tokio::spawn(cache_cleanup_task());
 
-    let internal_proof_host = std::env::var("BROWSER_PROOF_INTERNAL_HOST")
-        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    let internal_proof_host =
+        std::env::var("BROWSER_PROOF_INTERNAL_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let internal_proof_port = std::env::var("BROWSER_PROOF_INTERNAL_PORT")
         .unwrap_or_else(|_| "3005".to_string())
         .parse::<u16>()
         .expect("BROWSER_PROOF_INTERNAL_PORT must be a valid number");
-    spawn_internal_browser_proof_server(
-        state.clone(),
-        internal_proof_host,
-        internal_proof_port,
-    )
-    .await?;
+    spawn_internal_browser_proof_server(state.clone(), internal_proof_host, internal_proof_port)
+        .await?;
 
     // Configure CORS - more permissive for development, strict for production
     let is_development = std::env::var("DEBUG_MODE").unwrap_or_default() == "true";
