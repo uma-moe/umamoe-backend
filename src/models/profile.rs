@@ -70,6 +70,7 @@ pub struct VeteranCharacter {
 pub struct TrainerInfo {
     pub account_id: String,
     pub name: String,
+    pub shame_score: Option<i32>,
     pub follower_num: Option<i32>,
     pub best_team_class: Option<i32>,
     pub team_class: Option<i32>,

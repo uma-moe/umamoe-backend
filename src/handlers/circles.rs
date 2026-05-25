@@ -749,6 +749,7 @@ async fn fetch_circle_members(
         circle_id: i64,
         viewer_id: i64,
         trainer_name: Option<String>,
+        shame_score: Option<i32>,
         year: i32,
         month: i32,
         daily_fans: Vec<i64>,
@@ -763,6 +764,7 @@ async fn fetch_circle_members(
             cm.circle_id,
             cm.viewer_id,
             t.name as trainer_name,
+            s.suspicion_score AS shame_score,
             cm.year,
             cm.month,
             cm.daily_fans,
@@ -778,6 +780,7 @@ async fn fetch_circle_members(
             ) as next_month_start
         FROM circle_member_fans_monthly cm
         LEFT JOIN trainer t ON cm.viewer_id::text = t.account_id
+        LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = cm.viewer_id
         WHERE cm.circle_id = $1 AND cm.year = $2 AND cm.month = $3
         ORDER BY cm.viewer_id
         "#,
@@ -798,6 +801,7 @@ async fn fetch_circle_members(
                 circle_id: rec.circle_id,
                 viewer_id: rec.viewer_id,
                 trainer_name: rec.trainer_name,
+                shame_score: rec.shame_score,
                 year: rec.year,
                 month: rec.month,
                 daily_fans,

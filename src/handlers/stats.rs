@@ -61,21 +61,29 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsRespon
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE(tasks_24h, 0)    AS tasks_24h,
-            COALESCE(accounts_24h, 0) AS accounts_24h,
-            COALESCE(accounts_7d, 0)  AS accounts_7d,
-            COALESCE(umas_tracked, 0) AS umas_tracked
-        FROM stats_counts
+            COALESCE((TO_JSONB(s)->>'accounts_24h')::bigint, 0) AS accounts_24h,
+            COALESCE((TO_JSONB(s)->>'accounts_7d')::bigint, 0)  AS accounts_7d,
+            COALESCE((TO_JSONB(s)->>'umas_tracked')::bigint, 0) AS umas_tracked
+        FROM stats_counts s
         LIMIT 1
         "#,
     )
     .fetch_one(&state.db)
     .await?;
 
+    let tasks_24h = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM tasks
+        WHERE status = 'completed'
+          AND updated_at >= NOW() - INTERVAL '24 hours'
+        "#,
+    )
+    .fetch_one(&state.db)
+    .await?;
+
     let response = StatsResponse {
-        today: TodayActivity {
-            tasks_24h: row.get::<i64, _>("tasks_24h"),
-        },
+        today: TodayActivity { tasks_24h },
         freshness: DataFreshness {
             accounts_24h: row.get::<i64, _>("accounts_24h"),
             accounts_7d: row.get::<i64, _>("accounts_7d"),

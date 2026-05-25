@@ -1,0 +1,144 @@
+# Uses DATABASE_URL from this repo's .env. The app containers rewrite
+# 127.0.0.1/localhost to host.docker.internal so Docker can reach the host DB.
+name: umamoe-local
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: umamoe-local-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - redis-data:/data
+
+  resources:
+    build:
+      context: ../umamoe-resources
+    image: umamoe-resources:local
+    container_name: umamoe-local-resources
+    environment:
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://localhost:3002,http://localhost:3004}
+      API_PROTECTION_BYPASS: ${API_PROTECTION_BYPASS:-true}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-umamoe}
+      RESOURCES_INTERNAL_HOST: 0.0.0.0
+      RESOURCES_INTERNAL_PORT: 3204
+      RUST_LOG: ${RUST_LOG:-umamoe_resources=info,info}
+    ports:
+      - "127.0.0.1:${LOCAL_RESOURCES_PORT:-3004}:3000"
+    volumes:
+      - ../umamoe-resources/master.mdb:/data/master.mdb:ro
+      - ../umamoe-resources/generated-data:/data/generated-data
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - umamoe-resources
+          - umamoe-resources-beta
+
+  backend:
+    build:
+      context: .
+    image: umamoe-backend:local
+    container_name: umamoe-local-backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
+      HOST: 0.0.0.0
+      PORT: 3001
+      DEBUG_MODE: ${DEBUG_MODE:-true}
+      SKIP_MIGRATIONS: ${SKIP_MIGRATIONS:-false}
+      BASELINE_MIGRATIONS: ${BASELINE_MIGRATIONS:-false}
+      BASELINE_MIGRATIONS_BEFORE: ${BASELINE_MIGRATIONS_BEFORE:-}
+      BASELINE_MIGRATIONS_UP_TO: ${BASELINE_MIGRATIONS_UP_TO:-}
+      IGNORE_MIGRATION_VERSION_MISMATCH: ${IGNORE_MIGRATION_VERSION_MISMATCH:-true}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://localhost:3002,http://localhost:3004}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:4200}
+      OAUTH_REDIRECT_BASE_URL: ${OAUTH_REDIRECT_BASE_URL:-http://localhost:3001}
+      SEARCH_SERVICE_URL: http://umamoe-search:3202
+      JWT_SECRET: ${JWT_SECRET:-local-dev-jwt-secret-change-me}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:-}
+      DISCORD_CLIENT_SECRET: ${DISCORD_CLIENT_SECRET:-}
+      APPLE_CLIENT_ID: ${APPLE_CLIENT_ID:-}
+      APPLE_CLIENT_SECRET: ${APPLE_CLIENT_SECRET:-}
+      BROWSER_PROOF_SECRET: ${BROWSER_PROOF_SECRET:-local-dev-browser-proof-secret-change-me}
+      BROWSER_PROOF_COOKIE_SECURE: ${BROWSER_PROOF_COOKIE_SECURE:-false}
+      BROWSER_PROOF_INTERNAL_HOST: 0.0.0.0
+      BROWSER_PROOF_INTERNAL_PORT: 3201
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-umamoe}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-local-dev-turnstile-secret}
+      TURNSTILE_ALLOWED_HOSTS: ${TURNSTILE_ALLOWED_HOSTS:-localhost,127.0.0.1,umamoe-backend}
+      TURNSTILE_ACTION: ${TURNSTILE_ACTION:-api_request}
+      API_PROTECTION_BYPASS: ${API_PROTECTION_BYPASS:-true}
+      TURNSTILE_BYPASS: ${TURNSTILE_BYPASS:-true}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export DATABASE_URL="$$(printf '%s' "$$DATABASE_URL" | sed -e 's|@127\.0\.0\.1:|@host.docker.internal:|g' -e 's|@localhost:|@host.docker.internal:|g' -e 's|@127\.0\.0\.1/|@host.docker.internal/|g' -e 's|@localhost/|@host.docker.internal/|g')"
+        exec /usr/local/bin/umamoe-backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${LOCAL_BACKEND_PORT:-3001}:3001"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - umamoe-backend
+          - umamoe-backend-beta
+
+  search:
+    build:
+      context: ../umamoe_db
+    image: umamoe-search:local
+    container_name: umamoe-local-search
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
+      RESOURCE_BASE_URL: http://umamoe-resources:3204/resources
+      SEARCH_PORT: 3002
+      SEARCH_INTERNAL_PORT: 3202
+      SYNC_INTERVAL_SECS: ${SYNC_INTERVAL_SECS:-300}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://localhost:3002,http://localhost:3004}
+      API_PROTECTION_BYPASS: ${API_PROTECTION_BYPASS:-true}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-umamoe}
+      RUST_LOG: ${RUST_LOG:-umamoe_search=info}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        export DATABASE_URL="$$(printf '%s' "$$DATABASE_URL" | sed -e 's|@127\.0\.0\.1:|@host.docker.internal:|g' -e 's|@localhost:|@host.docker.internal:|g' -e 's|@127\.0\.0\.1/|@host.docker.internal/|g' -e 's|@localhost/|@host.docker.internal/|g')"
+        exec /usr/local/bin/umamoe-search
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:${LOCAL_SEARCH_PORT:-3002}:3002"
+    depends_on:
+      redis:
+        condition: service_healthy
+      resources:
+        condition: service_healthy
+    networks:
+      default:
+        aliases:
+          - umamoe-search
+          - umamoe-search-beta
+
+networks:
+  default:
+    name: umamoe-local
+
+volumes:
+  redis-data:
+    name: umamoe-local-redis-data

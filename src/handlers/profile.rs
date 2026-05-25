@@ -45,10 +45,13 @@ async fn get_profile(
     // 1) Trainer info
     let trainer = sqlx::query_as::<_, TrainerInfo>(
         r#"SELECT account_id, name, follower_num, best_team_class, team_class,
+               s.suspicion_score AS shame_score,
                team_evaluation_point, leader_chara_dress_id, rank_score,
                release_num_info, trophy_num_info, team_stadium_user,
                own_follow_num, enable_circle_scout, comment
-        FROM trainer WHERE account_id = $1"#,
+        FROM trainer
+        LEFT JOIN viewer_suspicion_scores s ON s.viewer_id::text = trainer.account_id
+        WHERE account_id = $1"#,
     )
     .bind(&account_id)
     .fetch_optional(&state.db)
@@ -143,12 +146,14 @@ async fn get_profile(
     // 4) Fan history — monthly rankings (graceful fallback if views have old schema)
     let monthly = sqlx::query_as::<_, UserFanRankingMonthly>(
         r#"
-        SELECT viewer_id, trainer_name, year, month, total_fans, monthly_gain,
-               active_days, avg_daily, avg_3d, avg_7d, avg_monthly, rank,
-               circle_id, circle_name, next_month_start
-        FROM user_fan_rankings_monthly
-        WHERE viewer_id = $1
-        ORDER BY year DESC, month DESC
+         SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score,
+             r.year, r.month, r.total_fans, r.monthly_gain,
+             r.active_days, r.avg_daily, r.avg_3d, r.avg_7d, r.avg_monthly, r.rank,
+             r.circle_id, r.circle_name, r.next_month_start
+         FROM user_fan_rankings_monthly r
+         LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id
+         WHERE r.viewer_id = $1
+         ORDER BY r.year DESC, r.month DESC
         "#,
     )
     .bind(viewer_id)
@@ -158,9 +163,12 @@ async fn get_profile(
 
     // 5) Rolling gains
     let rolling = sqlx::query_as::<_, UserFanRankingGains>(
-        r#"SELECT viewer_id, trainer_name, gain_3d, gain_7d, gain_30d,
-                rank_3d, rank_7d, rank_30d, circle_id, circle_name
-         FROM user_fan_rankings_gains WHERE viewer_id = $1"#,
+        r#"SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score,
+            r.gain_3d, r.gain_7d, r.gain_30d,
+            r.rank_3d, r.rank_7d, r.rank_30d, r.circle_id, r.circle_name
+         FROM user_fan_rankings_gains r
+         LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id
+         WHERE r.viewer_id = $1"#,
     )
     .bind(viewer_id)
     .fetch_optional(&state.db)
@@ -169,11 +177,14 @@ async fn get_profile(
 
     // 6) All-time ranking
     let alltime = sqlx::query_as::<_, UserFanRankingAlltime>(
-        r#"SELECT viewer_id, trainer_name, total_fans, total_gain, active_days,
-                avg_day, avg_week, avg_month, rank,
-                rank_total_fans, rank_total_gain, rank_avg_day, rank_avg_week, rank_avg_month,
-                circle_id, circle_name
-         FROM user_fan_rankings_alltime WHERE viewer_id = $1"#,
+        r#"SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score,
+            r.total_fans, r.total_gain, r.active_days,
+            r.avg_day, r.avg_week, r.avg_month, r.rank,
+            r.rank_total_fans, r.rank_total_gain, r.rank_avg_day, r.rank_avg_week, r.rank_avg_month,
+            r.circle_id, r.circle_name
+         FROM user_fan_rankings_alltime r
+         LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id
+         WHERE r.viewer_id = $1"#,
     )
     .bind(viewer_id)
     .fetch_optional(&state.db)

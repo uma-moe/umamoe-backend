@@ -6,6 +6,7 @@ pub mod partner;
 pub mod profile;
 pub mod rankings;
 pub mod search;
+pub mod shame;
 pub mod sharing;
 pub mod stats;
 pub mod tasks;

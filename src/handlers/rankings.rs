@@ -116,7 +116,7 @@ pub async fn get_monthly_rankings(
     let (extra_condition, search_id, search_pattern) = parse_search_query(&params.query, "$3");
 
     let where_clause = format!(
-        "year = $1 AND month = $2{}",
+        "r.year = $1 AND r.month = $2{}",
         if extra_condition.is_empty() {
             String::new()
         } else {
@@ -134,7 +134,10 @@ pub async fn get_monthly_rankings(
     let total: i64 = if let Some(cached) = crate::cache::get::<i64>(&count_cache_key) {
         cached
     } else {
-        let count_sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table_name, where_clause);
+        let count_sql = format!(
+            "SELECT COUNT(*) FROM {} r WHERE {}",
+            table_name, where_clause
+        );
         let count = bind_search(
             sqlx::query_scalar(&count_sql)
                 .bind(target_year)
@@ -159,9 +162,13 @@ pub async fn get_monthly_rankings(
         ("$3", "$4")
     };
     let data_sql = format!(
-        "SELECT viewer_id, trainer_name, year, month, total_fans, monthly_gain, active_days, \
-         avg_daily, avg_3d, avg_7d, avg_monthly, rank, circle_id, circle_name, next_month_start \
-         FROM {} WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
+        "SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score, \
+         r.year, r.month, r.total_fans, r.monthly_gain, r.active_days, \
+         r.avg_daily, r.avg_3d, r.avg_7d, r.avg_monthly, r.rank, \
+         r.circle_id, r.circle_name, r.next_month_start \
+         FROM {} r \
+         LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id \
+         WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
         table_name, where_clause, order_by, lp, op
     );
     let rankings: Vec<UserFanRankingMonthly> = bind_search_and_page(
@@ -232,7 +239,7 @@ pub async fn get_alltime_rankings(
         cached
     } else {
         let count_sql = format!(
-            "SELECT COUNT(*) FROM user_fan_rankings_alltime WHERE {}",
+            "SELECT COUNT(*) FROM user_fan_rankings_alltime r WHERE {}",
             where_clause
         );
         let count = bind_search(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
@@ -253,11 +260,14 @@ pub async fn get_alltime_rankings(
         ("$1", "$2")
     };
     let data_sql = format!(
-        "SELECT viewer_id, trainer_name, total_fans, total_gain, active_days, \
-         avg_day, avg_week, avg_month, rank, \
-         rank_total_fans, rank_total_gain, rank_avg_day, rank_avg_week, rank_avg_month, \
-         circle_id, circle_name \
-         FROM user_fan_rankings_alltime WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
+        "SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score, \
+         r.total_fans, r.total_gain, r.active_days, \
+         r.avg_day, r.avg_week, r.avg_month, r.rank, \
+         r.rank_total_fans, r.rank_total_gain, r.rank_avg_day, r.rank_avg_week, r.rank_avg_month, \
+         r.circle_id, r.circle_name \
+         FROM user_fan_rankings_alltime r \
+         LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id \
+         WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
         where_clause, order_by, lp, op
     );
     let rankings: Vec<UserFanRankingAlltime> = bind_search_and_page(
@@ -322,7 +332,7 @@ pub async fn get_gains_rankings(
         cached
     } else {
         let count_sql = format!(
-            "SELECT COUNT(*) FROM user_fan_rankings_gains WHERE {}",
+            "SELECT COUNT(*) FROM user_fan_rankings_gains r WHERE {}",
             where_clause
         );
         let count = bind_search(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
@@ -343,8 +353,12 @@ pub async fn get_gains_rankings(
         ("$1", "$2")
     };
     let data_sql = format!(
-        "SELECT viewer_id, trainer_name, gain_3d, gain_7d, gain_30d, rank_3d, rank_7d, rank_30d, circle_id, circle_name \
-         FROM user_fan_rankings_gains WHERE {} ORDER BY {} ASC LIMIT {} OFFSET {}",
+        "SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score, \
+         r.gain_3d, r.gain_7d, r.gain_30d, r.rank_3d, r.rank_7d, r.rank_30d, \
+         r.circle_id, r.circle_name \
+         FROM user_fan_rankings_gains r \
+         LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id \
+         WHERE {} ORDER BY {} ASC LIMIT {} OFFSET {}",
         where_clause, rank_column, lp, op
     );
     let rankings: Vec<UserFanRankingGains> = bind_search_and_page(
@@ -388,12 +402,12 @@ fn parse_search_query(
         let q = q.trim();
         if !q.is_empty() {
             if let Ok(id) = q.parse::<i64>() {
-                return (format!("viewer_id = {}", param), Some(id), None);
+                return (format!("r.viewer_id = {}", param), Some(id), None);
             } else if q.len() >= 2 {
                 let pat = format!("%{}%", q.replace('\'', "''"));
                 return (
                     format!(
-                        "(trainer_name ILIKE {} OR circle_name ILIKE {})",
+                        "(r.trainer_name ILIKE {} OR r.circle_name ILIKE {})",
                         param, param
                     ),
                     None,

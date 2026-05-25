@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 mod auth;
 mod cache;
+mod cheat_analysis;
 mod database;
 mod errors;
 mod handlers;
@@ -17,8 +18,8 @@ mod notify;
 mod redis_store;
 
 use handlers::{
-    affinity, auth as auth_handlers, circles, docs, partner, profile, rankings, search, sharing,
-    stats, tasks, version,
+    affinity, auth as auth_handlers, circles, docs, partner, profile, rankings, search, shame,
+    sharing, stats, tasks, version,
 };
 use notify::TaskNotifier;
 
@@ -48,13 +49,17 @@ async fn main() -> anyhow::Result<()> {
     if is_development {
         tracing_subscriber::fmt()
             .with_max_level(Level::INFO)
-            .with_env_filter(EnvFilter::new("honsemoe_backend=info,sqlx=info,info"))
+            .with_env_filter(EnvFilter::new(
+                "honsemoe_backend_v2=info,honsemoe_backend=info,sqlx=info,info",
+            ))
             .init();
         info!("🔧 Development mode: INFO logging enabled with SQL query logging");
     } else {
         tracing_subscriber::fmt()
             .with_max_level(Level::WARN)
-            .with_env_filter(EnvFilter::new("honsemoe_backend=warn,sqlx=warn,warn"))
+            .with_env_filter(EnvFilter::new(
+                "honsemoe_backend_v2=warn,honsemoe_backend=warn,sqlx=warn,warn",
+            ))
             .init();
     }
 
@@ -83,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
 
         let migrator = sqlx::migrate!("./migrations");
 
+        baseline_migrations_from_env(&pool, &migrator).await?;
+
         // Determine which migrations are already applied so we can log only the new ones.
         let applied: std::collections::HashSet<i64> =
             sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success = true")
@@ -106,7 +113,76 @@ async fn main() -> anyhow::Result<()> {
                 warn!("   ▶ {} — {}", m.version, m.description);
             }
 
-            match migrator.run(&pool).await {
+            // Heartbeat task: polls _sqlx_migrations every few seconds so we
+            // can log which migration just completed and how long the
+            // currently-running one has been going. sqlx::Migrator::run
+            // applies them sequentially in pending order, so we can derive
+            // "currently running" as the first not-yet-applied pending one.
+            let pending_for_watch: Vec<(i64, String)> = pending
+                .iter()
+                .map(|m| (m.version, m.description.to_string()))
+                .collect();
+            let pool_watch = pool.clone();
+            let watch_handle = tokio::spawn(async move {
+                let overall_start = std::time::Instant::now();
+                let mut step_start = std::time::Instant::now();
+                let mut current_idx: usize = 0;
+                if let Some((v, d)) = pending_for_watch.first() {
+                    warn!("   ▶ applying {} — {} ...", v, d);
+                }
+                let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(5));
+                tick.tick().await; // discard immediate first tick
+                loop {
+                    tick.tick().await;
+                    let applied_now: std::collections::HashSet<i64> = sqlx::query_scalar(
+                        "SELECT version FROM _sqlx_migrations WHERE success = true",
+                    )
+                    .fetch_all(&pool_watch)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+
+                    // Advance past any completions we missed since last tick.
+                    while current_idx < pending_for_watch.len()
+                        && applied_now.contains(&pending_for_watch[current_idx].0)
+                    {
+                        let (v, d) = &pending_for_watch[current_idx];
+                        warn!(
+                            "   ✅ {} — {} done in {:.1}s",
+                            v,
+                            d,
+                            step_start.elapsed().as_secs_f64()
+                        );
+                        current_idx += 1;
+                        step_start = std::time::Instant::now();
+                        if let Some((nv, nd)) = pending_for_watch.get(current_idx) {
+                            warn!("   ▶ applying {} — {} ...", nv, nd);
+                        }
+                    }
+
+                    if current_idx >= pending_for_watch.len() {
+                        break;
+                    }
+
+                    let (v, d) = &pending_for_watch[current_idx];
+                    warn!(
+                        "   ⏳ {} — {} still running ({:.0}s, {:.0}s total)",
+                        v,
+                        d,
+                        step_start.elapsed().as_secs_f64(),
+                        overall_start.elapsed().as_secs_f64()
+                    );
+                }
+            });
+
+            let run_result = migrator.run(&pool).await;
+            // Give the watcher one more tick to flush final completion lines,
+            // then stop it regardless of outcome.
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            watch_handle.abort();
+
+            match run_result {
                 Ok(_) => warn!("✅ Migrations completed successfully"),
                 Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
                     if ignore_migration_version_mismatch {
@@ -212,6 +288,9 @@ async fn main() -> anyhow::Result<()> {
     // Start background task to clean up expired cache entries every 10 minutes
     tokio::spawn(cache_cleanup_task());
 
+    // Start background task to incrementally refresh cheat / botting analysis
+    tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
+
     let internal_proof_host =
         std::env::var("BROWSER_PROOF_INTERNAL_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
     let internal_proof_port = std::env::var("BROWSER_PROOF_INTERNAL_PORT")
@@ -311,6 +390,7 @@ async fn main() -> anyhow::Result<()> {
         .nest("/api/v4/circles", circles::router())
         .nest("/api/v4/rankings", rankings::router())
         .nest("/api/v4/user/profile", profile::router())
+        .nest("/api/v4/shame", shame::router())
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -375,6 +455,86 @@ async fn main() -> anyhow::Result<()> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
+
+    Ok(())
+}
+
+async fn baseline_migrations_from_env(
+    pool: &PgPool,
+    migrator: &sqlx::migrate::Migrator,
+) -> anyhow::Result<()> {
+    let baseline_all = std::env::var("BASELINE_MIGRATIONS")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    let baseline_before = std::env::var("BASELINE_MIGRATIONS_BEFORE")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.parse::<i64>())
+        .transpose()?;
+    let baseline_up_to = std::env::var("BASELINE_MIGRATIONS_UP_TO")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.parse::<i64>())
+        .transpose()?;
+
+    if !baseline_all && baseline_before.is_none() && baseline_up_to.is_none() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+            success BOOLEAN NOT NULL,
+            checksum BYTEA NOT NULL,
+            execution_time BIGINT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    let selected: Vec<_> = migrator
+        .migrations
+        .iter()
+        .filter(|migration| {
+            baseline_all
+                || baseline_before.is_some_and(|version| migration.version < version)
+                || baseline_up_to.is_some_and(|version| migration.version <= version)
+        })
+        .collect();
+
+    if selected.is_empty() {
+        warn!("⚠️ Migration baseline requested, but no migrations matched the configured range");
+        return Ok(());
+    }
+
+    warn!(
+        "⚠️ Baselining {} migration(s) into _sqlx_migrations without executing them",
+        selected.len()
+    );
+    warn!("⚠️ Use this only when the database schema/data already has those migrations applied");
+
+    for migration in selected {
+        sqlx::query(
+            r#"
+            INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+            VALUES ($1, $2, TRUE, $3, 0)
+            ON CONFLICT (version) DO UPDATE SET
+                description = EXCLUDED.description,
+                success = TRUE,
+                checksum = EXCLUDED.checksum,
+                execution_time = EXCLUDED.execution_time
+            "#,
+        )
+        .bind(migration.version)
+        .bind(&*migration.description)
+        .bind(&*migration.checksum)
+        .execute(pool)
+        .await?;
+    }
 
     Ok(())
 }
@@ -550,6 +710,45 @@ async fn refresh_stats_task(pool: PgPool) {
 
     loop {
         refresh_mat_view(&pool, "stats_counts").await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+    }
+}
+
+// Background task that rebuilds the cheat/botting analysis aggregates by
+// streaming `circle_member_fan_snapshots` through the in-process Rust
+// pipeline (see `cheat_analysis::run_full_rebuild`). The DB only stores
+// the final aggregate tables; all sessionization / scoring happens here.
+// Runs every hour.
+async fn refresh_cheat_analysis_task(pool: PgPool) {
+    info!("🔄 Starting cheat analysis refresh background task (runs every hour)");
+
+    // Preload the in-memory /shame snapshot from the currently published
+    // aggregate tables so requests are fast immediately after startup.
+    match handlers::shame::rebuild_snapshot(&pool).await {
+        Ok(()) => info!("✅ initial shame snapshot loaded from aggregate tables"),
+        Err(e) => warn!("⚠️ Failed to preload shame snapshot: {}", e),
+    }
+
+    // Delay first run a bit so startup migrations / other initial work finish first.
+    tokio::time::sleep(tokio::time::Duration::from_secs(90)).await;
+
+    loop {
+        let start = std::time::Instant::now();
+        info!("▶ cheat analysis rebuild starting");
+        match cheat_analysis::run_full_rebuild(&pool).await {
+            Ok(stats) => {
+                info!(
+                    "✅ cheat analysis refreshed: {} snapshots, {} viewers scored, last_snapshot_id={} in {} ms (wall {:.1}s)",
+                    stats.snapshots_processed,
+                    stats.viewers_scored,
+                    stats.last_snapshot_id,
+                    stats.duration_ms,
+                    start.elapsed().as_secs_f64()
+                );
+            }
+            Err(e) => warn!("⚠️ Failed to refresh cheat analysis: {}", e),
+        }
+
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
     }
 }

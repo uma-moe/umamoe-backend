@@ -1,0 +1,3 @@
+ALTER TABLE viewer_suspicion_scores
+    ADD COLUMN IF NOT EXISTS fans_per_active_minute DOUBLE PRECISION NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS peak_fans_per_minute   DOUBLE PRECISION NOT NULL DEFAULT 0;

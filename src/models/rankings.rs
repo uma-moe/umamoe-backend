@@ -6,6 +6,7 @@ use sqlx::FromRow;
 pub struct UserFanRankingMonthly {
     pub viewer_id: i64,
     pub trainer_name: Option<String>,
+    pub shame_score: Option<i32>,
     pub year: i32,
     pub month: i32,
     /// Cumulative fan count at end of month
@@ -34,6 +35,7 @@ pub struct UserFanRankingMonthly {
 pub struct UserFanRankingAlltime {
     pub viewer_id: i64,
     pub trainer_name: Option<String>,
+    pub shame_score: Option<i32>,
     /// Latest (current) cumulative fan count
     pub total_fans: i64,
     /// All-time gain (latest - earliest cumulative)
@@ -62,6 +64,7 @@ pub struct UserFanRankingAlltime {
 pub struct UserFanRankingGains {
     pub viewer_id: i64,
     pub trainer_name: Option<String>,
+    pub shame_score: Option<i32>,
     pub gain_3d: i64,
     pub gain_7d: i64,
     pub gain_30d: i64,

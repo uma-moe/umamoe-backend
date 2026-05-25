@@ -44,6 +44,7 @@ pub struct CircleMemberFansMonthly {
     pub circle_id: i64,
     pub viewer_id: i64,
     pub trainer_name: Option<String>,
+    pub shame_score: Option<i32>,
     pub year: i32,
     pub month: i32,
     pub daily_fans: Vec<i64>,
