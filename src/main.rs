@@ -185,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
             match run_result {
                 Ok(_) => warn!("✅ Migrations completed successfully"),
                 Err(sqlx::migrate::MigrateError::VersionMismatch(version)) => {
-                    if ignore_migration_version_mismatch {
+                    if ignore_migration_version_mismatch && pending.is_empty() {
                         warn!(
                             "⚠️  Ignoring migration version mismatch for version {}",
                             version
@@ -193,6 +193,21 @@ async fn main() -> anyhow::Result<()> {
                         warn!(
                             "Database migration history differs from this checkout, but startup will continue"
                         );
+                    } else if ignore_migration_version_mismatch {
+                        error!(
+                            "⚠️  Migration version mismatch for version {} prevented {} pending migration(s) from running",
+                            version,
+                            pending.len()
+                        );
+                        error!(
+                            "Refusing to continue because the application expects schema from pending migrations"
+                        );
+                        error!(
+                            "Fix the migration mismatch or explicitly baseline the already-applied migrations before restarting"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "Migration version mismatch blocked pending migrations"
+                        ));
                     } else {
                         error!("⚠️  Migration version mismatch: {}", version);
                         error!("Database has different migration state than expected");
@@ -239,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
 
     let oauth_redirect_base = std::env::var("OAUTH_REDIRECT_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3001".to_string());
+    info!("OAuth redirect base URL: {}", oauth_redirect_base);
 
     let redis_store = match redis_store::RedisStore::from_env() {
         Ok(Some(store)) => {
