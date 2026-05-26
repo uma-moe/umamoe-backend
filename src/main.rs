@@ -33,6 +33,33 @@ pub struct AppState {
     pub redis_store: Option<redis_store::RedisStore>,
 }
 
+async fn log_database_write_state(pool: &PgPool, require_writable: bool) -> anyhow::Result<()> {
+    let (in_recovery, transaction_read_only, current_user, current_database) =
+        sqlx::query_as::<_, (bool, String, String, String)>(
+            "SELECT pg_is_in_recovery(), current_setting('transaction_read_only'), current_user, current_database()",
+        )
+        .fetch_one(pool)
+        .await?;
+
+    let is_read_only = in_recovery || transaction_read_only.eq_ignore_ascii_case("on");
+    if is_read_only {
+        warn!(
+            "Database connection is read-only: database={}, user={}, pg_is_in_recovery={}, transaction_read_only={}",
+            current_database, current_user, in_recovery, transaction_read_only
+        );
+        if require_writable {
+            anyhow::bail!("REQUIRE_WRITABLE_DATABASE=true but PostgreSQL connection is read-only");
+        }
+    } else {
+        info!(
+            "Database connection is writable: database={}, user={}, pg_is_in_recovery={}, transaction_read_only={}",
+            current_database, current_user, in_recovery, transaction_read_only
+        );
+    }
+
+    Ok(())
+}
+
 fn default_search_service_url() -> String {
     if std::path::Path::new("/.dockerenv").exists() {
         "http://umamoe-search:3202".to_string()
@@ -72,6 +99,10 @@ async fn main() -> anyhow::Result<()> {
     let pool = database::create_pool(&database_url)
         .await
         .expect("Failed to connect to PostgreSQL");
+    let require_writable_database = std::env::var("REQUIRE_WRITABLE_DATABASE")
+        .map(|v| v.to_lowercase() == "true" || v == "1")
+        .unwrap_or(false);
+    log_database_write_state(&pool, require_writable_database).await?;
 
     // Run migrations with better error handling (can be disabled via env var)
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
@@ -80,7 +111,6 @@ async fn main() -> anyhow::Result<()> {
     let ignore_migration_version_mismatch = std::env::var("IGNORE_MIGRATION_VERSION_MISMATCH")
         .map(|v| v.to_lowercase() == "true" || v == "1")
         .unwrap_or(false);
-
     if skip_migrations {
         warn!("⚠️ Skipping migrations due to SKIP_MIGRATIONS=true");
     } else {
