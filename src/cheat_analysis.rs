@@ -94,6 +94,9 @@ const SHORT_CAREER_SNAPSHOTS_PER_VIEWER: usize = 25;
 const JST_RESET_HOUR_UTC: u32 = 15;
 const LAST_CAREER_LENGTH_WINDOW: usize = 20;
 const CAREER_RATE_MAX_SAMPLE_SECONDS: u32 = 120 * 60;
+const CAREER_RATE_ROBUST_MIN_SAMPLES: usize = 10;
+const CAREER_RATE_ZERO_IQR_LOWER_MULTIPLIER: f64 = 0.5;
+const CAREER_RATE_ZERO_IQR_UPPER_MULTIPLIER: f64 = 2.0;
 /// Width of each career-length histogram bucket, in seconds.
 const CAREER_LENGTH_BUCKET_SECONDS: u32 = 300;
 /// Number of buckets. Bucket i covers `[i*5, (i+1)*5)` minutes for
@@ -1915,11 +1918,11 @@ fn career_rate_breakdown(
     let last_20: Vec<&CareerRateSample> = bounded.iter().rev().take(20).copied().collect();
 
     CareerRateBreakdown {
-        all: career_rate_window(bounded.iter().copied()),
+        all: career_rate_window_robust(bounded.iter().copied()),
         last_30d: career_rate_window_for_days(&bounded, reference_at, 30),
         last_7d: career_rate_window_for_days(&bounded, reference_at, 7),
         last_3d: career_rate_window_for_days(&bounded, reference_at, 3),
-        last_20: career_rate_window(last_20.iter().copied()),
+        last_20: career_rate_window_robust(last_20.iter().copied()),
     }
 }
 
@@ -1929,7 +1932,7 @@ fn career_rate_window_for_days(
     days: i64,
 ) -> CareerRateWindow {
     let cutoff = reference_at - chrono::Duration::days(days);
-    career_rate_window(
+    career_rate_window_robust(
         samples
             .iter()
             .copied()
@@ -1951,6 +1954,51 @@ fn career_rate_window<'a>(
     } else {
         0.0
     };
+    CareerRateWindow {
+        careers_per_hour,
+        sample_count,
+        sample_seconds,
+    }
+}
+
+fn career_rate_window_robust<'a>(
+    samples: impl IntoIterator<Item = &'a CareerRateSample>,
+) -> CareerRateWindow {
+    let samples: Vec<&CareerRateSample> = samples.into_iter().collect();
+    if samples.len() < CAREER_RATE_ROBUST_MIN_SAMPLES {
+        return career_rate_window(samples.iter().copied());
+    }
+
+    let mut sorted_seconds: Vec<u32> = samples.iter().map(|sample| sample.seconds).collect();
+    sorted_seconds.sort_unstable();
+
+    let q1 = sorted_seconds[sorted_seconds.len() / 4] as f64;
+    let median = sorted_seconds[sorted_seconds.len() / 2] as f64;
+    let q3 = sorted_seconds[(sorted_seconds.len() * 3) / 4] as f64;
+    let iqr = q3 - q1;
+    let (lower, upper) = if iqr > 0.0 {
+        ((q1 - 1.5 * iqr).max(1.0), q3 + 1.5 * iqr)
+    } else {
+        (
+            (median * CAREER_RATE_ZERO_IQR_LOWER_MULTIPLIER).max(1.0),
+            median * CAREER_RATE_ZERO_IQR_UPPER_MULTIPLIER,
+        )
+    };
+
+    let mut sample_count = 0i32;
+    let mut sample_seconds = 0i64;
+    for sample in samples {
+        sample_count = sample_count.saturating_add(1);
+        sample_seconds = sample_seconds
+            .saturating_add((sample.seconds as f64).clamp(lower, upper).round() as i64);
+    }
+
+    let careers_per_hour = if sample_seconds > 0 {
+        sample_count as f64 / (sample_seconds as f64 / 3600.0)
+    } else {
+        0.0
+    };
+
     CareerRateWindow {
         careers_per_hour,
         sample_count,
@@ -4000,6 +4048,63 @@ mod tests {
         assert_eq!(breakdown.last_30d.sample_count, 2);
         assert_eq!(breakdown.last_3d.sample_seconds, 70 * 60);
         assert_eq!(breakdown.last_20.sample_count, 3);
+    }
+
+    #[test]
+    fn career_rate_windows_winsorize_outlier_intervals() {
+        let reference_at = ts("2026-05-20T12:00:00Z");
+        let mut samples: Vec<CareerRateSample> = (0..18)
+            .map(|idx| CareerRateSample {
+                finished_at: reference_at + chrono::Duration::minutes(idx),
+                seconds: 20 * 60,
+            })
+            .collect();
+        samples.push(CareerRateSample {
+            finished_at: reference_at + chrono::Duration::minutes(18),
+            seconds: 100 * 60,
+        });
+        samples.push(CareerRateSample {
+            finished_at: reference_at + chrono::Duration::minutes(19),
+            seconds: 100 * 60,
+        });
+
+        let breakdown = career_rate_breakdown(&samples, reference_at);
+
+        assert_eq!(breakdown.all.sample_count, 20);
+        assert_eq!(breakdown.all.sample_seconds, 440 * 60);
+        assert_eq!(breakdown.last_20.sample_count, 20);
+        assert_eq!(breakdown.last_20.sample_seconds, 440 * 60);
+        assert_eq!(breakdown.last_30d.sample_seconds, 440 * 60);
+        assert_eq!(breakdown.last_7d.sample_seconds, 440 * 60);
+        assert_eq!(breakdown.last_3d.sample_seconds, 440 * 60);
+        assert!((breakdown.last_20.careers_per_hour - (20.0 / (440.0 / 60.0))).abs() < 1e-9);
+    }
+
+    #[test]
+    fn career_rate_windows_keep_small_samples_raw() {
+        let reference_at = ts("2026-05-20T12:00:00Z");
+        let samples = vec![
+            CareerRateSample {
+                finished_at: reference_at,
+                seconds: 20 * 60,
+            },
+            CareerRateSample {
+                finished_at: reference_at + chrono::Duration::minutes(1),
+                seconds: 100 * 60,
+            },
+        ];
+
+        let breakdown = career_rate_breakdown(&samples, reference_at);
+
+        assert_eq!(breakdown.all.sample_count, 2);
+        assert_eq!(breakdown.all.sample_seconds, 120 * 60);
+        assert!((breakdown.all.careers_per_hour - 1.0).abs() < 1e-9);
+        assert_eq!(breakdown.last_30d.sample_seconds, 120 * 60);
+        assert_eq!(breakdown.last_7d.sample_seconds, 120 * 60);
+        assert_eq!(breakdown.last_3d.sample_seconds, 120 * 60);
+        assert_eq!(breakdown.last_20.sample_count, 2);
+        assert_eq!(breakdown.last_20.sample_seconds, 120 * 60);
+        assert!((breakdown.last_20.careers_per_hour - 1.0).abs() < 1e-9);
     }
 
     #[test]
