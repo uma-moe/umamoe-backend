@@ -133,6 +133,13 @@ async fn create_lookup(
         }
     }
 
+    if state.user_writes_disabled {
+        return Err(AppError::Forbidden(
+            "Partner lookups that need a new task are disabled in this read-only environment"
+                .into(),
+        ));
+    }
+
     let task_data = json!({
         "partner_id": partner_id,
         "lookup_kind": lookup_kind,
@@ -258,10 +265,12 @@ async fn stream_lookup(
             if remaining.is_zero() {
                 // Timed out — delete the stale task so it doesn't linger in
                 // the queue and get retried endlessly.
-                let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
-                    .bind(task_id)
-                    .execute(&state_clone.db)
-                    .await;
+                if !state_clone.user_writes_disabled {
+                    let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
+                        .bind(task_id)
+                        .execute(&state_clone.db)
+                        .await;
+                }
                 let _ = tx
                     .send(Ok(Event::default().event("timeout").data(
                         json!({ "task_id": task_id, "status": "timeout" }).to_string(),
@@ -310,10 +319,12 @@ async fn stream_lookup(
                 Err(_) => {
                     // Timed out — delete the stale task so it doesn't linger in
                     // the queue and get retried endlessly.
-                    let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
-                        .bind(task_id)
-                        .execute(&state_clone.db)
-                        .await;
+                    if !state_clone.user_writes_disabled {
+                        let _ = sqlx::query("DELETE FROM tasks WHERE id = $1")
+                            .bind(task_id)
+                            .execute(&state_clone.db)
+                            .await;
+                    }
                     let _ = tx
                         .send(Ok(Event::default().event("timeout").data(
                             json!({ "task_id": task_id, "status": "timeout" }).to_string(),

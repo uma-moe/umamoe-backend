@@ -146,9 +146,14 @@ docker run --rm \
    --env-file .env \
    -e HOST=0.0.0.0 \
    -e PORT=3101 \
+   -e USER_WRITES_DISABLED=true \
    -p 127.0.0.1:3101:3101 \
    umamoe-backend:local
 ```
+
+Set `USER_WRITES_DISABLED=true` for beta/read-only followers. This rejects user
+and task mutations while still allowing backend-generated materialized views,
+ranking refreshes, live rank cleanup, and suspicious-activity aggregates.
 
 ### GitHub Actions Deployment
 

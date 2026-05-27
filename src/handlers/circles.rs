@@ -3,6 +3,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use chrono::{Datelike, Duration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -514,11 +515,51 @@ pub struct RankThreshold {
     pub ranking_from: Option<i32>,
     pub ranking_to: Option<i32>,
     pub current_min_fans: Option<i64>,
+    pub current_fans_per_day: Option<i64>,
+    pub yesterday_min_fans: Option<i64>,
+    pub yesterday_fans_per_day: Option<i64>,
+    pub daily_fans_delta: Option<i64>,
+    pub last_month_min_fans: Option<i64>,
+    pub last_month_fans_per_day: Option<i64>,
+    pub current_vs_last_month_delta: Option<i64>,
+}
+
+struct MonthProgress {
+    elapsed_days: i64,
+    yesterday_elapsed_days: i64,
+    previous_month_days: i64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct RankThresholdsResponse {
     pub thresholds: Vec<RankThreshold>,
+}
+
+fn month_progress_jst() -> MonthProgress {
+    let jst_offset = FixedOffset::east_opt(9 * 3600).unwrap();
+    let now_jst = Utc::now().with_timezone(&jst_offset);
+    let elapsed_days = now_jst.day() as i64;
+    let first_day_this_month = NaiveDate::from_ymd_opt(now_jst.year(), now_jst.month(), 1).unwrap();
+    let previous_month_last_day = first_day_this_month - Duration::days(1);
+
+    MonthProgress {
+        elapsed_days,
+        yesterday_elapsed_days: (elapsed_days - 1).max(1),
+        previous_month_days: previous_month_last_day.day() as i64,
+    }
+}
+
+fn fans_per_day(total_fans: Option<i64>, days: i64) -> Option<i64> {
+    let total_fans = total_fans?;
+    if days <= 0 || total_fans <= 0 {
+        Some(0)
+    } else {
+        Some(total_fans.saturating_add(days - 1) / days)
+    }
+}
+
+fn option_delta(current: Option<i64>, previous: Option<i64>) -> Option<i64> {
+    Some(current? - previous?)
 }
 
 /// GET /api/v4/circles/rank-thresholds - Get the fan requirements for each circle rank tier
@@ -539,13 +580,29 @@ pub async fn get_rank_thresholds(
         ("D", 1, None, None),
     ];
 
+    let month_progress = month_progress_jst();
     let mut thresholds = Vec::new();
 
     for (name, rank_index, ranking_from, ranking_to) in tiers {
-        let current_min_fans = if let Some(boundary) = ranking_to {
-            fetch_boundary_points(&state.db, boundary).await?
+        let (
+            current_min_fans,
+            yesterday_min_fans,
+            last_month_min_fans,
+            daily_fans_delta,
+            current_vs_last_month_delta,
+        ) = if let Some(boundary) = ranking_to {
+            let current = fetch_boundary_points(&state.db, boundary).await?;
+            let yesterday = fetch_boundary_points_yesterday(&state.db, boundary).await?;
+            let last_month = fetch_boundary_points_last_month(&state.db, boundary).await?;
+            (
+                current,
+                yesterday,
+                last_month,
+                option_delta(current, yesterday),
+                option_delta(current, last_month),
+            )
         } else {
-            None
+            (None, None, None, None, None)
         };
 
         thresholds.push(RankThreshold {
@@ -554,6 +611,19 @@ pub async fn get_rank_thresholds(
             ranking_from,
             ranking_to,
             current_min_fans,
+            current_fans_per_day: fans_per_day(current_min_fans, month_progress.elapsed_days),
+            yesterday_min_fans,
+            yesterday_fans_per_day: fans_per_day(
+                yesterday_min_fans,
+                month_progress.yesterday_elapsed_days,
+            ),
+            daily_fans_delta,
+            last_month_min_fans,
+            last_month_fans_per_day: fans_per_day(
+                last_month_min_fans,
+                month_progress.previous_month_days,
+            ),
+            current_vs_last_month_delta,
         });
     }
 
@@ -663,6 +733,30 @@ async fn fetch_boundary_points_yesterday(
         JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id
         WHERE lr.live_yesterday_rank <= $1 AND c.yesterday_points IS NOT NULL
         ORDER BY lr.live_yesterday_rank DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(boundary_rank)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(result)
+}
+
+/// Fetch the last_month_point of the circle at the given boundary rank.
+async fn fetch_boundary_points_last_month(
+    pool: &PgPool,
+    boundary_rank: i32,
+) -> Result<Option<i64>, AppError> {
+    let result: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT c.last_month_point
+        FROM circles c
+        WHERE c.last_month_rank <= $1
+          AND c.last_month_rank > 0
+          AND c.last_month_point IS NOT NULL
+          AND (c.archived IS NULL OR c.archived = false)
+        ORDER BY c.last_month_rank DESC
         LIMIT 1
         "#,
     )

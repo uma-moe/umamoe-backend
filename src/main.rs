@@ -31,6 +31,7 @@ pub struct AppState {
     pub oauth_redirect_base: String,
     pub task_notifier: TaskNotifier,
     pub redis_store: Option<redis_store::RedisStore>,
+    pub user_writes_disabled: bool,
 }
 
 async fn log_database_write_state(pool: &PgPool, require_writable: bool) -> anyhow::Result<()> {
@@ -68,6 +69,12 @@ fn default_search_service_url() -> String {
     }
 }
 
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing - production uses WARN/ERROR only, development uses INFO
@@ -103,6 +110,13 @@ async fn main() -> anyhow::Result<()> {
         .map(|v| v.to_lowercase() == "true" || v == "1")
         .unwrap_or(false);
     log_database_write_state(&pool, require_writable_database).await?;
+
+    let user_writes_disabled = env_flag("USER_WRITES_DISABLED") || env_flag("BETA_READ_ONLY");
+    if user_writes_disabled {
+        warn!(
+            "🔒 User writes are disabled: auth mutations, task creation, bookmarks, profile settings, daily stats, and request usage writes will be rejected or skipped"
+        );
+    }
 
     // Run migrations with better error handling (can be disabled via env var)
     let skip_migrations = std::env::var("SKIP_MIGRATIONS")
@@ -271,7 +285,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Hash any remaining plaintext emails (one-time backfill, idempotent)
-    backfill_email_hashes(&pool).await;
+    if user_writes_disabled {
+        warn!("🔒 Skipping email hash backfill because user writes are disabled");
+    } else {
+        backfill_email_hashes(&pool).await;
+    }
 
     let search_url =
         std::env::var("SEARCH_SERVICE_URL").unwrap_or_else(|_| default_search_service_url());
@@ -314,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
         oauth_redirect_base,
         task_notifier,
         redis_store,
+        user_writes_disabled,
     };
 
     // Start background task to refresh materialized views every hour
@@ -325,8 +344,12 @@ async fn main() -> anyhow::Result<()> {
     // Start background task to refresh user fan rankings every hour
     tokio::spawn(refresh_user_rankings_task(pool.clone()));
 
-    // Start background task to ensure daily stats entries exist
-    tokio::spawn(ensure_daily_stats_task(pool.clone()));
+    if user_writes_disabled {
+        warn!("🔒 Daily stats table writes are disabled in user-write read-only mode");
+    } else {
+        // Start background task to ensure daily stats entries exist
+        tokio::spawn(ensure_daily_stats_task(pool.clone()));
+    }
 
     // Start background task to clear stale live_points/live_rank every hour
     tokio::spawn(clear_stale_live_task(pool.clone()));
@@ -334,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
     // Start background task to clean up expired cache entries every 10 minutes
     tokio::spawn(cache_cleanup_task());
 
-    // Start background task to incrementally refresh cheat / botting analysis
+    // Start background task to incrementally refresh suspicious-activity analysis
     tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
 
     let internal_proof_host =
@@ -442,6 +465,10 @@ async fn main() -> anyhow::Result<()> {
                 .layer(TraceLayer::new_for_http())
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
+                    middleware::user_writes::user_write_guard_middleware,
+                ))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
                     middleware::api_key::api_key_tracking_middleware,
                 ))
                 .layer(axum::middleware::from_fn_with_state(
@@ -470,6 +497,10 @@ async fn main() -> anyhow::Result<()> {
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::user_writes::user_write_guard_middleware,
+                ))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     middleware::api_key::api_key_tracking_middleware,
@@ -760,13 +791,13 @@ async fn refresh_stats_task(pool: PgPool) {
     }
 }
 
-// Background task that rebuilds the cheat/botting analysis aggregates by
+// Background task that rebuilds the suspicious-activity analysis aggregates by
 // streaming `circle_member_fan_snapshots` through the in-process Rust
 // pipeline (see `cheat_analysis::run_full_rebuild`). The DB only stores
 // the final aggregate tables; all sessionization / scoring happens here.
 // Runs every hour.
 async fn refresh_cheat_analysis_task(pool: PgPool) {
-    info!("🔄 Starting cheat analysis refresh background task (runs every hour)");
+    info!("🔄 Starting suspicious-activity analysis refresh background task (runs every hour)");
 
     // Preload the in-memory /shame snapshot from the currently published
     // aggregate tables so requests are fast immediately after startup.
@@ -780,11 +811,11 @@ async fn refresh_cheat_analysis_task(pool: PgPool) {
 
     loop {
         let start = std::time::Instant::now();
-        info!("▶ cheat analysis rebuild starting");
+        info!("▶ suspicious-activity analysis rebuild starting");
         match cheat_analysis::run_full_rebuild(&pool).await {
             Ok(stats) => {
                 info!(
-                    "✅ cheat analysis refreshed: {} snapshots, {} viewers scored, last_snapshot_id={} in {} ms (wall {:.1}s)",
+                    "✅ suspicious-activity analysis refreshed: {} snapshots, {} viewers scored, last_snapshot_id={} in {} ms (wall {:.1}s)",
                     stats.snapshots_processed,
                     stats.viewers_scored,
                     stats.last_snapshot_id,
@@ -792,7 +823,7 @@ async fn refresh_cheat_analysis_task(pool: PgPool) {
                     start.elapsed().as_secs_f64()
                 );
             }
-            Err(e) => warn!("⚠️ Failed to refresh cheat analysis: {}", e),
+            Err(e) => warn!("⚠️ Failed to refresh suspicious-activity analysis: {}", e),
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;

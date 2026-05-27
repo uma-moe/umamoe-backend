@@ -64,6 +64,10 @@ pub async fn api_key_tracking_middleware(
     let response = next.run(request).await;
 
     // After the response is produced, log usage asynchronously
+    if state.user_writes_disabled {
+        return response;
+    }
+
     if let Some(raw_key) = api_key_raw {
         let db = state.db.clone();
         let endpoint = normalize_endpoint(&method.to_string(), &path);

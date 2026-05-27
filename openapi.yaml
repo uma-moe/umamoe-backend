@@ -361,7 +361,42 @@ components:
           type: integer
           format: int64
           nullable: true
-          description: "Current minimum fans needed to reach this tier (null for D+ and D)"
+          description: "Current minimum fans needed to reach this tier boundary (null when the tier has no boundary)"
+        current_fans_per_day:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Current boundary total divided by elapsed JST days in the current month, rounded up"
+        yesterday_min_fans:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Yesterday's minimum fans at the same tier boundary"
+        yesterday_fans_per_day:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Yesterday boundary total divided by elapsed JST days as of yesterday, rounded up"
+        daily_fans_delta:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Difference between current_min_fans and yesterday_min_fans"
+        last_month_min_fans:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Minimum fans at the same tier boundary last month"
+        last_month_fans_per_day:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Last month's boundary total divided by the number of days in the previous month, rounded up"
+        current_vs_last_month_delta:
+          type: integer
+          format: int64
+          nullable: true
+          description: "Difference between current_min_fans and last_month_min_fans"
 
     RankThresholdsResponse:
       type: object

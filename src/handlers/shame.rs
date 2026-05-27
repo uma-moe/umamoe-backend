@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use crate::{
     cache,
-    cheat_analysis::{SuspicionProbeMetrics, SUSPICIOUS_SCORE_THRESHOLD},
+    cheat_analysis::{CareerRateBreakdown, SuspicionProbeMetrics, SUSPICIOUS_SCORE_THRESHOLD},
     errors::AppError,
     AppState,
 };
@@ -32,7 +32,7 @@ pub fn router() -> Router<AppState> {
 }
 
 // ---------------------------------------------------------------------------
-// Hall of shame: ranked list
+// Suspicious activity: ranked list
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -42,8 +42,8 @@ pub struct HallParams {
     #[serde(default)]
     pub limit: Option<i64>,
     /// score (default), behavior_change, short_fan_gain, short_high_fan,
-    /// max_session, careers_per_hour, avg_career_length,
-    /// careers, active_time, fans_per_minute, peak_fans_per_minute,
+    /// max_session, careers_per_hour, avg_careers_per_day,
+    /// avg_career_length, careers, active_time, fans_per_minute, peak_fans_per_minute,
     /// reset_breaks, long_hours, probe_score, career_quantization,
     /// career_regularity, login_regularity, zero_idle, burst_careers,
     /// coactivity
@@ -71,7 +71,15 @@ pub struct HallEntry {
     pub total_active_seconds: i64,
     pub total_fan_gain: i64,
     pub total_careers: i32,
+    /// Careers averaged over observed calendar days.
+    pub avg_careers_per_day: f64,
+    /// Careers per hour from bounded finish-to-finish career-end intervals.
+    /// The first observed career end is not counted because it has no prior
+    /// end timestamp; intervals over 120 minutes are excluded.
     pub careers_per_active_hour: f64,
+    pub career_rate_sample_count: i32,
+    pub career_rate_sample_seconds: i64,
+    pub career_rate_breakdown: CareerRateBreakdown,
     pub avg_career_length_last20_seconds: f64,
     /// Histogram of estimated career lengths. Index `i` counts careers
     /// whose estimated wall-clock duration fell into `[i*5, (i+1)*5)`
@@ -104,6 +112,9 @@ pub struct HallEntry {
     pub behavior_change_score: f64,
     pub fans_per_active_minute: f64,
     pub peak_fans_per_minute: f64,
+    pub high_fan_rate_windows: i32,
+    pub high_fan_rate_total_fan_gain: i64,
+    pub high_fan_rate_total_seconds: i32,
     pub max_daily_active_seconds: i32,
     pub max_daily_careers: i32,
     pub max_session_seconds: i32,
@@ -141,7 +152,13 @@ impl<'r> FromRow<'r, PgRow> for HallEntry {
             total_active_seconds: row.try_get("total_active_seconds")?,
             total_fan_gain: row.try_get("total_fan_gain")?,
             total_careers: row.try_get("total_careers")?,
+            avg_careers_per_day: row.try_get("avg_careers_per_day")?,
             careers_per_active_hour: row.try_get("careers_per_active_hour")?,
+            career_rate_sample_count: row.try_get("career_rate_sample_count")?,
+            career_rate_sample_seconds: row.try_get("career_rate_sample_seconds")?,
+            career_rate_breakdown: row
+                .try_get::<SqlJson<CareerRateBreakdown>, _>("career_rate_breakdown")?
+                .0,
             avg_career_length_last20_seconds: row.try_get("avg_career_length_last20_seconds")?,
             career_length_buckets: row.try_get("career_length_buckets")?,
             short_high_fan_careers: row.try_get("short_high_fan_careers")?,
@@ -160,6 +177,9 @@ impl<'r> FromRow<'r, PgRow> for HallEntry {
             behavior_change_score: row.try_get("behavior_change_score")?,
             fans_per_active_minute: row.try_get("fans_per_active_minute")?,
             peak_fans_per_minute: row.try_get("peak_fans_per_minute")?,
+            high_fan_rate_windows: row.try_get("high_fan_rate_windows")?,
+            high_fan_rate_total_fan_gain: row.try_get("high_fan_rate_total_fan_gain")?,
+            high_fan_rate_total_seconds: row.try_get("high_fan_rate_total_seconds")?,
             max_daily_active_seconds: row.try_get("max_daily_active_seconds")?,
             max_daily_careers: row.try_get("max_daily_careers")?,
             max_session_seconds: row.try_get("max_session_seconds")?,
@@ -214,11 +234,23 @@ pub struct EvidenceReason {
 }
 
 impl HallEntry {
+    fn career_rate_last20(&self) -> f64 {
+        self.career_rate_breakdown.last_20.careers_per_hour
+    }
+
     fn attach_evidence(&mut self) {
         self.evidence = build_evidence_summary(self);
     }
 
     fn with_evidence(mut self) -> Self {
+        self.attach_evidence();
+        self
+    }
+
+    fn for_hall_list(mut self) -> Self {
+        self.careers_per_active_hour = self.career_rate_breakdown.last_20.careers_per_hour;
+        self.career_rate_sample_count = self.career_rate_breakdown.last_20.sample_count;
+        self.career_rate_sample_seconds = self.career_rate_breakdown.last_20.sample_seconds;
         self.attach_evidence();
         self
     }
@@ -332,13 +364,32 @@ fn build_evidence_summary(entry: &HallEntry) -> EvidenceSummary {
         });
     }
 
-    if entry.peak_fans_per_minute >= FAN_GAIN_RATE_EVIDENCE_PEAK_MIN
-        || entry.fans_per_active_minute >= FAN_GAIN_RATE_EVIDENCE_LIFETIME_MIN
-    {
+    let has_repeated_peak_fan_rate = entry.high_fan_rate_windows >= 2
+        && entry.peak_fans_per_minute >= FAN_GAIN_RATE_EVIDENCE_PEAK_MIN;
+    let has_sustained_fan_rate =
+        entry.fans_per_active_minute >= FAN_GAIN_RATE_EVIDENCE_LIFETIME_MIN;
+    if has_repeated_peak_fan_rate || has_sustained_fan_rate {
+        let display_value = if entry.high_fan_rate_windows > 0 {
+            format!(
+                "{} fast windows, {} fans over {}, peak {}/min, active avg {}/min",
+                entry.high_fan_rate_windows,
+                format_fans(entry.high_fan_rate_total_fan_gain as f64),
+                format_duration(entry.high_fan_rate_total_seconds as i64),
+                format_fans(entry.peak_fans_per_minute),
+                format_fans(entry.fans_per_active_minute)
+            )
+        } else {
+            format!(
+                "active avg {}/min, peak {}/min",
+                format_fans(entry.fans_per_active_minute),
+                format_fans(entry.peak_fans_per_minute)
+            )
+        };
         reasons.push(EvidenceReason {
             key: "fan_gain_rate".to_string(),
             label: "Fast fan gain".to_string(),
-            severity: if entry.peak_fans_per_minute >= FAN_GAIN_RATE_EVIDENCE_HIGH_PEAK
+            severity: if (entry.high_fan_rate_windows >= 3
+                && entry.peak_fans_per_minute >= FAN_GAIN_RATE_EVIDENCE_HIGH_PEAK)
                 || entry.fans_per_active_minute >= FAN_GAIN_RATE_EVIDENCE_HIGH_LIFETIME
             {
                 "high"
@@ -347,12 +398,12 @@ fn build_evidence_summary(entry: &HallEntry) -> EvidenceSummary {
             }
             .to_string(),
             confidence: "medium".to_string(),
-            message: "Fans went up unusually fast in the snapshots we can trust.".to_string(),
-            display_value: format!(
-                "peak {}/min, lifetime {}/min",
-                format_fans(entry.peak_fans_per_minute),
-                format_fans(entry.fans_per_active_minute)
-            ),
+            message: if has_repeated_peak_fan_rate {
+                "Fans went up unusually fast across multiple trusted snapshot windows.".to_string()
+            } else {
+                "Fans went up unusually fast across the trusted active-time total.".to_string()
+            },
+            display_value,
             caveat: Some(
                 "This matters most when short-training evidence points the same way.".to_string(),
             ),
@@ -555,12 +606,17 @@ fn build_evidence_summary(entry: &HallEntry) -> EvidenceSummary {
     if entry.flag_inhuman_career_rate {
         reasons.push(EvidenceReason {
             key: "career_rate".to_string(),
-            label: "Training rate".to_string(),
+            label: "Career runtime rate".to_string(),
             severity: "high".to_string(),
             confidence: "medium".to_string(),
-            message: "The account finished too many trainings for the active time we observed."
+            message: "The account finished too many trainings for the observed career runtimes."
                 .to_string(),
-            display_value: format!("{:.1} trainings/hour", entry.careers_per_active_hour),
+            display_value: format!(
+                "{:.1}/hour from {} runs over {}",
+                entry.careers_per_active_hour,
+                entry.career_rate_sample_count,
+                format_duration(entry.career_rate_sample_seconds)
+            ),
             caveat: None,
         });
     }
@@ -792,6 +848,7 @@ fn format_percent(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cheat_analysis::CareerRateWindow;
 
     fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339(value)
@@ -813,7 +870,11 @@ mod tests {
             total_active_seconds: 20 * 3600,
             total_fan_gain: 20_000_000,
             total_careers: 30,
+            avg_careers_per_day: 1.5,
             careers_per_active_hour: 1.5,
+            career_rate_sample_count: 30,
+            career_rate_sample_seconds: 20 * 3600,
+            career_rate_breakdown: CareerRateBreakdown::default(),
             avg_career_length_last20_seconds: 3600.0,
             career_length_buckets: vec![0; 36],
             short_high_fan_careers: 0,
@@ -832,6 +893,9 @@ mod tests {
             behavior_change_score: 0.0,
             fans_per_active_minute: 0.0,
             peak_fans_per_minute: 0.0,
+            high_fan_rate_windows: 0,
+            high_fan_rate_total_fan_gain: 0,
+            high_fan_rate_total_seconds: 0,
             max_daily_active_seconds: 3600,
             max_daily_careers: 2,
             max_session_seconds: 3600,
@@ -868,6 +932,25 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.key == "career_length_distribution"));
+    }
+
+    #[test]
+    fn hall_list_uses_last20_career_rate_fields() {
+        let mut entry = entry_with_defaults();
+        entry.careers_per_active_hour = 2.0;
+        entry.career_rate_sample_count = 100;
+        entry.career_rate_sample_seconds = 180_000;
+        entry.career_rate_breakdown.last_20 = CareerRateWindow {
+            careers_per_hour: 8.5,
+            sample_count: 20,
+            sample_seconds: 8_470,
+        };
+
+        let entry = entry.for_hall_list();
+
+        assert_eq!(entry.careers_per_active_hour, 8.5);
+        assert_eq!(entry.career_rate_sample_count, 20);
+        assert_eq!(entry.career_rate_sample_seconds, 8_470);
     }
 
     #[test]
@@ -919,6 +1002,37 @@ mod tests {
 
         assert_eq!(reason.severity, "high");
         assert_eq!(reason.confidence, "medium");
+    }
+
+    #[test]
+    fn single_peak_fan_rate_does_not_surface_without_repetition() {
+        let mut entry = entry_with_defaults();
+        entry.peak_fans_per_minute = 320_000.0;
+        entry.high_fan_rate_windows = 1;
+
+        let summary = build_evidence_summary(&entry);
+
+        assert!(!summary
+            .reasons
+            .iter()
+            .any(|reason| reason.key == "fan_gain_rate"));
+    }
+
+    #[test]
+    fn repeated_peak_fan_rate_surfaces_with_window_count() {
+        let mut entry = entry_with_defaults();
+        entry.peak_fans_per_minute = 320_000.0;
+        entry.high_fan_rate_windows = 3;
+
+        let summary = build_evidence_summary(&entry);
+        let reason = summary
+            .reasons
+            .iter()
+            .find(|reason| reason.key == "fan_gain_rate")
+            .unwrap();
+
+        assert_eq!(reason.severity, "high");
+        assert!(reason.display_value.contains("3 fast windows"));
     }
 
     #[test]
@@ -1014,7 +1128,7 @@ async fn get_hall_of_shame(
         .filter(|q| !q.is_empty());
 
     // Fast path: serve directly from the in-memory snapshot published by
-    // the cheat-analysis rebuild (every 10 minutes). The snapshot already
+    // the suspicious-activity rebuild. The snapshot already
     // contains every HallEntry with evidence attached, so this is just an
     // in-memory filter + sort + slice.
     if let Some(snapshot) = ensure_snapshot(&state.db).await {
@@ -1032,6 +1146,14 @@ async fn get_hall_of_shame(
     // Cold-start fallback: no snapshot yet (first ~90s after process
     // start, before the initial rebuild). Use the legacy SQL path so the
     // endpoint still works.
+    crate::cheat_analysis::ensure_rate_diagnostic_columns(&state.db)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "failed to ensure suspicious-activity rate columns: {e}"
+            ))
+        })?;
+
     let cache_key = format!(
         "shame:hall:p={}:l={}:s={}:ms={}:md={}:q={}",
         page,
@@ -1049,13 +1171,18 @@ async fn get_hall_of_shame(
         Some("longest_session") | Some("online_streak") | Some("max_session") => {
             "s.max_session_seconds DESC"
         }
-        Some("careers_per_hour") => "s.careers_per_active_hour DESC",
+        Some("careers_per_hour") => {
+            "COALESCE(((s.career_rate_breakdown->'last_20'->>'careers_per_hour')::double precision), 0) DESC"
+        }
+        Some("avg_careers_per_day") => "s.avg_careers_per_day DESC",
         Some("avg_career_length") => "s.avg_career_length_last20_seconds ASC",
         Some("behavior_change") => "s.behavior_change_score DESC, s.fan_gain_spike_ratio DESC",
         Some("short_fan_gain") => "s.short_fan_gain_score DESC, s.short_high_fan_careers DESC",
         Some("short_high_fan") => "s.short_high_fan_careers DESC, s.suspicion_score DESC",
         Some("fans_per_minute") => "s.fans_per_active_minute DESC",
-        Some("peak_fans_per_minute") => "s.peak_fans_per_minute DESC",
+        Some("peak_fans_per_minute") => {
+            "s.high_fan_rate_windows DESC, s.peak_fans_per_minute DESC"
+        }
         Some("reset_breaks") => "s.reset_break_score DESC, s.reset_breaks DESC",
         Some("long_hours") => {
             "s.days_over_20h DESC, s.days_over_16h DESC, s.max_daily_active_seconds DESC"
@@ -1119,7 +1246,11 @@ async fn get_hall_of_shame(
               s.first_seen, s.last_seen,
               s.days_observed, s.days_active,
               s.total_active_seconds, s.total_fan_gain, s.total_careers,
+              s.avg_careers_per_day,
               s.careers_per_active_hour,
+              s.career_rate_sample_count,
+              s.career_rate_sample_seconds,
+              s.career_rate_breakdown,
               s.avg_career_length_last20_seconds,
               s.career_length_buckets,
               s.short_high_fan_careers,
@@ -1138,6 +1269,9 @@ async fn get_hall_of_shame(
               s.behavior_change_score,
               s.fans_per_active_minute,
               s.peak_fans_per_minute,
+              s.high_fan_rate_windows,
+              s.high_fan_rate_total_fan_gain,
+              s.high_fan_rate_total_seconds,
               s.max_daily_active_seconds, s.max_daily_careers,
               s.max_session_seconds,
               s.days_over_16h, s.days_over_20h,
@@ -1180,10 +1314,8 @@ async fn get_hall_of_shame(
             list_q = list_q.bind(format!("%{}%", q));
         }
     }
-    let mut entries = list_q.bind(limit).bind(offset).fetch_all(&state.db).await?;
-    for entry in &mut entries {
-        entry.attach_evidence();
-    }
+    let entries = list_q.bind(limit).bind(offset).fetch_all(&state.db).await?;
+    let entries: Vec<HallEntry> = entries.into_iter().map(HallEntry::for_hall_list).collect();
 
     let last_refreshed_at: Option<chrono::DateTime<chrono::Utc>> =
         sqlx::query_scalar("SELECT last_refreshed_at FROM cheat_analysis_meta WHERE id = 1")
@@ -1379,6 +1511,14 @@ async fn get_viewer_report(
     }
 
     // Cold-start fallback: legacy SQL path.
+    crate::cheat_analysis::ensure_rate_diagnostic_columns(&state.db)
+        .await
+        .map_err(|e| {
+            AppError::DatabaseError(format!(
+                "failed to ensure suspicious-activity rate columns: {e}"
+            ))
+        })?;
+
     let days_i64 = days as i64;
 
     let score_sql = format!(
@@ -1391,7 +1531,11 @@ async fn get_viewer_report(
               s.first_seen, s.last_seen,
               s.days_observed, s.days_active,
               s.total_active_seconds, s.total_fan_gain, s.total_careers,
+              s.avg_careers_per_day,
               s.careers_per_active_hour,
+              s.career_rate_sample_count,
+              s.career_rate_sample_seconds,
+              s.career_rate_breakdown,
               s.avg_career_length_last20_seconds,
               s.career_length_buckets,
               s.short_high_fan_careers,
@@ -1410,6 +1554,9 @@ async fn get_viewer_report(
               s.behavior_change_score,
               s.fans_per_active_minute,
               s.peak_fans_per_minute,
+              s.high_fan_rate_windows,
+              s.high_fan_rate_total_fan_gain,
+              s.high_fan_rate_total_seconds,
               s.max_daily_active_seconds, s.max_daily_careers,
               s.max_session_seconds,
               s.days_over_16h, s.days_over_20h,
@@ -1558,12 +1705,14 @@ async fn refresh_now(
         ));
     }
 
-    info!("▶ manual cheat analysis rebuild requested");
+    info!("▶ manual suspicious-activity analysis rebuild requested");
     let stats = crate::cheat_analysis::run_full_rebuild(&state.db)
         .await
-        .map_err(|e| AppError::DatabaseError(format!("cheat analysis rebuild failed: {e}")))?;
+        .map_err(|e| {
+            AppError::DatabaseError(format!("suspicious-activity analysis rebuild failed: {e}"))
+        })?;
     info!(
-        "✅ manual cheat analysis rebuild finished: {} snapshots, {} viewers scored, last_snapshot_id={} in {} ms",
+        "✅ manual suspicious-activity analysis rebuild finished: {} snapshots, {} viewers scored, last_snapshot_id={} in {} ms",
         stats.snapshots_processed,
         stats.viewers_scored,
         stats.last_snapshot_id,
@@ -1581,7 +1730,7 @@ async fn refresh_now(
 // ---------------------------------------------------------------------------
 // In-memory snapshot
 //
-// The cheat-analysis pipeline runs every hour and republishes the
+// The suspicious-activity pipeline runs every hour and republishes the
 // entire `viewer_suspicion_scores` / `viewer_activity_daily` /
 // `viewer_activity_heatmap` / `viewer_top_sessions` tables. Per-request
 // fetches over those tables (especially the ~40-column score row plus
@@ -1643,6 +1792,8 @@ async fn ensure_snapshot(pool: &PgPool) -> Option<Arc<ShameSnapshot>> {
 pub async fn rebuild_snapshot(pool: &PgPool) -> anyhow::Result<()> {
     let start = Instant::now();
 
+    crate::cheat_analysis::ensure_rate_diagnostic_columns(pool).await?;
+
     // These feeds are independent. Fetch them concurrently so the
     // overall rebuild time is bounded by the slowest query (the scores
     // SELECT) instead of the sum.
@@ -1654,7 +1805,11 @@ pub async fn rebuild_snapshot(pool: &PgPool) -> anyhow::Result<()> {
               s.first_seen, s.last_seen,
               s.days_observed, s.days_active,
               s.total_active_seconds, s.total_fan_gain, s.total_careers,
+              s.avg_careers_per_day,
               s.careers_per_active_hour,
+              s.career_rate_sample_count,
+              s.career_rate_sample_seconds,
+              s.career_rate_breakdown,
               s.avg_career_length_last20_seconds,
               s.career_length_buckets,
               s.short_high_fan_careers,
@@ -1673,6 +1828,9 @@ pub async fn rebuild_snapshot(pool: &PgPool) -> anyhow::Result<()> {
               s.behavior_change_score,
               s.fans_per_active_minute,
               s.peak_fans_per_minute,
+              s.high_fan_rate_windows,
+              s.high_fan_rate_total_fan_gain,
+              s.high_fan_rate_total_seconds,
               s.max_daily_active_seconds, s.max_daily_careers,
               s.max_session_seconds,
               s.days_over_16h, s.days_over_20h,
@@ -1890,10 +2048,12 @@ impl ShameSnapshot {
                     .cmp(&a.max_session_seconds)
                     .then(b.suspicion_score.cmp(&a.suspicion_score))
             }),
-            "careers_per_hour" => Box::new(|a, b| {
-                b.careers_per_active_hour
-                    .total_cmp(&a.careers_per_active_hour)
-            }),
+            "careers_per_hour" => {
+                Box::new(|a, b| b.career_rate_last20().total_cmp(&a.career_rate_last20()))
+            }
+            "avg_careers_per_day" => {
+                Box::new(|a, b| b.avg_careers_per_day.total_cmp(&a.avg_careers_per_day))
+            }
             "avg_career_length" => Box::new(|a, b| {
                 a.avg_career_length_last20_seconds
                     .total_cmp(&b.avg_career_length_last20_seconds)
@@ -1917,9 +2077,11 @@ impl ShameSnapshot {
                 b.fans_per_active_minute
                     .total_cmp(&a.fans_per_active_minute)
             }),
-            "peak_fans_per_minute" => {
-                Box::new(|a, b| b.peak_fans_per_minute.total_cmp(&a.peak_fans_per_minute))
-            }
+            "peak_fans_per_minute" => Box::new(|a, b| {
+                b.high_fan_rate_windows
+                    .cmp(&a.high_fan_rate_windows)
+                    .then(b.peak_fans_per_minute.total_cmp(&a.peak_fans_per_minute))
+            }),
             "reset_breaks" => Box::new(|a, b| {
                 b.reset_break_score
                     .total_cmp(&a.reset_break_score)
@@ -2006,7 +2168,7 @@ impl ShameSnapshot {
         let entries: Vec<HallEntry> = if offset < filtered.len() {
             filtered[offset..end]
                 .iter()
-                .map(|&i| self.entries[i].clone())
+                .map(|&i| self.entries[i].clone().for_hall_list())
                 .collect()
         } else {
             Vec::new()

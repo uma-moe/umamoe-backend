@@ -1,4 +1,4 @@
-//! Cheat / botting analysis pipeline.
+//! Suspicious-activity analysis pipeline.
 //!
 //! Reads `circle_member_fan_snapshots`, streams every snapshot row in
 //! `(snapshot_time, id)` order, unnests the parallel `viewer_ids / fans /
@@ -46,7 +46,7 @@
 //!     single-career finishes use the later of the previous career finish
 //!     or current `last_login_time`, but are floored to 10 min so sparse
 //!     polling plus a fresh login does not manufacture fake 5-10 minute
-//!     runs. The short/high-fan cheating signal only uses trusted chained
+//!     runs. The short/high-fan automation signal only uses trusted chained
 //!     samples.
 //!
 //! Output is published in viewer batches: each batch deletes and reinserts
@@ -93,6 +93,7 @@ const SHORT_CAREER_SNAPSHOTS_PER_VIEWER: usize = 25;
 /// `last_login_time` change in the snapshot stream right away.
 const JST_RESET_HOUR_UTC: u32 = 15;
 const LAST_CAREER_LENGTH_WINDOW: usize = 20;
+const CAREER_RATE_MAX_SAMPLE_SECONDS: u32 = 120 * 60;
 /// Width of each career-length histogram bucket, in seconds.
 const CAREER_LENGTH_BUCKET_SECONDS: u32 = 300;
 /// Number of buckets. Bucket i covers `[i*5, (i+1)*5)` minutes for
@@ -123,6 +124,8 @@ const SUSTAINED_FAN_RATE_SCORE_MAX: f64 = 6.0;
 /// higher threshold and cap their contribution lower than before.
 const PEAK_FAN_RATE_SCORE_BASE_FANS_PER_MINUTE: f64 = 180_000.0;
 const PEAK_FAN_RATE_SCORE_MAX: f64 = 6.0;
+const REPEATED_HIGH_FAN_RATE_MIN_WINDOWS: u32 = 2;
+const REPEATED_HIGH_FAN_RATE_FULL_WINDOWS: u32 = 4;
 /// Broad weekly-hour coverage is mostly context. A long-lived account can
 /// eventually touch the whole 7x24 grid, so the score contribution stays low
 /// unless paired with real daily volume.
@@ -169,7 +172,7 @@ const RECENT_BEHAVIOR_DAYS: i64 = 3;
 const BASELINE_BEHAVIOR_DAYS: i64 = 14;
 /// Avoid infinite/absurd ratios for accounts with tiny historical baseline.
 const BEHAVIOR_BASELINE_FAN_FLOOR: f64 = 500_000.0;
-/// Default Hall of Shame cutoff for accounts considered suspicious.
+/// Default suspicious-activity cutoff for accounts considered suspicious.
 pub const SUSPICIOUS_SCORE_THRESHOLD: i32 = 60;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,6 +213,30 @@ pub struct SuspicionProbeMetrics {
     pub coactivity_cluster_score: f64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CareerRateBreakdown {
+    pub all: CareerRateWindow,
+    pub last_30d: CareerRateWindow,
+    pub last_7d: CareerRateWindow,
+    pub last_3d: CareerRateWindow,
+    pub last_20: CareerRateWindow,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CareerRateWindow {
+    pub careers_per_hour: f64,
+    pub sample_count: i32,
+    pub sample_seconds: i64,
+}
+
+#[derive(Debug, Clone)]
+struct CareerRateSample {
+    finished_at: DateTime<Utc>,
+    seconds: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -221,16 +248,42 @@ pub struct RebuildStats {
     pub duration_ms: i64,
 }
 
+pub async fn ensure_rate_diagnostic_columns(pool: &PgPool) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"ALTER TABLE viewer_suspicion_scores
+           ADD COLUMN IF NOT EXISTS career_rate_sample_count INTEGER NOT NULL DEFAULT 0,
+           ADD COLUMN IF NOT EXISTS career_rate_sample_seconds BIGINT NOT NULL DEFAULT 0,
+           ADD COLUMN IF NOT EXISTS avg_careers_per_day DOUBLE PRECISION NOT NULL DEFAULT 0,
+           ADD COLUMN IF NOT EXISTS career_rate_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb,
+           ADD COLUMN IF NOT EXISTS high_fan_rate_windows INTEGER NOT NULL DEFAULT 0,
+           ADD COLUMN IF NOT EXISTS high_fan_rate_total_fan_gain BIGINT NOT NULL DEFAULT 0,
+           ADD COLUMN IF NOT EXISTS high_fan_rate_total_seconds INTEGER NOT NULL DEFAULT 0"#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"CREATE INDEX IF NOT EXISTS viewer_suspicion_scores_avg_careers_day_idx
+           ON viewer_suspicion_scores (avg_careers_per_day DESC, suspicion_score DESC)"#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 /// Run a full rebuild of the cheat-analysis aggregates.
 pub async fn run_full_rebuild(pool: &PgPool) -> anyhow::Result<RebuildStats> {
     let start = Instant::now();
+
+    ensure_rate_diagnostic_columns(pool).await?;
 
     let max_snapshot_id: Option<i64> =
         sqlx::query_scalar("SELECT MAX(id) FROM circle_member_fan_snapshots")
             .fetch_one(pool)
             .await?;
     let Some(max_snapshot_id) = max_snapshot_id else {
-        info!("cheat analysis: no snapshots to process");
+        info!("suspicious-activity analysis: no snapshots to process");
         return Ok(RebuildStats {
             snapshots_processed: 0,
             viewers_scored: 0,
@@ -240,7 +293,7 @@ pub async fn run_full_rebuild(pool: &PgPool) -> anyhow::Result<RebuildStats> {
     };
 
     info!(
-        "cheat analysis: starting full rebuild up to snapshot id {}",
+        "suspicious-activity analysis: starting full rebuild up to snapshot id {}",
         max_snapshot_id
     );
 
@@ -277,7 +330,7 @@ pub async fn run_full_rebuild(pool: &PgPool) -> anyhow::Result<RebuildStats> {
         // Periodic progress log so a multi-minute scan isn't silent.
         if snapshots_processed % 100_000 == 0 {
             info!(
-                "cheat analysis: {} snapshots streamed in {:.1}s ({} viewers held)",
+                "suspicious-activity analysis: {} snapshots streamed in {:.1}s ({} viewers held)",
                 snapshots_processed,
                 stream_start.elapsed().as_secs_f64(),
                 viewers.len()
@@ -286,7 +339,7 @@ pub async fn run_full_rebuild(pool: &PgPool) -> anyhow::Result<RebuildStats> {
     }
 
     info!(
-        "cheat analysis: streamed {} snapshot rows ({} viewers) in {:.1}s",
+        "suspicious-activity analysis: streamed {} snapshot rows ({} viewers) in {:.1}s",
         snapshots_processed,
         viewers.len(),
         stream_start.elapsed().as_secs_f64()
@@ -412,7 +465,7 @@ pub async fn run_full_rebuild(pool: &PgPool) -> anyhow::Result<RebuildStats> {
     }
 
     info!(
-        "cheat analysis: published {} daily / {} heatmap / {} scores / {} sessions / {} short-career snapshots in {:.1}s (total {:.1}s)",
+        "suspicious-activity analysis: published {} daily / {} heatmap / {} scores / {} sessions / {} short-career snapshots in {:.1}s (total {:.1}s)",
         daily_rows.len(),
         heatmap_rows.len(),
         score_rows.len(),
@@ -649,10 +702,14 @@ struct ViewerAccum {
     trusted_career_fan_gains: Vec<u32>,
     trusted_career_lengths: Vec<u32>,
     career_finish_intervals: Vec<u32>,
+    career_rate_samples: Vec<CareerRateSample>,
     /// Highest fan-gain rate observed across a single tight-gap transition,
     /// expressed as fans per minute. Long service-gap intervals are
     /// excluded so a multi-hour outage doesn't produce a fake peak.
     peak_fans_per_minute: f64,
+    high_fan_rate_windows: u32,
+    high_fan_rate_total_fan_gain: u64,
+    high_fan_rate_total_seconds: u32,
 
     login_gap_seconds: Vec<u32>,
     pending_login_latency: Option<DateTime<Utc>>,
@@ -872,6 +929,15 @@ impl ViewerAccum {
             let rate = observed_fan_rate_per_minute(fan_delta, active_seconds);
             if rate > self.peak_fans_per_minute {
                 self.peak_fans_per_minute = rate;
+            }
+            if rate >= PEAK_FAN_RATE_SCORE_BASE_FANS_PER_MINUTE {
+                self.high_fan_rate_windows = self.high_fan_rate_windows.saturating_add(1);
+                self.high_fan_rate_total_fan_gain = self
+                    .high_fan_rate_total_fan_gain
+                    .saturating_add(fan_delta as u64);
+                self.high_fan_rate_total_seconds = self
+                    .high_fan_rate_total_seconds
+                    .saturating_add(active_seconds);
             }
             self.current_zero_idle_fan_gain_streak =
                 self.current_zero_idle_fan_gain_streak.saturating_add(1);
@@ -1131,8 +1197,12 @@ impl ViewerAccum {
         if let Some(prev_finish_at) = self.last_career_finish_at {
             let gap_seconds = (ctx.snapshot_time - prev_finish_at).num_seconds();
             if (1..=6 * 3600).contains(&gap_seconds) {
-                self.career_finish_intervals
-                    .push(gap_seconds.try_into().unwrap_or(u32::MAX));
+                let seconds = gap_seconds.try_into().unwrap_or(u32::MAX);
+                self.career_finish_intervals.push(seconds);
+                self.career_rate_samples.push(CareerRateSample {
+                    finished_at: ctx.snapshot_time,
+                    seconds,
+                });
             }
         }
         let trusted_chain_seconds = self.last_career_finish_at.and_then(|prev_finish_at| {
@@ -1431,11 +1501,11 @@ impl ViewerAccum {
         let total_fan_gain = self.total_fan_gain as i64;
         let avg_active_seconds_per_observed_day =
             average_active_seconds_per_observed_day(total_active_seconds, days_observed);
-        let careers_per_active_hour = if total_active_seconds >= 3600 {
-            (self.total_careers as f64) / (total_active_seconds as f64 / 3600.0)
-        } else {
-            0.0
-        };
+        let career_rate_breakdown = career_rate_breakdown(&self.career_rate_samples, last_seen);
+        let careers_per_active_hour = career_rate_breakdown.all.careers_per_hour;
+        let career_rate_sample_count = career_rate_breakdown.all.sample_count;
+        let career_rate_sample_seconds = career_rate_breakdown.all.sample_seconds;
+        let avg_careers_per_day = avg_careers_per_observed_day(self.total_careers, days_observed);
         let fans_per_active_minute = if total_active_seconds >= 60 {
             (total_fan_gain as f64) / (total_active_seconds as f64 / 60.0)
         } else {
@@ -1444,9 +1514,8 @@ impl ViewerAccum {
         let peak_fans_per_minute = self.peak_fans_per_minute;
         let flag_no_sleep = days_observed >= 3 && max_daily_active_seconds > 18 * 3600;
         let flag_extreme_session = (self.max_session_seconds as i32) > 8 * 3600;
-        let flag_inhuman_career_rate = total_active_seconds >= 6 * 3600
-            && total_careers >= 10
-            && careers_per_active_hour > 6.0;
+        let flag_inhuman_career_rate =
+            career_rate_sample_count >= 10 && careers_per_active_hour > 6.0;
         let flag_247 = is_247_schedule(
             distinct_weekly_hour_buckets,
             avg_active_seconds_per_observed_day,
@@ -1518,7 +1587,7 @@ impl ViewerAccum {
             peak_fans_per_minute,
             PEAK_FAN_RATE_SCORE_BASE_FANS_PER_MINUTE,
             PEAK_FAN_RATE_SCORE_MAX,
-        );
+        ) * repeated_high_fan_rate_factor(self.high_fan_rate_windows);
         let reset_break_score = reset_break_score(
             self.reset_breaks,
             self.reset_recovery_windows,
@@ -1556,6 +1625,10 @@ impl ViewerAccum {
             total_fan_gain,
             total_careers,
             careers_per_active_hour,
+            career_rate_sample_count,
+            career_rate_sample_seconds,
+            career_rate_breakdown,
+            avg_careers_per_day,
             avg_career_length_last20_seconds,
             career_length_buckets: self
                 .career_length_buckets
@@ -1579,6 +1652,9 @@ impl ViewerAccum {
             behavior_change_score: behavior_change_stats.behavior_change_score,
             fans_per_active_minute,
             peak_fans_per_minute,
+            high_fan_rate_windows: self.high_fan_rate_windows as i32,
+            high_fan_rate_total_fan_gain: self.high_fan_rate_total_fan_gain as i64,
+            high_fan_rate_total_seconds: self.high_fan_rate_total_seconds as i32,
             max_daily_active_seconds,
             max_daily_careers,
             max_session_seconds: self.max_session_seconds as i32,
@@ -1817,6 +1893,76 @@ fn average_active_seconds_per_observed_day(total_active_seconds: i64, days_obser
         0.0
     } else {
         total_active_seconds as f64 / days_observed as f64
+    }
+}
+
+fn avg_careers_per_observed_day(total_careers: u32, days_observed: i32) -> f64 {
+    if days_observed <= 0 {
+        0.0
+    } else {
+        total_careers as f64 / days_observed as f64
+    }
+}
+
+fn career_rate_breakdown(
+    samples: &[CareerRateSample],
+    reference_at: DateTime<Utc>,
+) -> CareerRateBreakdown {
+    let bounded: Vec<&CareerRateSample> = samples
+        .iter()
+        .filter(|sample| sample.seconds <= CAREER_RATE_MAX_SAMPLE_SECONDS)
+        .collect();
+    let last_20: Vec<&CareerRateSample> = bounded.iter().rev().take(20).copied().collect();
+
+    CareerRateBreakdown {
+        all: career_rate_window(bounded.iter().copied()),
+        last_30d: career_rate_window_for_days(&bounded, reference_at, 30),
+        last_7d: career_rate_window_for_days(&bounded, reference_at, 7),
+        last_3d: career_rate_window_for_days(&bounded, reference_at, 3),
+        last_20: career_rate_window(last_20.iter().copied()),
+    }
+}
+
+fn career_rate_window_for_days(
+    samples: &[&CareerRateSample],
+    reference_at: DateTime<Utc>,
+    days: i64,
+) -> CareerRateWindow {
+    let cutoff = reference_at - chrono::Duration::days(days);
+    career_rate_window(
+        samples
+            .iter()
+            .copied()
+            .filter(|sample| sample.finished_at >= cutoff),
+    )
+}
+
+fn career_rate_window<'a>(
+    samples: impl IntoIterator<Item = &'a CareerRateSample>,
+) -> CareerRateWindow {
+    let mut sample_count = 0i32;
+    let mut sample_seconds = 0i64;
+    for sample in samples {
+        sample_count = sample_count.saturating_add(1);
+        sample_seconds = sample_seconds.saturating_add(sample.seconds as i64);
+    }
+    let careers_per_hour = if sample_seconds > 0 {
+        sample_count as f64 / (sample_seconds as f64 / 3600.0)
+    } else {
+        0.0
+    };
+    CareerRateWindow {
+        careers_per_hour,
+        sample_count,
+        sample_seconds,
+    }
+}
+
+fn repeated_high_fan_rate_factor(windows: u32) -> f64 {
+    if windows < REPEATED_HIGH_FAN_RATE_MIN_WINDOWS {
+        0.0
+    } else {
+        (windows as f64 / REPEATED_HIGH_FAN_RATE_FULL_WINDOWS as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -2447,6 +2593,10 @@ struct ScoreRow {
     total_fan_gain: i64,
     total_careers: i32,
     careers_per_active_hour: f64,
+    career_rate_sample_count: i32,
+    career_rate_sample_seconds: i64,
+    career_rate_breakdown: CareerRateBreakdown,
+    avg_careers_per_day: f64,
     avg_career_length_last20_seconds: f64,
     career_length_buckets: Vec<i32>,
     short_high_fan_careers: i32,
@@ -2465,6 +2615,9 @@ struct ScoreRow {
     behavior_change_score: f64,
     fans_per_active_minute: f64,
     peak_fans_per_minute: f64,
+    high_fan_rate_windows: i32,
+    high_fan_rate_total_fan_gain: i64,
+    high_fan_rate_total_seconds: i32,
     max_daily_active_seconds: i32,
     max_daily_careers: i32,
     max_session_seconds: i32,
@@ -2668,6 +2821,10 @@ async fn insert_scores(
         let mut total_fan_gain: Vec<i64> = Vec::with_capacity(chunk.len());
         let mut total_careers: Vec<i32> = Vec::with_capacity(chunk.len());
         let mut careers_per_active_hour: Vec<f64> = Vec::with_capacity(chunk.len());
+        let mut career_rate_sample_count: Vec<i32> = Vec::with_capacity(chunk.len());
+        let mut career_rate_sample_seconds: Vec<i64> = Vec::with_capacity(chunk.len());
+        let mut career_rate_breakdown_text: Vec<String> = Vec::with_capacity(chunk.len());
+        let mut avg_careers_per_day: Vec<f64> = Vec::with_capacity(chunk.len());
         let mut avg_career_length_last20_seconds: Vec<f64> = Vec::with_capacity(chunk.len());
         let mut career_length_buckets_text: Vec<String> = Vec::with_capacity(chunk.len());
         let mut short_high_fan_careers: Vec<i32> = Vec::with_capacity(chunk.len());
@@ -2686,6 +2843,9 @@ async fn insert_scores(
         let mut behavior_change_score: Vec<f64> = Vec::with_capacity(chunk.len());
         let mut fans_per_active_minute: Vec<f64> = Vec::with_capacity(chunk.len());
         let mut peak_fans_per_minute: Vec<f64> = Vec::with_capacity(chunk.len());
+        let mut high_fan_rate_windows: Vec<i32> = Vec::with_capacity(chunk.len());
+        let mut high_fan_rate_total_fan_gain: Vec<i64> = Vec::with_capacity(chunk.len());
+        let mut high_fan_rate_total_seconds: Vec<i32> = Vec::with_capacity(chunk.len());
         let mut max_daily_active_seconds: Vec<i32> = Vec::with_capacity(chunk.len());
         let mut max_daily_careers: Vec<i32> = Vec::with_capacity(chunk.len());
         let mut max_session_seconds: Vec<i32> = Vec::with_capacity(chunk.len());
@@ -2718,6 +2878,10 @@ async fn insert_scores(
             total_fan_gain.push(r.total_fan_gain);
             total_careers.push(r.total_careers);
             careers_per_active_hour.push(r.careers_per_active_hour);
+            career_rate_sample_count.push(r.career_rate_sample_count);
+            career_rate_sample_seconds.push(r.career_rate_sample_seconds);
+            career_rate_breakdown_text.push(serde_json::to_string(&r.career_rate_breakdown)?);
+            avg_careers_per_day.push(r.avg_careers_per_day);
             avg_career_length_last20_seconds.push(r.avg_career_length_last20_seconds);
             // Postgres array literal: "{1,2,3,...}". Cast to integer[] in
             // the SELECT below since UNNEST can't emit per-row arrays.
@@ -2756,6 +2920,9 @@ async fn insert_scores(
             behavior_change_score.push(r.behavior_change_score);
             fans_per_active_minute.push(r.fans_per_active_minute);
             peak_fans_per_minute.push(r.peak_fans_per_minute);
+            high_fan_rate_windows.push(r.high_fan_rate_windows);
+            high_fan_rate_total_fan_gain.push(r.high_fan_rate_total_fan_gain);
+            high_fan_rate_total_seconds.push(r.high_fan_rate_total_seconds);
             max_daily_active_seconds.push(r.max_daily_active_seconds);
             max_daily_careers.push(r.max_daily_careers);
             max_session_seconds.push(r.max_session_seconds);
@@ -2792,7 +2959,10 @@ async fn insert_scores(
                 reset_recovery_windows, reset_breaks, max_reset_recovery_seconds, reset_break_score, \
                 probe_score, probe_metrics, \
                 distinct_weekly_hour_buckets, flag_no_sleep, flag_extreme_session, \
-                flag_inhuman_career_rate, flag_247, flag_marathon, suspicion_score, refreshed_at) \
+                     flag_inhuman_career_rate, flag_247, flag_marathon, suspicion_score, \
+                     avg_careers_per_day, career_rate_sample_count, career_rate_sample_seconds, \
+                     high_fan_rate_windows, high_fan_rate_total_fan_gain, \
+                     high_fan_rate_total_seconds, career_rate_breakdown, refreshed_at) \
              SELECT viewer_id, trainer_name, circle_id, circle_name, circle_monthly_rank, \
                     first_seen, last_seen, days_observed, days_active, \
                     total_active_seconds, total_fan_gain, total_careers, careers_per_active_hour, \
@@ -2808,7 +2978,10 @@ async fn insert_scores(
                     reset_recovery_windows, reset_breaks, max_reset_recovery_seconds, reset_break_score, \
                     probe_score, probe_metrics::jsonb, \
                     distinct_weekly_hour_buckets, flag_no_sleep, flag_extreme_session, \
-                    flag_inhuman_career_rate, flag_247, flag_marathon, suspicion_score, NOW() \
+                          flag_inhuman_career_rate, flag_247, flag_marathon, suspicion_score, \
+                          avg_careers_per_day, career_rate_sample_count, career_rate_sample_seconds, \
+                          high_fan_rate_windows, high_fan_rate_total_fan_gain, \
+                          high_fan_rate_total_seconds, career_rate_breakdown::jsonb, NOW() \
              FROM UNNEST( \
                        $1::bigint[], $2::text[], $3::bigint[], $4::text[], $5::int[], \
                        $6::timestamptz[], $7::timestamptz[], $8::int[], $9::int[], \
@@ -2824,7 +2997,9 @@ async fn insert_scores(
                              $37::int[], $38::int[], $39::int[], $40::double precision[], \
                              $41::double precision[], $42::text[], \
                              $43::smallint[], $44::boolean[], $45::boolean[], $46::boolean[], \
-                             $47::boolean[], $48::boolean[], $49::int[] \
+                             $47::boolean[], $48::boolean[], $49::int[], \
+                             $50::double precision[], $51::int[], $52::bigint[], \
+                             $53::int[], $54::bigint[], $55::int[], $56::text[] \
                       ) AS u(viewer_id, trainer_name, circle_id, circle_name, circle_monthly_rank, \
                           first_seen, last_seen, days_observed, days_active, \
                     total_active_seconds, total_fan_gain, total_careers, careers_per_active_hour, \
@@ -2840,7 +3015,10 @@ async fn insert_scores(
                     reset_recovery_windows, reset_breaks, max_reset_recovery_seconds, reset_break_score, \
                     probe_score, probe_metrics, \
                     distinct_weekly_hour_buckets, flag_no_sleep, flag_extreme_session, \
-                    flag_inhuman_career_rate, flag_247, flag_marathon, suspicion_score)",
+                    flag_inhuman_career_rate, flag_247, flag_marathon, suspicion_score, \
+                    avg_careers_per_day, career_rate_sample_count, career_rate_sample_seconds, \
+                    high_fan_rate_windows, high_fan_rate_total_fan_gain, \
+                    high_fan_rate_total_seconds, career_rate_breakdown)",
         )
         .bind(&viewer_id)
         .bind(&trainer_name)
@@ -2891,6 +3069,13 @@ async fn insert_scores(
         .bind(&flag_247)
         .bind(&flag_marathon)
         .bind(&suspicion_score)
+        .bind(&avg_careers_per_day)
+        .bind(&career_rate_sample_count)
+        .bind(&career_rate_sample_seconds)
+        .bind(&high_fan_rate_windows)
+        .bind(&high_fan_rate_total_fan_gain)
+        .bind(&high_fan_rate_total_seconds)
+        .bind(&career_rate_breakdown_text)
         .execute(&mut **tx)
         .await?;
     }
@@ -3779,6 +3964,45 @@ mod tests {
     }
 
     #[test]
+    fn average_career_daily_metric_uses_observed_days() {
+        let careers_per_day = avg_careers_per_observed_day(48, 3);
+
+        assert!((careers_per_day - 16.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn career_rate_samples_use_finish_to_finish_intervals_under_two_hours() {
+        let reference_at = ts("2026-05-20T12:00:00Z");
+        let samples = vec![
+            CareerRateSample {
+                finished_at: reference_at - chrono::Duration::days(40),
+                seconds: 30 * 60,
+            },
+            CareerRateSample {
+                finished_at: reference_at - chrono::Duration::days(2),
+                seconds: 50 * 60,
+            },
+            CareerRateSample {
+                finished_at: reference_at - chrono::Duration::days(1),
+                seconds: 20 * 60,
+            },
+            CareerRateSample {
+                finished_at: reference_at,
+                seconds: 121 * 60,
+            },
+        ];
+
+        let breakdown = career_rate_breakdown(&samples, reference_at);
+
+        assert_eq!(breakdown.all.sample_count, 3);
+        assert_eq!(breakdown.all.sample_seconds, 100 * 60);
+        assert!((breakdown.all.careers_per_hour - 1.8).abs() < 1e-9);
+        assert_eq!(breakdown.last_30d.sample_count, 2);
+        assert_eq!(breakdown.last_3d.sample_seconds, 70 * 60);
+        assert_eq!(breakdown.last_20.sample_count, 3);
+    }
+
+    #[test]
     fn observed_activity_session_ignores_login_changes() {
         let mut acc = ViewerAccum::default();
         let t0 = ts("2026-05-20T12:00:00Z");
@@ -3972,6 +4196,24 @@ mod tests {
         assert_eq!(short_snapshot.fan_gain, 900_000);
         assert_eq!(short_snapshot.previous_career_gap_seconds, 600);
         assert!(short_snapshot.short_training_score > 0.0);
+
+        let mut daily_rows = Vec::new();
+        let mut heatmap_rows = Vec::new();
+        let mut score_rows = Vec::new();
+        let mut session_rows = Vec::new();
+        let mut short_career_rows = Vec::new();
+        acc.collect_into(
+            1,
+            &mut daily_rows,
+            &mut heatmap_rows,
+            &mut score_rows,
+            &mut session_rows,
+            &mut short_career_rows,
+        );
+
+        assert_eq!(score_rows[0].career_rate_sample_count, 1);
+        assert_eq!(score_rows[0].career_rate_sample_seconds, 600);
+        assert_eq!(score_rows[0].careers_per_active_hour, 6.0);
     }
 
     #[test]
