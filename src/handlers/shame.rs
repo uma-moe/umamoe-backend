@@ -1602,7 +1602,7 @@ async fn get_viewer_report(
     // Top playtime days: precomputed by the Rust pipeline. The response key
     // remains `top_sessions` for API compatibility.
     let top_session_rows = sqlx::query(
-        r#"SELECT COALESCE(day, (started_at AT TIME ZONE 'Europe/Berlin')::date) AS day,
+        r#"SELECT COALESCE(day, (started_at AT TIME ZONE 'UTC')::date) AS day,
                   started_at, ended_at, duration_seconds, active_seconds,
                   idle_seconds, careers, fan_gain,
                   COALESCE(NULLIF(session_count, 0), 1) AS session_count,
@@ -1862,7 +1862,7 @@ pub async fn rebuild_snapshot(pool: &PgPool) -> anyhow::Result<()> {
     .fetch_all(pool);
     let sessions_fut = sqlx::query(
         r#"SELECT viewer_id,
-                  COALESCE(day, (started_at AT TIME ZONE 'Europe/Berlin')::date) AS day,
+                  COALESCE(day, (started_at AT TIME ZONE 'UTC')::date) AS day,
                   started_at, ended_at, duration_seconds, active_seconds,
                   idle_seconds, careers, fan_gain,
                   COALESCE(NULLIF(session_count, 0), 1) AS session_count,

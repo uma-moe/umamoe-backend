@@ -270,8 +270,8 @@ pub async fn list_circles(
     Query(params): Query<CircleListParams>,
     State(state): State<AppState>,
 ) -> Result<Json<CircleListResponse>, AppError> {
-    let page = params.page.unwrap_or(0);
-    let limit = params.limit.unwrap_or(100).min(100);
+    let page = params.page.unwrap_or(0).max(0);
+    let limit = params.limit.unwrap_or(100).clamp(1, 100);
     let offset = page * limit;
 
     let mut with_parts = Vec::new();
@@ -451,24 +451,23 @@ pub async fn list_circles(
 
     // Add sorting
     let sort_by = params.sort_by.as_deref().unwrap_or("rank");
-    let sort_dir = params.sort_dir.as_deref().unwrap_or("asc");
+    let sort_dir = match params.sort_dir.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("desc") => "DESC",
+        _ => "ASC",
+    };
 
     let order_clause = match sort_by {
-        "name" => format!(
-            " ORDER BY c.name {}, c.circle_id ASC",
-            sort_dir.to_uppercase()
-        ),
+        "name" => format!(" ORDER BY c.name {}, c.circle_id ASC", sort_dir),
         "member_count" => format!(
             " ORDER BY c.member_count {} NULLS LAST, c.circle_id ASC",
-            sort_dir.to_uppercase()
+            sort_dir
         ),
         "rank" | "monthly_rank" => {
             format!(" ORDER BY {} ASC NULLS LAST, c.circle_id ASC", rank_column)
         }
         "monthly_point" => format!(
             " ORDER BY {} {} NULLS LAST, c.circle_id ASC",
-            points_column,
-            sort_dir.to_uppercase()
+            points_column, sort_dir
         ),
         _ => format!(" ORDER BY {} ASC NULLS LAST, c.circle_id ASC", rank_column),
     };

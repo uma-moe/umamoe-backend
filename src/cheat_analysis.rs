@@ -4,10 +4,10 @@
 //! `(snapshot_time, id)` order, unnests the parallel `viewer_ids / fans /
 //! last_login_times` arrays, and folds per-viewer state in memory:
 //!
-//!   * Per-day buckets (Europe/Berlin): active seconds, careers, fan gain,
+//!   * Per-day buckets (UTC): active seconds, careers, fan gain,
 //!     observed fan-gain sessions started, longest session, distinct hours
 //!     touched.
-//!   * Weekly heatmap (dow × hour, Berlin).
+//!   * Weekly heatmap (dow × hour, UTC).
 //!   * Overall counters used for the suspicion score and the 5 boolean
 //!     flags (no-sleep, extreme-session, inhuman-career-rate, 24/7,
 //!     marathon).
@@ -59,7 +59,6 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
-use chrono_tz::Europe::Berlin;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -307,7 +306,10 @@ pub async fn run_full_rebuild(pool: &PgPool) -> anyhow::Result<RebuildStats> {
 
     let mut rows = sqlx::query(
         "SELECT id, circle_id, snapshot_time, viewer_ids, fans, \
-            last_login_times::timestamptz[] AS last_login_times \
+            ARRAY( \
+                SELECT login_text::timestamp AT TIME ZONE 'UTC' \
+                FROM unnest(last_login_times) AS login(login_text) \
+            ) AS last_login_times \
          FROM circle_member_fan_snapshots \
          WHERE id <= $1 \
          ORDER BY snapshot_time, id",
@@ -498,7 +500,7 @@ struct DailyAccum {
     sessions: u32,
     longest_session_sec: u32,
     session_breakdown: Vec<SessionRecord>,
-    /// bitmap of berlin-hour buckets touched today (bit 0..23)
+    /// bitmap of UTC-hour buckets touched today (bit 0..23)
     hours_bitmap: u32,
 }
 
@@ -994,7 +996,7 @@ impl ViewerAccum {
         // to any particular day. Crediting fan_delta but not
         // active_seconds in that case produces artifacts like "23M fans
         // in 15 min active" on the daily chart.
-        let (day, dow, hour) = berlin_parts(snapshot_time);
+        let (day, dow, hour) = utc_parts(snapshot_time);
         let day_bucket = self.daily.entry(day).or_default();
         day_bucket.active_seconds = day_bucket.active_seconds.saturating_add(active_seconds);
         if tight_gap {
@@ -1126,7 +1128,7 @@ impl ViewerAccum {
         }
         let active_sec = open.active_seconds_so_far.min(duration_sec);
         let idle_sec = duration_sec.saturating_sub(active_sec);
-        let (start_day, _, _) = berlin_parts(open.started_at);
+        let (start_day, _, _) = utc_parts(open.started_at);
         let bucket = self.daily.entry(start_day).or_default();
         bucket.sessions = bucket.sessions.saturating_add(1);
         if duration_sec > bucket.longest_session_sec {
@@ -2595,12 +2597,11 @@ fn behavior_change_stats(daily: &HashMap<NaiveDate, DailyAccum>) -> BehaviorChan
     }
 }
 
-fn berlin_parts(ts: DateTime<Utc>) -> (NaiveDate, u8, u8) {
-    let local = ts.with_timezone(&Berlin);
+fn utc_parts(ts: DateTime<Utc>) -> (NaiveDate, u8, u8) {
     (
-        local.date_naive(),
-        local.weekday().num_days_from_sunday() as u8,
-        local.hour() as u8,
+        ts.date_naive(),
+        ts.weekday().num_days_from_sunday() as u8,
+        ts.hour() as u8,
     )
 }
 
@@ -3619,7 +3620,10 @@ mod tests {
                CROSS JOIN LATERAL unnest(
                    s.viewer_ids,
                    s.fans,
-                   s.last_login_times::timestamptz[]
+                   ARRAY(
+                       SELECT login_text::timestamp AT TIME ZONE 'UTC'
+                       FROM unnest(s.last_login_times) AS login(login_text)
+                   )
                ) WITH ORDINALITY AS x(viewer_id, fan, last_login, ord)
                WHERE $1 = ANY(s.viewer_ids)
                  AND x.viewer_id = $1
