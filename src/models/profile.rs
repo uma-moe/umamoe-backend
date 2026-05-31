@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct ProfileVisibility {
@@ -21,6 +22,7 @@ pub struct ProfileResponse {
 
 #[derive(Debug, Serialize, FromRow)]
 pub struct VeteranCharacter {
+    pub id: Uuid,
     pub account_id: String,
     pub trained_chara_id: i64,
     pub card_id: Option<i32>,

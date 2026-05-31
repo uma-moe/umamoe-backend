@@ -5,6 +5,7 @@ use axum::{
     Router,
 };
 use sqlx::FromRow;
+use uuid::Uuid;
 
 use crate::errors::AppError;
 use crate::middleware::auth::AuthenticatedUser;
@@ -19,6 +20,7 @@ use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/veterans/:veteran_id", get(get_veteran))
         .route("/:account_id", get(get_profile))
         .route(
             "/:account_id/visibility",
@@ -224,32 +226,14 @@ async fn get_profile(
     .await?;
 
     // 10) Veteran characters with pinned status
-    let veterans = sqlx::query_as::<_, VeteranCharacter>(
-        r#"
-        SELECT vc.account_id, vc.trained_chara_id, vc.card_id, vc.scenario_id, vc.route_id,
-               vc.rarity, vc.succession_trained_chara_id_1, vc.succession_trained_chara_id_2,
-               vc.succession_num, vc.speed, vc.stamina, vc.power, vc.wiz, vc.guts, vc.fans,
-               vc.rank_score, vc.rank, vc.chara_grade, vc.talent_level, vc.running_style,
-               vc.race_cloth_id, vc.nickname_id, vc.wins,
-               vc.proper_ground_turf, vc.proper_ground_dirt,
-               vc.proper_running_style_nige, vc.proper_running_style_senko,
-               vc.proper_running_style_sashi, vc.proper_running_style_oikomi,
-               vc.proper_distance_short, vc.proper_distance_mile,
-               vc.proper_distance_middle, vc.proper_distance_long,
-               vc.skill_array, vc.support_card_list, vc.factor_info_array, vc.win_saddle_id_array,
-               vc.succession_chara_array,
-               vc.register_time, vc.create_time, vc.ingested_at, vc.updated_at,
-               (vp.trained_chara_id IS NOT NULL) AS is_pinned
-        FROM veteran_characters vc
-        LEFT JOIN veteran_pins vp
-            ON vp.account_id = vc.account_id AND vp.trained_chara_id = vc.trained_chara_id
-        WHERE vc.account_id = $1
-        ORDER BY is_pinned DESC, vc.rank_score DESC NULLS LAST
-        "#,
-    )
-    .bind(&account_id)
-    .fetch_all(&state.db)
-    .await?;
+    let veteran_sql = veteran_select_sql(
+        "vc.account_id = $1",
+        "ORDER BY is_pinned DESC, vc.rank_score DESC NULLS LAST",
+    );
+    let veterans = sqlx::query_as::<_, VeteranCharacter>(&veteran_sql)
+        .bind(&account_id)
+        .fetch_all(&state.db)
+        .await?;
 
     // Apply per-section visibility for non-owners
     let hidden = &visibility.hidden_sections;
@@ -303,6 +287,33 @@ async fn get_profile(
         team_stadium,
         veterans,
     }))
+}
+
+/// GET /api/v4/user/profile/veterans/:veteran_id — lightweight veteran payload for sharing
+async fn get_veteran(
+    State(state): State<AppState>,
+    Path(veteran_id): Path<Uuid>,
+    auth_user: Option<AuthenticatedUser>,
+) -> Result<Json<VeteranCharacter>, AppError> {
+    let veteran_sql = veteran_select_sql("vc.id = $1", "");
+    let veteran = sqlx::query_as::<_, VeteranCharacter>(&veteran_sql)
+        .bind(veteran_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Veteran not found".into()))?;
+
+    let is_owner = check_is_owner(&state.db, auth_user.as_ref(), &veteran.account_id).await?;
+    let visibility = get_privacy_settings(&state.db, &veteran.account_id).await?;
+    if !is_owner && visibility.profile_hidden {
+        return Err(AppError::Forbidden("This profile is hidden".into()));
+    }
+    if !is_owner && visibility.hidden_sections.iter().any(|s| s == "veterans") {
+        return Err(AppError::Forbidden(
+            "Veterans are hidden on this profile".into(),
+        ));
+    }
+
+    Ok(Json(veteran))
 }
 
 /// GET /api/v4/user/profile/:account_id/visibility
@@ -394,6 +405,32 @@ async fn unpin_veteran(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn veteran_select_sql(where_clause: &str, order_clause: &str) -> String {
+    format!(
+        r#"
+        SELECT vc.id, vc.account_id, vc.trained_chara_id, vc.card_id, vc.scenario_id, vc.route_id,
+               vc.rarity, vc.succession_trained_chara_id_1, vc.succession_trained_chara_id_2,
+               vc.succession_num, vc.speed, vc.stamina, vc.power, vc.wiz, vc.guts, vc.fans,
+               vc.rank_score, vc.rank, vc.chara_grade, vc.talent_level, vc.running_style,
+               vc.race_cloth_id, vc.nickname_id, vc.wins,
+               vc.proper_ground_turf, vc.proper_ground_dirt,
+               vc.proper_running_style_nige, vc.proper_running_style_senko,
+               vc.proper_running_style_sashi, vc.proper_running_style_oikomi,
+               vc.proper_distance_short, vc.proper_distance_mile,
+               vc.proper_distance_middle, vc.proper_distance_long,
+               vc.skill_array, vc.support_card_list, vc.factor_info_array, vc.win_saddle_id_array,
+               vc.succession_chara_array,
+               vc.register_time, vc.create_time, vc.ingested_at, vc.updated_at,
+               (vp.trained_chara_id IS NOT NULL) AS is_pinned
+        FROM veteran_characters vc
+        LEFT JOIN veteran_pins vp
+            ON vp.account_id = vc.account_id AND vp.trained_chara_id = vc.trained_chara_id
+        WHERE {where_clause}
+        {order_clause}
+        "#
+    )
+}
 
 async fn get_privacy_settings(
     db: &sqlx::PgPool,
