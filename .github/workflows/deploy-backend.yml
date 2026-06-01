@@ -48,6 +48,7 @@ env:
   APP_PORT: '3001'
   INTERNAL_APP_PORT: '3201'
   SEARCH_INTERNAL_PORT: '3202'
+  ROUTER_IMAGE: nginx:1.27-alpine
 
 concurrency:
   group: deploy-${{ github.workflow }}-${{ github.ref }}
@@ -204,6 +205,8 @@ jobs:
           INTERNAL_APP_PORT: ${{ env.INTERNAL_APP_PORT }}
           SEARCH_SERVICE_URL: http://umamoe-search-beta:${{ env.SEARCH_INTERNAL_PORT }}
           ENV_FILE: ${{ env.BETA_ENV_FILE }}
+          ROUTER_IMAGE: ${{ env.ROUTER_IMAGE }}
+          USER_WRITES_DISABLED: 'true'
         run: |
           set -euo pipefail
 
@@ -215,7 +218,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" "$ROUTER_IMAGE" "$USER_WRITES_DISABLED" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -228,6 +231,10 @@ jobs:
           compose_file="$8"
           network_name="$9"
           search_service_url="${10}"
+          router_image="${11}"
+          user_writes_disabled="${12}"
+          router_name="${container_name}-router"
+          router_config="$(dirname "$compose_file")/${container_name}.nginx.conf"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -249,45 +256,135 @@ jobs:
 
           gzip -dc "$archive" | docker load
 
-          docker rm -f "$container_name" >/dev/null 2>&1 || true
-          docker run -d \
-            --name "$container_name" \
-            --restart unless-stopped \
-            --add-host host.docker.internal:host-gateway \
-            --network "$network_name" \
-            --env-file "$env_file" \
-            -e HOST=0.0.0.0 \
-            -e PORT="$app_port" \
-            -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0 \
-            -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port" \
-            -e SEARCH_SERVICE_URL="$search_service_url" \
-            -e REDIS_URL=redis://redis:6379/0 \
-            -e REDIS_KEY_PREFIX=umamoe \
-            -e DEBUG_MODE=false \
-            -e USER_WRITES_DISABLED=true \
-            -p "127.0.0.1:${host_port}:${app_port}" \
-            "$image_tag"
+          active_color=""
+          if docker inspect "$router_name" >/dev/null 2>&1; then
+            active_upstream="$(docker exec "$router_name" sh -c "grep -Eo 'server [^;]+' /etc/nginx/conf.d/default.conf | head -1 | sed 's#server ##'" 2>/dev/null || true)"
+            case "$active_upstream" in
+              "${container_name}-blue:${app_port}"*) active_color="blue" ;;
+              "${container_name}-green:${app_port}"*) active_color="green" ;;
+            esac
+          fi
+
+          if [ -z "$active_color" ]; then
+            if [ "$(docker inspect --format '{{.State.Running}}' "${container_name}-blue" 2>/dev/null || true)" = "true" ]; then
+              active_color="blue"
+            elif [ "$(docker inspect --format '{{.State.Running}}' "${container_name}-green" 2>/dev/null || true)" = "true" ]; then
+              active_color="green"
+            fi
+          fi
+
+          if [ "$active_color" = "blue" ]; then
+            inactive_color="green"
+          else
+            inactive_color="blue"
+          fi
+
+          new_container="${container_name}-${inactive_color}"
+
+          docker rm -f "$new_container" >/dev/null 2>&1 || true
+
+          docker_args=(
+            -d
+            --name "$new_container"
+            --restart unless-stopped
+            --add-host host.docker.internal:host-gateway
+            --network "$network_name"
+            --env-file "$env_file"
+            -e HOST=0.0.0.0
+            -e PORT="$app_port"
+            -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0
+            -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port"
+            -e SEARCH_SERVICE_URL="$search_service_url"
+            -e REDIS_URL=redis://redis:6379/0
+            -e REDIS_KEY_PREFIX=umamoe
+            -e DEBUG_MODE=false
+          )
+
+          if [ "$user_writes_disabled" = "true" ]; then
+            docker_args+=(-e USER_WRITES_DISABLED=true)
+          fi
+
+          docker run "${docker_args[@]}" "$image_tag"
 
           for _ in $(seq 1 45); do
-            running="$(docker inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
-            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+            running="$(docker inspect --format '{{.State.Running}}' "$new_container" 2>/dev/null || true)"
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$new_container" 2>/dev/null || true)"
 
             if [ "$health" = "healthy" ]; then
-              rm -f "$archive"
-              docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
-              exit 0
+              break
             fi
 
             if [ "$running" != "true" ]; then
-              docker logs --tail=120 "$container_name" || true
+              docker logs --tail=120 "$new_container" || true
               exit 1
             fi
 
             sleep 2
           done
 
-          docker logs --tail=120 "$container_name" || true
-          exit 1
+          health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$new_container" 2>/dev/null || true)"
+          if [ "$health" != "healthy" ]; then
+            docker logs --tail=120 "$new_container" || true
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$router_config")"
+          cat > "$router_config" <<NGINX
+          upstream backend {
+              server ${new_container}:${app_port};
+              keepalive 32;
+          }
+
+          server {
+              listen 80;
+              access_log off;
+
+              location / {
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_read_timeout 300s;
+                  proxy_send_timeout 300s;
+                  proxy_pass http://backend;
+              }
+          }
+          NGINX
+
+          if docker inspect "$router_name" >/dev/null 2>&1; then
+            docker exec "$router_name" nginx -t
+            docker exec "$router_name" nginx -s reload
+          else
+            docker rm -f "$router_name" >/dev/null 2>&1 || true
+            if ! docker run -d \
+              --name "$router_name" \
+              --restart unless-stopped \
+              --network "$network_name" \
+              -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
+              -p "127.0.0.1:${host_port}:80" \
+              "$router_image"; then
+              docker rm -f "$container_name" >/dev/null 2>&1 || true
+              docker rm -f "$router_name" >/dev/null 2>&1 || true
+              docker run -d \
+                --name "$router_name" \
+                --restart unless-stopped \
+                --network "$network_name" \
+                -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
+                -p "127.0.0.1:${host_port}:80" \
+                "$router_image"
+            fi
+          fi
+
+          if command -v curl >/dev/null 2>&1; then
+            curl -fsS "http://127.0.0.1:${host_port}/api/health" >/dev/null
+          fi
+
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
+
+          rm -f "$archive"
+          docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
           REMOTE_SCRIPT
 
   deploy_production:
@@ -375,6 +472,8 @@ jobs:
           INTERNAL_APP_PORT: ${{ env.INTERNAL_APP_PORT }}
           SEARCH_SERVICE_URL: http://umamoe-search:${{ env.SEARCH_INTERNAL_PORT }}
           ENV_FILE: ${{ env.PROD_ENV_FILE }}
+          ROUTER_IMAGE: ${{ env.ROUTER_IMAGE }}
+          USER_WRITES_DISABLED: 'false'
         run: |
           set -euo pipefail
 
@@ -386,7 +485,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" "$ROUTER_IMAGE" "$USER_WRITES_DISABLED" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -399,6 +498,10 @@ jobs:
           compose_file="$8"
           network_name="$9"
           search_service_url="${10}"
+          router_image="${11}"
+          user_writes_disabled="${12}"
+          router_name="${container_name}-router"
+          router_config="$(dirname "$compose_file")/${container_name}.nginx.conf"
 
           if [ ! -f "$env_file" ]; then
             echo "Missing container env file: $env_file" >&2
@@ -420,42 +523,133 @@ jobs:
 
           gzip -dc "$archive" | docker load
 
-          docker rm -f "$container_name" >/dev/null 2>&1 || true
-          docker run -d \
-            --name "$container_name" \
-            --restart unless-stopped \
-            --add-host host.docker.internal:host-gateway \
-            --network "$network_name" \
-            --env-file "$env_file" \
-            -e HOST=0.0.0.0 \
-            -e PORT="$app_port" \
-            -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0 \
-            -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port" \
-            -e SEARCH_SERVICE_URL="$search_service_url" \
-            -e REDIS_URL=redis://redis:6379/0 \
-            -e REDIS_KEY_PREFIX=umamoe \
-            -e DEBUG_MODE=false \
-            -p "127.0.0.1:${host_port}:${app_port}" \
-            "$image_tag"
+          active_color=""
+          if docker inspect "$router_name" >/dev/null 2>&1; then
+            active_upstream="$(docker exec "$router_name" sh -c "grep -Eo 'server [^;]+' /etc/nginx/conf.d/default.conf | head -1 | sed 's#server ##'" 2>/dev/null || true)"
+            case "$active_upstream" in
+              "${container_name}-blue:${app_port}"*) active_color="blue" ;;
+              "${container_name}-green:${app_port}"*) active_color="green" ;;
+            esac
+          fi
+
+          if [ -z "$active_color" ]; then
+            if [ "$(docker inspect --format '{{.State.Running}}' "${container_name}-blue" 2>/dev/null || true)" = "true" ]; then
+              active_color="blue"
+            elif [ "$(docker inspect --format '{{.State.Running}}' "${container_name}-green" 2>/dev/null || true)" = "true" ]; then
+              active_color="green"
+            fi
+          fi
+
+          if [ "$active_color" = "blue" ]; then
+            inactive_color="green"
+          else
+            inactive_color="blue"
+          fi
+
+          new_container="${container_name}-${inactive_color}"
+
+          docker rm -f "$new_container" >/dev/null 2>&1 || true
+
+          docker_args=(
+            -d
+            --name "$new_container"
+            --restart unless-stopped
+            --add-host host.docker.internal:host-gateway
+            --network "$network_name"
+            --env-file "$env_file"
+            -e HOST=0.0.0.0
+            -e PORT="$app_port"
+            -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0
+            -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port"
+            -e SEARCH_SERVICE_URL="$search_service_url"
+            -e REDIS_URL=redis://redis:6379/0
+            -e REDIS_KEY_PREFIX=umamoe
+            -e DEBUG_MODE=false
+          )
+
+          if [ "$user_writes_disabled" = "true" ]; then
+            docker_args+=(-e USER_WRITES_DISABLED=true)
+          fi
+
+          docker run "${docker_args[@]}" "$image_tag"
 
           for _ in $(seq 1 45); do
-            running="$(docker inspect --format '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
-            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_name" 2>/dev/null || true)"
+            running="$(docker inspect --format '{{.State.Running}}' "$new_container" 2>/dev/null || true)"
+            health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$new_container" 2>/dev/null || true)"
 
             if [ "$health" = "healthy" ]; then
-              rm -f "$archive"
-              docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
-              exit 0
+              break
             fi
 
             if [ "$running" != "true" ]; then
-              docker logs --tail=120 "$container_name" || true
+              docker logs --tail=120 "$new_container" || true
               exit 1
             fi
 
             sleep 2
           done
 
-          docker logs --tail=120 "$container_name" || true
-          exit 1
+          health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$new_container" 2>/dev/null || true)"
+          if [ "$health" != "healthy" ]; then
+            docker logs --tail=120 "$new_container" || true
+            exit 1
+          fi
+
+          mkdir -p "$(dirname "$router_config")"
+          cat > "$router_config" <<NGINX
+          upstream backend {
+              server ${new_container}:${app_port};
+              keepalive 32;
+          }
+
+          server {
+              listen 80;
+              access_log off;
+
+              location / {
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_read_timeout 300s;
+                  proxy_send_timeout 300s;
+                  proxy_pass http://backend;
+              }
+          }
+          NGINX
+
+          if docker inspect "$router_name" >/dev/null 2>&1; then
+            docker exec "$router_name" nginx -t
+            docker exec "$router_name" nginx -s reload
+          else
+            docker rm -f "$router_name" >/dev/null 2>&1 || true
+            if ! docker run -d \
+              --name "$router_name" \
+              --restart unless-stopped \
+              --network "$network_name" \
+              -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
+              -p "127.0.0.1:${host_port}:80" \
+              "$router_image"; then
+              docker rm -f "$container_name" >/dev/null 2>&1 || true
+              docker rm -f "$router_name" >/dev/null 2>&1 || true
+              docker run -d \
+                --name "$router_name" \
+                --restart unless-stopped \
+                --network "$network_name" \
+                -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
+                -p "127.0.0.1:${host_port}:80" \
+                "$router_image"
+            fi
+          fi
+
+          if command -v curl >/dev/null 2>&1; then
+            curl -fsS "http://127.0.0.1:${host_port}/api/health" >/dev/null
+          fi
+
+          docker rm -f "$container_name" >/dev/null 2>&1 || true
+
+          rm -f "$archive"
+          docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
           REMOTE_SCRIPT
