@@ -2,10 +2,10 @@ openapi: 3.1.0
 info:
   title: uma.moe API
   description: |
-    Public API for uma.moe — Umamusume inheritance search, circle tracking, fan rankings, and trainer profiles.
+    API for uma.moe — Umamusume inheritance search, circle tracking, fan rankings, and trainer profiles.
 
-    All endpoints listed here are public and require no authentication.
-    If you have an API key, you can pass it via the `X-API-Key` header for usage tracking.
+    API endpoints are protected against scraping. Send either an `X-API-Key` header or a valid `X-Browser-Proof` header.
+    The version endpoints `/api/ver` and `/api/ver/history` are public and require no protection header.
   version: 1.0.0
   contact:
     name: uma.moe
@@ -28,6 +28,18 @@ tags:
     description: Health check and version info
 
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for server-to-server access and usage tracking.
+    BrowserProofAuth:
+      type: apiKey
+      in: header
+      name: X-Browser-Proof
+      description: Browser proof token issued by the frontend protection flow.
+
   schemas:
     Error:
       type: object
@@ -204,12 +216,12 @@ components:
         monthly_rank:
           type: integer
           nullable: true
-          description: Current rank. Replaced with `live_rank` when live data is fresh (last_live_update >= today JST midnight) and live_points >= monthly_point.
+          description: Effective current/display rank. During the rollover display window this can show the completed-month rank so local ranking stays stable.
         monthly_point:
           type: integer
           format: int64
           nullable: true
-          description: Current points. Replaced with GREATEST(live_points, monthly_point) when live data is fresh (last_live_update >= today JST midnight).
+          description: Effective current/display points. During the rollover display window this can show completed-month points. Archived circles use their frozen monthly values until they leave rankings at the 3rd JST cutoff.
         last_month_rank:
           type: integer
           nullable: true
@@ -235,16 +247,16 @@ components:
           type: integer
           format: int64
           nullable: true
-          description: Top-100 circles only, updates every 5 minutes
+          description: Top-100 circles only, updates every 5 minutes. Hidden during carryover where it would conflict with the completed-month display payload.
         live_rank:
           type: integer
           nullable: true
-          description: Top-100 circles only, updates every 5 minutes
+          description: Top-100 circles only, updates every 5 minutes. Hidden during carryover where it would conflict with the completed-month display payload.
         last_live_update:
           type: string
           format: date-time
           nullable: true
-          description: Timestamp of the last live_points update. When this is on or after today's JST midnight, `monthly_rank` and `monthly_point` are replaced with the live values (GREATEST of live and monthly).
+          description: Timestamp of the last live_points update.
 
     CircleMemberFansMonthly:
       type: object
@@ -259,6 +271,9 @@ components:
           format: int64
         trainer_name:
           type: string
+          nullable: true
+        shame_score:
+          type: integer
           nullable: true
         year:
           type: integer
@@ -606,8 +621,43 @@ components:
           type: string
         name:
           type: string
+        shame_score:
+          type: integer
+          nullable: true
         follower_num:
           type: integer
+          nullable: true
+        best_team_class:
+          type: integer
+          nullable: true
+        team_class:
+          type: integer
+          nullable: true
+        team_evaluation_point:
+          type: integer
+          format: int64
+          nullable: true
+        leader_chara_dress_id:
+          type: integer
+          nullable: true
+        rank_score:
+          type: integer
+          format: int64
+          nullable: true
+        release_num_info:
+          nullable: true
+        trophy_num_info:
+          nullable: true
+        team_stadium_user:
+          nullable: true
+        own_follow_num:
+          type: integer
+          nullable: true
+        enable_circle_scout:
+          type: integer
+          nullable: true
+        comment:
+          type: string
           nullable: true
 
     CircleInfo:
@@ -676,6 +726,246 @@ components:
         alltime:
           $ref: "#/components/schemas/UserFanRankingAlltime"
 
+    TeamStadiumMember:
+      type: object
+      properties:
+        id:
+          type: integer
+        trainer_id:
+          type: string
+        distance_type:
+          type: integer
+          nullable: true
+        member_id:
+          type: integer
+          nullable: true
+        trained_chara_id:
+          type: integer
+          nullable: true
+        running_style:
+          type: integer
+          nullable: true
+        card_id:
+          type: integer
+          nullable: true
+        speed:
+          type: integer
+          nullable: true
+        power:
+          type: integer
+          nullable: true
+        stamina:
+          type: integer
+          nullable: true
+        wiz:
+          type: integer
+          nullable: true
+        guts:
+          type: integer
+          nullable: true
+        fans:
+          type: integer
+          nullable: true
+        rank_score:
+          type: integer
+          format: int64
+          nullable: true
+        skills:
+          type: array
+          nullable: true
+          items:
+            type: integer
+        creation_time:
+          type: string
+          nullable: true
+        scenario_id:
+          type: integer
+          nullable: true
+        factors:
+          type: array
+          nullable: true
+          items:
+            type: integer
+        support_cards:
+          type: array
+          nullable: true
+          items:
+            type: integer
+        proper_ground_turf:
+          type: integer
+          nullable: true
+        proper_ground_dirt:
+          type: integer
+          nullable: true
+        proper_running_style_nige:
+          type: integer
+          nullable: true
+        proper_running_style_senko:
+          type: integer
+          nullable: true
+        proper_running_style_sashi:
+          type: integer
+          nullable: true
+        proper_running_style_oikomi:
+          type: integer
+          nullable: true
+        proper_distance_short:
+          type: integer
+          nullable: true
+        proper_distance_mile:
+          type: integer
+          nullable: true
+        proper_distance_middle:
+          type: integer
+          nullable: true
+        proper_distance_long:
+          type: integer
+          nullable: true
+        rarity:
+          type: integer
+          nullable: true
+        talent_level:
+          type: integer
+          nullable: true
+        team_rating:
+          type: integer
+          nullable: true
+
+    VeteranCharacter:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Stable veteran UUID. Use this to load or share a veteran without fetching the full profile.
+        account_id:
+          type: string
+        trained_chara_id:
+          type: integer
+          format: int64
+        card_id:
+          type: integer
+          nullable: true
+        scenario_id:
+          type: integer
+          nullable: true
+        route_id:
+          type: integer
+          nullable: true
+        rarity:
+          type: integer
+          nullable: true
+        succession_trained_chara_id_1:
+          type: integer
+          format: int64
+          nullable: true
+        succession_trained_chara_id_2:
+          type: integer
+          format: int64
+          nullable: true
+        succession_num:
+          type: integer
+          nullable: true
+        speed:
+          type: integer
+          nullable: true
+        stamina:
+          type: integer
+          nullable: true
+        power:
+          type: integer
+          nullable: true
+        wiz:
+          type: integer
+          nullable: true
+        guts:
+          type: integer
+          nullable: true
+        fans:
+          type: integer
+          nullable: true
+        rank_score:
+          type: integer
+          format: int64
+          nullable: true
+        rank:
+          type: integer
+          nullable: true
+        chara_grade:
+          type: integer
+          nullable: true
+        talent_level:
+          type: integer
+          nullable: true
+        running_style:
+          type: integer
+          nullable: true
+        race_cloth_id:
+          type: integer
+          nullable: true
+        nickname_id:
+          type: integer
+          nullable: true
+        wins:
+          type: integer
+          nullable: true
+        proper_ground_turf:
+          type: integer
+          nullable: true
+        proper_ground_dirt:
+          type: integer
+          nullable: true
+        proper_running_style_nige:
+          type: integer
+          nullable: true
+        proper_running_style_senko:
+          type: integer
+          nullable: true
+        proper_running_style_sashi:
+          type: integer
+          nullable: true
+        proper_running_style_oikomi:
+          type: integer
+          nullable: true
+        proper_distance_short:
+          type: integer
+          nullable: true
+        proper_distance_mile:
+          type: integer
+          nullable: true
+        proper_distance_middle:
+          type: integer
+          nullable: true
+        proper_distance_long:
+          type: integer
+          nullable: true
+        skill_array:
+          description: Raw skill payload from the game.
+        support_card_list:
+          description: Raw support-card payload from the game.
+        factor_info_array:
+          description: Raw factor payload from the game.
+        win_saddle_id_array:
+          description: Raw win-saddle payload from the game.
+        succession_chara_array:
+          description: Raw succession-character payload from the game.
+        register_time:
+          type: string
+          format: date-time
+          nullable: true
+        create_time:
+          type: string
+          format: date-time
+          nullable: true
+        ingested_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        is_pinned:
+          type: boolean
+
     ProfileResponse:
       type: object
       properties:
@@ -693,6 +983,18 @@ components:
           $ref: "#/components/schemas/Inheritance"
         support_card:
           $ref: "#/components/schemas/SupportCard"
+        team_stadium:
+          type: array
+          items:
+            $ref: "#/components/schemas/TeamStadiumMember"
+        veterans:
+          type: array
+          items:
+            $ref: "#/components/schemas/VeteranCharacter"
+
+security:
+  - ApiKeyAuth: []
+  - BrowserProofAuth: []
 
 # ─── Paths ─────────────────────────────────────────────────────
 paths:
@@ -1041,10 +1343,12 @@ paths:
             type: integer
             minimum: 1
             maximum: 12
+          description: Defaults to the current game month starting at the 2nd JST. Rankings still use the 3rd JST carryover rule.
         - name: year
           in: query
           schema:
             type: integer
+          description: Defaults to the current game year starting at the 2nd JST when `month` is omitted.
       responses:
         "200":
           description: Circle with members
@@ -1248,7 +1552,7 @@ paths:
                 $ref: "#/components/schemas/GainsRankingsResponse"
 
   # ── Profile ─────────────────────────────────────────────────
-  /api/v4/profile/{account_id}:
+  /api/v4/user/profile/{account_id}:
     get:
       tags: [Profile]
       summary: Get complete user profile
@@ -1274,6 +1578,40 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /api/v4/user/profile/veterans/{veteran_id}:
+    get:
+      tags: [Profile]
+      summary: Get a single veteran character by UUID
+      operationId: getVeteran
+      description: Lightweight veteran payload for sharing without loading the full profile. Respects profile and veteran-section privacy.
+      parameters:
+        - name: veteran_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Stable veteran UUID from `ProfileResponse.veterans[].id`
+      responses:
+        "200":
+          description: Veteran character
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VeteranCharacter"
+        "403":
+          description: Profile or veterans are hidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Veteran not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   # ── System ──────────────────────────────────────────────────
   /api/health:
     get:
@@ -1294,6 +1632,7 @@ paths:
 
   /api/ver:
     get:
+      security: []
       tags: [System]
       summary: Get current server version
       operationId: getVersion
@@ -1309,6 +1648,7 @@ paths:
 
   /api/ver/history:
     get:
+      security: []
       tags: [System]
       summary: Get version history
       operationId: getVersionHistory

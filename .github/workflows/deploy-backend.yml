@@ -264,6 +264,7 @@ jobs:
             -e REDIS_URL=redis://redis:6379/0 \
             -e REDIS_KEY_PREFIX=umamoe \
             -e DEBUG_MODE=false \
+            -e USER_WRITES_DISABLED=true \
             -p "127.0.0.1:${host_port}:${app_port}" \
             "$image_tag"
 
