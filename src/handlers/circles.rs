@@ -82,8 +82,23 @@ pub fn router() -> Router<AppState> {
         .route("/rank-thresholds", get(get_rank_thresholds))
 }
 
-fn rollover_display_sql() -> &'static str {
+fn tallying_sql() -> &'static str {
+    "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') >= (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '19 hours') AND (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') < (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day')"
+}
+
+fn post_tally_display_sql() -> &'static str {
     "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') >= (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day') AND (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') < (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')"
+}
+
+fn row_has_new_last_month_sql(alias: &str) -> String {
+    format!(
+        "{}.last_updated >= ((date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day') AT TIME ZONE 'Asia/Tokyo')::timestamp AND NOT COALESCE({}.archived, false)",
+        alias, alias
+    )
+}
+
+fn archived_sql(alias: &str) -> String {
+    format!("COALESCE({}.archived, false)", alias)
 }
 
 fn valid_live_sql(alias: &str) -> String {
@@ -100,13 +115,31 @@ fn disbanded_name_sql(alias: &str) -> String {
 fn effective_points_sql(alias: &str) -> String {
     format!(
         "CASE \
-            WHEN {} THEN {}.live_points \
-            WHEN {} THEN COALESCE({}.last_month_point, {}.monthly_point) \
+            WHEN {} AND {} THEN {}.monthly_point \
+            WHEN {} AND {} THEN {}.live_points \
+            WHEN {} THEN {}.monthly_point \
+            WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.monthly_point) \
+            WHEN {} THEN {}.monthly_point \
+            WHEN {} THEN COALESCE(GREATEST({}.live_points, {}.monthly_point), {}.live_points, {}.monthly_point) \
             ELSE {}.monthly_point \
         END",
+        tallying_sql(),
+        archived_sql(alias),
+        alias,
+        tallying_sql(),
         valid_live_sql(alias),
         alias,
-        rollover_display_sql(),
+        tallying_sql(),
+        alias,
+        post_tally_display_sql(),
+        row_has_new_last_month_sql(alias),
+        alias,
+        alias,
+        post_tally_display_sql(),
+        alias,
+        valid_live_sql(alias),
+        alias,
+        alias,
         alias,
         alias,
         alias,
@@ -116,15 +149,93 @@ fn effective_points_sql(alias: &str) -> String {
 fn rank_fallback_sql(alias: &str) -> String {
     format!(
         "CASE \
+            WHEN {} AND {} THEN {}.monthly_rank \
+            WHEN {} AND {} THEN {}.live_rank \
+            WHEN {} THEN {}.monthly_rank \
+            WHEN {} AND {} THEN COALESCE({}.last_month_rank, {}.monthly_rank) \
+            WHEN {} THEN {}.monthly_rank \
             WHEN {} THEN {}.live_rank \
-            WHEN {} THEN COALESCE({}.last_month_rank, {}.monthly_rank) \
             ELSE {}.monthly_rank \
         END",
+        tallying_sql(),
+        archived_sql(alias),
+        alias,
+        tallying_sql(),
         valid_live_sql(alias),
         alias,
-        rollover_display_sql(),
+        tallying_sql(),
+        alias,
+        post_tally_display_sql(),
+        row_has_new_last_month_sql(alias),
         alias,
         alias,
+        post_tally_display_sql(),
+        alias,
+        valid_live_sql(alias),
+        alias,
+        alias,
+    )
+}
+
+fn display_monthly_point_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.monthly_point) ELSE {}.monthly_point END",
+        post_tally_display_sql(),
+        row_has_new_last_month_sql(alias),
+        alias,
+        alias,
+        alias,
+    )
+}
+
+fn display_yesterday_points_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.yesterday_points) ELSE {}.yesterday_points END",
+        post_tally_display_sql(),
+        row_has_new_last_month_sql(alias),
+        alias,
+        alias,
+        alias,
+    )
+}
+
+fn display_yesterday_rank_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} AND {} THEN COALESCE({}.last_month_rank, {}.yesterday_rank) ELSE {}.yesterday_rank END",
+        post_tally_display_sql(),
+        row_has_new_last_month_sql(alias),
+        alias,
+        alias,
+        alias,
+    )
+}
+
+fn display_live_points_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {}.live_points END",
+        post_tally_display_sql(),
+        tallying_sql(),
+        archived_sql(alias),
+        alias,
+    )
+}
+
+fn display_live_rank_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {}.live_rank END",
+        post_tally_display_sql(),
+        tallying_sql(),
+        archived_sql(alias),
+        alias,
+    )
+}
+
+fn display_last_live_update_sql(alias: &str) -> String {
+    format!(
+        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {}.last_live_update END",
+        post_tally_display_sql(),
+        tallying_sql(),
+        archived_sql(alias),
         alias,
     )
 }
@@ -136,18 +247,40 @@ fn effective_circle_points(circle: &Circle) -> i64 {
         .unwrap()
         .and_hms_opt(0, 0, 0)
         .unwrap();
-    let display_start_jst = month_start_jst + Duration::days(1);
+    let tally_start_jst = month_start_jst + Duration::hours(19);
+    let game_month_start_jst = month_start_jst + Duration::days(1);
     let display_end_jst = month_start_jst + Duration::days(2);
+    let game_month_start_utc = game_month_start_jst - Duration::hours(9);
     let now_jst_naive = now_jst.naive_local();
     let valid_live = circle.live_rank.unwrap_or(0) > 0 && circle.live_points.unwrap_or(0) > 0;
+    let archived = circle.archived.unwrap_or(false);
 
-    if valid_live {
-        circle.live_points.unwrap_or(0)
-    } else if now_jst_naive >= display_start_jst && now_jst_naive < display_end_jst {
+    if now_jst_naive >= tally_start_jst && now_jst_naive < game_month_start_jst {
+        if archived {
+            circle.monthly_point.unwrap_or(0)
+        } else if valid_live {
+            circle.live_points.unwrap_or(0)
+        } else {
+            circle.monthly_point.unwrap_or(0)
+        }
+    } else if now_jst_naive >= game_month_start_jst && now_jst_naive < display_end_jst {
+        if !archived
+            && circle
+                .last_updated
+                .is_some_and(|updated| updated >= game_month_start_utc)
+        {
+            circle
+                .last_month_point
+                .or(circle.monthly_point)
+                .unwrap_or(0)
+        } else {
+            circle.monthly_point.unwrap_or(0)
+        }
+    } else if valid_live {
         circle
-            .last_month_point
-            .or(circle.monthly_point)
+            .live_points
             .unwrap_or(0)
+            .max(circle.monthly_point.unwrap_or(0))
     } else {
         circle.monthly_point.unwrap_or(0)
     }
@@ -372,6 +505,12 @@ pub async fn list_circles(
     let points_column = effective_points_sql("c");
     let rank_column = rank_fallback_sql("c");
     let name_column = disbanded_name_sql("c");
+    let monthly_point_column = display_monthly_point_sql("c");
+    let yesterday_points_column = display_yesterday_points_sql("c");
+    let yesterday_rank_column = display_yesterday_rank_sql("c");
+    let live_points_column = display_live_points_sql("c");
+    let live_rank_column = display_live_rank_sql("c");
+    let last_live_update_column = display_last_live_update_sql("c");
     // Build dynamic query
     let mut count_query = format!(
         "{} SELECT COUNT(*) FROM circles c LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id {} WHERE 1=1",
@@ -394,22 +533,31 @@ pub async fn list_circles(
             c.created_at,
             c.last_updated,
             {} as monthly_rank,
-            c.monthly_point,
+            {} as monthly_point,
             c.last_month_rank,
             c.last_month_point,
             c.archived,
             c.yesterday_updated,
-            c.yesterday_points,
-            c.yesterday_rank,
-            c.live_points,
-            c.live_rank,
-            c.last_live_update
+            {} as yesterday_points,
+            {} as yesterday_rank,
+            {} as live_points,
+            {} as live_rank,
+            {} as last_live_update
         FROM circles c
         LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id
         {}
         WHERE 1=1
         "#,
-        with_clause, name_column, rank_column, join_matching_circles
+        with_clause,
+        name_column,
+        rank_column,
+        monthly_point_column,
+        yesterday_points_column,
+        yesterday_rank_column,
+        live_points_column,
+        live_rank_column,
+        last_live_update_column,
+        join_matching_circles
     );
 
     let mut conditions = Vec::new();
@@ -417,7 +565,7 @@ pub async fn list_circles(
     // Only show circles updated this month to ensure points are current
     // Use JST minus 2 days so the month flips at midnight JST on the 3rd (giving time for data collection)
     conditions.push("c.last_updated >= date_trunc('month', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')".to_string());
-    // Archived circles stay visible for the display month; the date window removes them after rollover.
+    conditions.push("(c.archived IS DISTINCT FROM true OR (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::timestamp < date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')".to_string());
 
     // Name filter
     if let Some(name) = &params.name {
@@ -707,25 +855,23 @@ fn lower_tier_boundary(rank: Option<i32>, points: i64) -> Option<i32> {
 async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
     let points_column = effective_points_sql("c");
 
-    let result: Option<i64> = sqlx::query_scalar(
-        &format!(
+    let result: Option<Option<i64>> = sqlx::query_scalar(&format!(
         r#"
         SELECT {}
         FROM circles c
         JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id
         WHERE lr.live_rank <= $1
-          AND (c.live_points IS NOT NULL OR c.last_month_point IS NOT NULL OR c.monthly_point IS NOT NULL)
+          AND ({}) IS NOT NULL
         ORDER BY lr.live_rank DESC
         LIMIT 1
         "#,
-        points_column
-        ),
-    )
+        points_column, points_column
+    ))
     .bind(boundary_rank)
     .fetch_optional(pool)
     .await?;
 
-    Ok(result)
+    Ok(result.flatten())
 }
 
 /// Fetch the yesterday_points of the circle at the given boundary rank (using yesterday's rankings)
@@ -733,21 +879,25 @@ async fn fetch_boundary_points_yesterday(
     pool: &PgPool,
     boundary_rank: i32,
 ) -> Result<Option<i64>, AppError> {
-    let result: Option<i64> = sqlx::query_scalar(
+    let points_column = display_yesterday_points_sql("c");
+
+    let result: Option<Option<i64>> = sqlx::query_scalar(&format!(
         r#"
-        SELECT c.yesterday_points
+        SELECT {}
         FROM circles c
         JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id
-        WHERE lr.live_yesterday_rank <= $1 AND c.yesterday_points IS NOT NULL
+        WHERE lr.live_yesterday_rank <= $1
+          AND ({}) IS NOT NULL
         ORDER BY lr.live_yesterday_rank DESC
         LIMIT 1
         "#,
-    )
+        points_column, points_column
+    ))
     .bind(boundary_rank)
     .fetch_optional(pool)
     .await?;
 
-    Ok(result)
+    Ok(result.flatten())
 }
 
 /// Fetch the last_month_point of the circle at the given boundary rank.
@@ -755,7 +905,7 @@ async fn fetch_boundary_points_last_month(
     pool: &PgPool,
     boundary_rank: i32,
 ) -> Result<Option<i64>, AppError> {
-    let result: Option<i64> = sqlx::query_scalar(
+    let result: Option<Option<i64>> = sqlx::query_scalar(
         r#"
         SELECT c.last_month_point
         FROM circles c
@@ -770,13 +920,19 @@ async fn fetch_boundary_points_last_month(
     .fetch_optional(pool)
     .await?;
 
-    Ok(result)
+    Ok(result.flatten())
 }
 
 /// Fetch circle by ID
 async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, AppError> {
     let rank_column = rank_fallback_sql("c");
     let name_column = disbanded_name_sql("c");
+    let monthly_point_column = display_monthly_point_sql("c");
+    let yesterday_points_column = display_yesterday_points_sql("c");
+    let yesterday_rank_column = display_yesterday_rank_sql("c");
+    let live_points_column = display_live_points_sql("c");
+    let live_rank_column = display_live_rank_sql("c");
+    let last_live_update_column = display_last_live_update_sql("c");
 
     let circle = sqlx::query_as::<_, Circle>(&format!(
         r#"
@@ -792,21 +948,28 @@ async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, App
             c.created_at,
             c.last_updated,
             {} as monthly_rank,
-            c.monthly_point,
+            {} as monthly_point,
             c.last_month_rank,
             c.last_month_point,
             c.archived,
             c.yesterday_updated,
-            c.yesterday_points,
-            c.yesterday_rank,
-            c.live_points,
-            c.live_rank,
-            c.last_live_update
+            {} as yesterday_points,
+            {} as yesterday_rank,
+            {} as live_points,
+            {} as live_rank,
+            {} as last_live_update
         FROM circles c
         LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id
         WHERE c.circle_id = $1
         "#,
-        name_column, rank_column,
+        name_column,
+        rank_column,
+        monthly_point_column,
+        yesterday_points_column,
+        yesterday_rank_column,
+        live_points_column,
+        live_rank_column,
+        last_live_update_column,
     ))
     .bind(circle_id)
     .fetch_optional(pool)
@@ -826,8 +989,7 @@ async fn fetch_circle_members(
     use chrono::{Datelike, Duration, FixedOffset, Utc};
     use std::collections::HashMap;
 
-    // Default to current date in JST minus 1 day if not provided
-    // This means the month flips at midnight JST on the 2nd (giving time for data collection)
+    // Default circle detail members to the new game month starting on the 2nd JST.
     let (target_year, target_month) = if year.is_none() || month.is_none() {
         let jst_offset = FixedOffset::east_opt(9 * 3600).unwrap();
         let now_jst = Utc::now().with_timezone(&jst_offset) - Duration::days(1);
