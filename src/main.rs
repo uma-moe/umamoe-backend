@@ -482,8 +482,6 @@ async fn main() -> anyhow::Result<()> {
     // Protected endpoints (Turnstile + restricted CORS)
     let protected_routes = Router::new()
         .route("/api/health", get(health_check))
-        .route("/api/ver", get(version::get_version))
-        .route("/api/ver/history", get(version::get_version_history))
         .nest("/api/docs", docs::router())
         .nest("/api/stats", stats::router())
         .nest("/api/tasks", tasks::router())
@@ -509,12 +507,22 @@ async fn main() -> anyhow::Result<()> {
                     state.clone(),
                     middleware::turnstile::api_protection_middleware,
                 ))
+                .layer(cors.clone()),
+        )
+        .with_state(state.clone());
+
+    let version_routes = Router::new()
+        .route("/api/ver", get(version::get_version))
+        .route("/api/ver/history", get(version::get_version_history))
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
                 .layer(cors),
         )
         .with_state(state);
 
     // Merge public and protected routes
-    let app = public_routes.merge(protected_routes);
+    let app = version_routes.merge(public_routes).merge(protected_routes);
 
     // Server configuration
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
