@@ -481,7 +481,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Protected endpoints (Turnstile + restricted CORS)
     let protected_routes = Router::new()
-        .route("/api/health", get(health_check))
         .nest("/api/docs", docs::router())
         .nest("/api/stats", stats::router())
         .nest("/api/tasks", tasks::router())
@@ -512,6 +511,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone());
 
     let version_routes = Router::new()
+        .route("/api/health", get(health_check))
         .route("/api/ver", get(version::get_version))
         .route("/api/ver/history", get(version::get_version_history))
         .layer(

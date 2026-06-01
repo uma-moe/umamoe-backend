@@ -24,6 +24,8 @@ tags:
     description: Monthly, all-time, and rolling gain rankings
   - name: Profile
     description: Trainer profile (circle history, fan history, inheritance)
+  - name: Shame
+    description: Suspicious activity analysis and viewer reports
   - name: System
     description: Health check and version info
 
@@ -992,6 +994,461 @@ components:
           items:
             $ref: "#/components/schemas/VeteranCharacter"
 
+    # -- Suspicious Activity -----------------------------------------------
+    EvidenceReason:
+      type: object
+      properties:
+        key:
+          type: string
+        label:
+          type: string
+        severity:
+          type: string
+          enum: [critical, high, medium, low, info]
+        confidence:
+          type: string
+          enum: [strong, medium, contextual]
+        message:
+          type: string
+        display_value:
+          type: string
+        caveat:
+          type: string
+          nullable: true
+
+    EvidenceSummary:
+      type: object
+      properties:
+        verdict:
+          type: string
+          description: Machine-readable verdict for badges and filtering.
+        summary:
+          type: string
+        strongest_signal:
+          type: string
+          nullable: true
+        reasons:
+          type: array
+          items:
+            $ref: "#/components/schemas/EvidenceReason"
+        caveats:
+          type: array
+          items:
+            type: string
+
+    CareerRateWindow:
+      type: object
+      properties:
+        careers_per_hour:
+          type: number
+        sample_count:
+          type: integer
+        sample_seconds:
+          type: integer
+
+    CareerRateBreakdown:
+      type: object
+      properties:
+        last_20:
+          $ref: "#/components/schemas/CareerRateWindow"
+        lifetime:
+          $ref: "#/components/schemas/CareerRateWindow"
+      additionalProperties: true
+
+    SuspicionProbeMetrics:
+      type: object
+      description: Additional probe metrics used by the suspicious-activity score. Shape may expand as probes are added.
+      additionalProperties: true
+
+    ShameHallEntry:
+      type: object
+      properties:
+        viewer_id:
+          type: integer
+          format: int64
+        trainer_name:
+          type: string
+          nullable: true
+        circle_id:
+          type: integer
+          format: int64
+          nullable: true
+        circle_name:
+          type: string
+          nullable: true
+        circle_monthly_rank:
+          type: integer
+          nullable: true
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+        days_observed:
+          type: integer
+        days_active:
+          type: integer
+        total_active_seconds:
+          type: integer
+          format: int64
+        total_fan_gain:
+          type: integer
+          format: int64
+        total_careers:
+          type: integer
+        avg_careers_per_day:
+          type: number
+        careers_per_active_hour:
+          type: number
+          description: Hall list uses the last-20 career-rate window for this field.
+        career_rate_sample_count:
+          type: integer
+        career_rate_sample_seconds:
+          type: integer
+          format: int64
+        career_rate_breakdown:
+          $ref: "#/components/schemas/CareerRateBreakdown"
+        avg_career_length_last20_seconds:
+          type: number
+        career_length_buckets:
+          type: array
+          description: Five-minute estimated career-length buckets; final bucket is overflow.
+          items:
+            type: integer
+        short_high_fan_careers:
+          type: integer
+        short_fan_gain_score:
+          type: number
+        short_fan_gain_score_buckets:
+          type: array
+          items:
+            type: number
+        short_career_avg_fan_gain:
+          type: number
+        short_career_p50_fan_gain:
+          type: number
+        short_career_p90_fan_gain:
+          type: number
+        short_career_p95_fan_gain:
+          type: number
+        short_career_max_fan_gain:
+          type: number
+        recent_fan_gain_3d:
+          type: integer
+          format: int64
+        baseline_fan_gain_14d:
+          type: integer
+          format: int64
+        recent_fans_per_day:
+          type: number
+        baseline_fans_per_day:
+          type: number
+        fan_gain_spike_ratio:
+          type: number
+        behavior_change_score:
+          type: number
+        fans_per_active_minute:
+          type: number
+        peak_fans_per_minute:
+          type: number
+        high_fan_rate_windows:
+          type: integer
+        high_fan_rate_total_fan_gain:
+          type: integer
+          format: int64
+        high_fan_rate_total_seconds:
+          type: integer
+        max_daily_active_seconds:
+          type: integer
+        max_daily_careers:
+          type: integer
+        max_session_seconds:
+          type: integer
+        days_over_16h:
+          type: integer
+        days_over_20h:
+          type: integer
+        reset_recovery_windows:
+          type: integer
+        reset_breaks:
+          type: integer
+        max_reset_recovery_seconds:
+          type: integer
+        reset_break_score:
+          type: number
+        probe_score:
+          type: number
+        probe_metrics:
+          $ref: "#/components/schemas/SuspicionProbeMetrics"
+        distinct_weekly_hour_buckets:
+          type: integer
+        flag_no_sleep:
+          type: boolean
+        flag_extreme_session:
+          type: boolean
+        flag_inhuman_career_rate:
+          type: boolean
+        flag_247:
+          type: boolean
+        flag_marathon:
+          type: boolean
+        suspicion_score:
+          type: integer
+        is_suspicious:
+          type: boolean
+        evidence:
+          $ref: "#/components/schemas/EvidenceSummary"
+
+    ShameHallResponse:
+      type: object
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameHallEntry"
+        total:
+          type: integer
+          format: int64
+        page:
+          type: integer
+          format: int64
+        limit:
+          type: integer
+          format: int64
+        total_pages:
+          type: integer
+          format: int64
+        suspicion_score_threshold:
+          type: integer
+        last_refreshed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    ShameDailyPoint:
+      type: object
+      properties:
+        day:
+          type: string
+          format: date
+        active_seconds:
+          type: integer
+        careers:
+          type: integer
+        fan_gain:
+          type: integer
+          format: int64
+        sessions:
+          type: integer
+        longest_session_sec:
+          type: integer
+        distinct_hours:
+          type: integer
+
+    ShameHeatmapCell:
+      type: object
+      properties:
+        dow:
+          type: integer
+          description: Day of week bucket from the analysis pipeline.
+        hour:
+          type: integer
+        active_seconds:
+          type: integer
+        careers:
+          type: integer
+
+    ShameTopSessionBreakdown:
+      type: object
+      properties:
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+        duration_seconds:
+          type: integer
+        active_seconds:
+          type: integer
+        idle_seconds:
+          type: integer
+        careers:
+          type: integer
+        fan_gain:
+          type: integer
+          format: int64
+
+    ShameTopSession:
+      type: object
+      properties:
+        day:
+          type: string
+          format: date
+        started_at:
+          type: string
+          format: date-time
+        ended_at:
+          type: string
+          format: date-time
+        playtime_seconds:
+          type: integer
+        observed_seconds:
+          type: integer
+        idle_seconds:
+          type: integer
+        careers:
+          type: integer
+        fan_gain:
+          type: integer
+          format: int64
+        session_count:
+          type: integer
+        longest_session_sec:
+          type: integer
+        distinct_hours:
+          type: integer
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameTopSessionBreakdown"
+
+    ShameShortCareerTimelineSnapshot:
+      type: object
+      properties:
+        snapshot_id:
+          type: integer
+          format: int64
+        circle_id:
+          type: integer
+          format: int64
+        snapshot_time:
+          type: string
+          format: date-time
+        fans:
+          type: integer
+          format: int64
+        last_login:
+          type: string
+          format: date-time
+        fan_delta:
+          type: integer
+          format: int64
+        gap_seconds:
+          type: integer
+        login_changed:
+          type: boolean
+        tight_gap:
+          type: boolean
+        career_count:
+          type: integer
+        active_seconds:
+          type: integer
+        observed_runtime_seconds:
+          type: integer
+
+    ShameShortCareerSnapshot:
+      type: object
+      properties:
+        rank:
+          type: integer
+        total_count:
+          type: integer
+        snapshot_id:
+          type: integer
+          format: int64
+        circle_id:
+          type: integer
+          format: int64
+        snapshot_time:
+          type: string
+          format: date-time
+        previous_snapshot_id:
+          type: integer
+          format: int64
+        previous_snapshot_time:
+          type: string
+          format: date-time
+        previous_snapshot_fans:
+          type: integer
+          format: int64
+        current_fans:
+          type: integer
+          format: int64
+        fan_gain:
+          type: integer
+          format: int64
+        snapshot_gap_seconds:
+          type: integer
+        previous_career_snapshot_time:
+          type: string
+          format: date-time
+        previous_career_gap_seconds:
+          type: integer
+        career_length_seconds:
+          type: integer
+        fans_per_minute:
+          type: number
+        short_training_score:
+          type: number
+        is_high_fan_short:
+          type: boolean
+        prior_snapshots:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameShortCareerTimelineSnapshot"
+        next_snapshots:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameShortCareerTimelineSnapshot"
+
+    ShameViewerReport:
+      type: object
+      properties:
+        score:
+          allOf:
+            - $ref: "#/components/schemas/ShameHallEntry"
+          nullable: true
+        daily:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameDailyPoint"
+        heatmap:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameHeatmapCell"
+        top_sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameTopSession"
+        short_career_snapshots:
+          type: array
+          items:
+            $ref: "#/components/schemas/ShameShortCareerSnapshot"
+        short_career_snapshots_total:
+          type: integer
+        last_refreshed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    ShameRefreshResult:
+      type: object
+      properties:
+        snapshots_processed:
+          type: integer
+          format: int64
+        viewers_scored:
+          type: integer
+          format: int64
+        last_snapshot_id:
+          type: integer
+          format: int64
+        duration_ms:
+          type: integer
+          format: int64
+
 security:
   - ApiKeyAuth: []
   - BrowserProofAuth: []
@@ -1612,9 +2069,144 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  # ── Suspicious Activity ─────────────────────────────────────
+  /api/v4/shame/hall:
+    get:
+      tags: [Shame]
+      summary: List suspicious activity entries
+      operationId: getHallOfShame
+      description: Returns paginated suspicious-activity summaries with evidence explanations. Defaults to the configured suspicious score threshold and at least 3 observed days.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            format: int64
+            default: 0
+          description: Page number (0-indexed)
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: int64
+            default: 50
+            minimum: 1
+            maximum: 200
+          description: Results per page
+        - name: sort_by
+          in: query
+          schema:
+            type: string
+            enum:
+              - score
+              - behavior_change
+              - short_fan_gain
+              - short_high_fan
+              - max_session
+              - longest_session
+              - online_streak
+              - careers_per_hour
+              - avg_careers_per_day
+              - avg_career_length
+              - careers
+              - active_time
+              - fans_per_minute
+              - peak_fans_per_minute
+              - reset_breaks
+              - long_hours
+              - probe_score
+              - career_quantization
+              - career_regularity
+              - login_regularity
+              - zero_idle
+              - burst_careers
+              - coactivity
+          description: Sort mode. Empty or omitted uses suspicion score descending.
+        - name: min_score
+          in: query
+          schema:
+            type: integer
+          description: Minimum suspicion score. Defaults to the server threshold.
+        - name: min_days
+          in: query
+          schema:
+            type: integer
+            default: 3
+          description: Minimum observed days.
+        - name: query
+          in: query
+          schema:
+            type: string
+          description: Search by viewer_id, current circle_id, trainer name, or current circle name.
+      responses:
+        "200":
+          description: Paginated suspicious activity entries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShameHallResponse"
+
+  /api/v4/shame/viewer/{viewer_id}:
+    get:
+      tags: [Shame]
+      summary: Get suspicious activity report for a viewer
+      operationId: getShameViewerReport
+      parameters:
+        - name: viewer_id
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+          description: Trainer account ID / viewer ID
+        - name: days
+          in: query
+          schema:
+            type: integer
+            format: int64
+            default: 60
+            minimum: 1
+            maximum: 365
+          description: Number of recent daily points to include.
+      responses:
+        "200":
+          description: Suspicious activity report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShameViewerReport"
+
+  /api/v4/shame/refresh:
+    post:
+      tags: [Shame]
+      summary: Rebuild suspicious activity analysis now
+      operationId: refreshShameAnalysis
+      description: Manual/debug endpoint. In production it requires `CHEAT_ANALYSIS_REFRESH_TOKEN` to be configured server-side and is intended for admin use.
+      parameters:
+        - name: full
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Accepted for backward compatibility; the Rust pipeline always performs a full rebuild.
+      responses:
+        "200":
+          description: Refresh result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ShameRefreshResult"
+        "403":
+          description: Refresh disabled or forbidden
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   # ── System ──────────────────────────────────────────────────
   /api/health:
     get:
+      security: []
       tags: [System]
       summary: Health check
       operationId: healthCheck
