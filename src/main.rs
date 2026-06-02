@@ -760,8 +760,7 @@ async fn backfill_email_hashes(pool: &PgPool) {
 }
 
 // Background task to refresh materialized views periodically
-// Background task that nulls out live_points / live_rank for circles
-// whose last_updated is older than 4 hours (stale live data).
+// Background task that nulls out stale live_points / live_rank for circles.
 async fn clear_stale_live_task(pool: PgPool) {
     info!("🔄 Starting stale live-data cleanup task (runs every hour)");
     tokio::time::sleep(tokio::time::Duration::from_secs(45)).await;
@@ -771,7 +770,8 @@ async fn clear_stale_live_task(pool: PgPool) {
              SET live_points = NULL, live_rank = NULL \
              WHERE (live_points IS NOT NULL OR live_rank IS NOT NULL) \
                AND (last_live_update IS NULL OR last_live_update < \
-                   (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp)"
+                                     (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp \
+                                     OR (last_updated IS NOT NULL AND last_updated > last_live_update))"
         )
         .execute(&pool)
         .await
