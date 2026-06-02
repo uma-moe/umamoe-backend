@@ -503,7 +503,8 @@ pub async fn list_circles(
     };
 
     let points_column = effective_points_sql("c");
-    let rank_column = rank_fallback_sql("c");
+    let rank_fallback_column = rank_fallback_sql("c");
+    let rank_column = format!("COALESCE(lr.live_rank::int, {})", rank_fallback_column);
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
@@ -513,7 +514,7 @@ pub async fn list_circles(
     let last_live_update_column = display_last_live_update_sql("c");
     // Build dynamic query
     let mut count_query = format!(
-        "{} SELECT COUNT(*) FROM circles c LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id {} WHERE 1=1",
+        "{} SELECT COUNT(*) FROM circles c LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id LEFT JOIN circle_live_ranks lr ON lr.circle_id = c.circle_id {} WHERE 1=1",
         with_clause,
         join_matching_circles
     );
@@ -545,6 +546,7 @@ pub async fn list_circles(
             {} as last_live_update
         FROM circles c
         LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id
+        LEFT JOIN circle_live_ranks lr ON lr.circle_id = c.circle_id
         {}
         WHERE 1=1
         "#,
@@ -599,8 +601,6 @@ pub async fn list_circles(
 
     // Add sorting
     let sort_by = params.sort_by.as_deref().unwrap_or("rank");
-    let use_rank_index = matches!(sort_by, "rank" | "monthly_rank")
-        || !matches!(sort_by, "name" | "member_count" | "monthly_point");
     let sort_dir = match params.sort_dir.as_deref() {
         Some(value) if value.eq_ignore_ascii_case("desc") => "DESC",
         _ => "ASC",
@@ -613,10 +613,7 @@ pub async fn list_circles(
             sort_dir
         ),
         "rank" | "monthly_rank" => {
-            format!(
-                " ORDER BY {} DESC NULLS LAST, c.circle_id ASC",
-                points_column
-            )
+            format!(" ORDER BY {} ASC NULLS LAST, c.circle_id ASC", rank_column)
         }
         "monthly_point" => format!(
             " ORDER BY {} {} NULLS LAST, c.circle_id ASC",
@@ -635,11 +632,7 @@ pub async fn list_circles(
 
     let circles_with_rank: Vec<CircleWithRank> = circles
         .into_iter()
-        .enumerate()
-        .map(|(index, mut circle)| {
-            if use_rank_index {
-                circle.monthly_rank = Some((offset + index as i64 + 1) as i32);
-            }
+        .map(|circle| {
             let effective_points = effective_circle_points(&circle);
             let club_rank = Some(compute_club_rank(
                 circle.monthly_rank,
