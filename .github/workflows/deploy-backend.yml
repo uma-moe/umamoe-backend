@@ -96,6 +96,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Verify migration inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD
+          sha384sum migrations/20251117000000_optimize_stats.sql
+          ls -la migrations/20260502000002_restore_circle_live_ranks_tally.sql
+          test ! -e migrations/20260531000001_restore_circle_live_ranks_tally.sql
+
       - name: Build backend image
         uses: docker/build-push-action@v6
         with:
@@ -378,7 +387,24 @@ jobs:
           fi
 
           if command -v curl >/dev/null 2>&1; then
-            curl -fsS "http://127.0.0.1:${host_port}/api/health" >/dev/null
+            router_ok="false"
+            for _ in $(seq 1 15); do
+              if curl -fsS "http://127.0.0.1:${host_port}/api/health" >/dev/null; then
+                router_ok="true"
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$router_ok" != "true" ]; then
+              echo "Router health check failed after switching to $new_container" >&2
+              docker ps --filter "name=${container_name}" --filter "name=${router_name}" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' || true
+              docker inspect --format '{{json .NetworkSettings.Networks}}' "$new_container" || true
+              docker exec "$router_name" sh -c 'cat /etc/nginx/conf.d/default.conf && nginx -t' || true
+              docker logs --tail=120 "$router_name" || true
+              docker logs --tail=120 "$new_container" || true
+              exit 1
+            fi
           fi
 
           docker rm -f "$container_name" >/dev/null 2>&1 || true
@@ -645,7 +671,24 @@ jobs:
           fi
 
           if command -v curl >/dev/null 2>&1; then
-            curl -fsS "http://127.0.0.1:${host_port}/api/health" >/dev/null
+            router_ok="false"
+            for _ in $(seq 1 15); do
+              if curl -fsS "http://127.0.0.1:${host_port}/api/health" >/dev/null; then
+                router_ok="true"
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "$router_ok" != "true" ]; then
+              echo "Router health check failed after switching to $new_container" >&2
+              docker ps --filter "name=${container_name}" --filter "name=${router_name}" --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' || true
+              docker inspect --format '{{json .NetworkSettings.Networks}}' "$new_container" || true
+              docker exec "$router_name" sh -c 'cat /etc/nginx/conf.d/default.conf && nginx -t' || true
+              docker logs --tail=120 "$router_name" || true
+              docker logs --tail=120 "$new_container" || true
+              exit 1
+            fi
           fi
 
           docker rm -f "$container_name" >/dev/null 2>&1 || true
