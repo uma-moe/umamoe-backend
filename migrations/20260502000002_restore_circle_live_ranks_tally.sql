@@ -43,8 +43,8 @@ SELECT
 FROM circles c
 CROSS JOIN time_bounds tb
 WHERE (c.archived IS NULL OR c.archived = false)
-    AND c.last_updated >= date_trunc('month',
-                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days');
+  AND c.last_updated >= date_trunc('month',
+        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days');
 
 CREATE UNIQUE INDEX idx_circle_live_ranks_id ON circle_live_ranks (circle_id);
 CREATE INDEX idx_circle_live_ranks_rank ON circle_live_ranks (live_rank);
