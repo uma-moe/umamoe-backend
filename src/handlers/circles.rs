@@ -599,6 +599,8 @@ pub async fn list_circles(
 
     // Add sorting
     let sort_by = params.sort_by.as_deref().unwrap_or("rank");
+    let use_rank_index = matches!(sort_by, "rank" | "monthly_rank")
+        || !matches!(sort_by, "name" | "member_count" | "monthly_point");
     let sort_dir = match params.sort_dir.as_deref() {
         Some(value) if value.eq_ignore_ascii_case("desc") => "DESC",
         _ => "ASC",
@@ -611,7 +613,10 @@ pub async fn list_circles(
             sort_dir
         ),
         "rank" | "monthly_rank" => {
-            format!(" ORDER BY {} ASC NULLS LAST, c.circle_id ASC", rank_column)
+            format!(
+                " ORDER BY {} DESC NULLS LAST, c.circle_id ASC",
+                points_column
+            )
         }
         "monthly_point" => format!(
             " ORDER BY {} {} NULLS LAST, c.circle_id ASC",
@@ -630,7 +635,11 @@ pub async fn list_circles(
 
     let circles_with_rank: Vec<CircleWithRank> = circles
         .into_iter()
-        .map(|circle| {
+        .enumerate()
+        .map(|(index, mut circle)| {
+            if use_rank_index {
+                circle.monthly_rank = Some((offset + index as i64 + 1) as i32);
+            }
             let effective_points = effective_circle_points(&circle);
             let club_rank = Some(compute_club_rank(
                 circle.monthly_rank,
