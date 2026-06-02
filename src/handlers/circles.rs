@@ -220,13 +220,13 @@ fn display_live_points_sql(alias: &str) -> String {
     )
 }
 
-fn display_live_rank_sql(alias: &str) -> String {
+fn display_live_rank_expr_sql(alias: &str, live_rank_expr: &str) -> String {
     format!(
-        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {}.live_rank END",
+        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {} END",
         post_tally_display_sql(),
         tallying_sql(),
         archived_sql(alias),
-        alias,
+        live_rank_expr,
     )
 }
 
@@ -510,7 +510,8 @@ pub async fn list_circles(
     let yesterday_points_column = display_yesterday_points_sql("c");
     let yesterday_rank_column = display_yesterday_rank_sql("c");
     let live_points_column = display_live_points_sql("c");
-    let live_rank_column = display_live_rank_sql("c");
+    let live_rank_column =
+        display_live_rank_expr_sql("c", "COALESCE(lr.live_rank::int, c.live_rank)");
     let last_live_update_column = display_last_live_update_sql("c");
     // Build dynamic query
     let mut count_query = format!(
@@ -927,13 +928,15 @@ async fn fetch_boundary_points_last_month(
 
 /// Fetch circle by ID
 async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, AppError> {
-    let rank_column = rank_fallback_sql("c");
+    let rank_fallback_column = rank_fallback_sql("c");
+    let rank_column = format!("COALESCE(lr.live_rank::int, {})", rank_fallback_column);
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
     let yesterday_rank_column = display_yesterday_rank_sql("c");
     let live_points_column = display_live_points_sql("c");
-    let live_rank_column = display_live_rank_sql("c");
+    let live_rank_column =
+        display_live_rank_expr_sql("c", "COALESCE(lr.live_rank::int, c.live_rank)");
     let last_live_update_column = display_last_live_update_sql("c");
 
     let circle = sqlx::query_as::<_, Circle>(&format!(
@@ -962,6 +965,7 @@ async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, App
             {} as last_live_update
         FROM circles c
         LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id
+        LEFT JOIN circle_live_ranks lr ON lr.circle_id = c.circle_id
         WHERE c.circle_id = $1
         "#,
         name_column,
