@@ -766,12 +766,16 @@ async fn clear_stale_live_task(pool: PgPool) {
     tokio::time::sleep(tokio::time::Duration::from_secs(45)).await;
     loop {
         match sqlx::query(
-            "UPDATE circles \
-             SET live_points = NULL, live_rank = NULL \
-             WHERE (live_points IS NOT NULL OR live_rank IS NOT NULL) \
-               AND (last_live_update IS NULL OR last_live_update < \
-                                     (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp \
-                                     OR (last_updated IS NOT NULL AND last_updated > last_live_update))"
+                        r#"
+                        UPDATE circles
+                        SET live_points = NULL, live_rank = NULL
+                        WHERE (live_points IS NOT NULL OR live_rank IS NOT NULL)
+                            AND (
+                                last_live_update IS NULL
+                                OR last_live_update < (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp
+                                OR (last_updated IS NOT NULL AND last_updated > last_live_update)
+                            )
+                        "#,
         )
         .execute(&pool)
         .await

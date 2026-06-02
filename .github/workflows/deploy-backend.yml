@@ -407,7 +407,11 @@ jobs:
             fi
           fi
 
-          docker rm -f "$container_name" >/dev/null 2>&1 || true
+          if [ -n "$active_color" ]; then
+            old_container="${container_name}-${active_color}"
+            echo "Cleaning up old container: $old_container"
+            docker rm -f "$old_container" >/dev/null 2>&1 || true
+          fi
 
           rm -f "$archive"
           docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
@@ -691,7 +695,11 @@ jobs:
             fi
           fi
 
-          docker rm -f "$container_name" >/dev/null 2>&1 || true
+          if [ -n "$active_color" ]; then
+            old_container="${container_name}-${active_color}"
+            echo "Cleaning up old container: $old_container"
+            docker rm -f "$old_container" >/dev/null 2>&1 || true
+          fi
 
           rm -f "$archive"
           docker image prune -f --filter "until=168h" >/dev/null 2>&1 || true
