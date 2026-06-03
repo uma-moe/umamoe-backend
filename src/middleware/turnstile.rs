@@ -625,7 +625,7 @@ pub async fn verify_internal_credential(
                 let context_matches_proof = context
                     .context_host
                     .as_ref()
-                    .map(|host| host == &claims.host);
+                    .map(|host| browser_proof_context_matches(host, &claims.host));
                 if context_matches_proof == Some(false) {
                     warn!(
                         "Internal credential verifier rejected browser proof context mismatch: proof host {}, context {:?}, ip {}",
@@ -1128,6 +1128,37 @@ fn allowed_request_referer(referer: &str) -> bool {
     false
 }
 
+fn browser_proof_context_matches(context_host: &str, proof_host: &str) -> bool {
+    let context_host = normalize_hostname_for_match(context_host);
+    let proof_host = normalize_hostname_for_match(proof_host);
+    if context_host.is_empty() || proof_host.is_empty() {
+        return false;
+    }
+
+    if context_host == proof_host {
+        return true;
+    }
+
+    let context_site = strip_www_prefix(&context_host);
+    let proof_site = strip_www_prefix(&proof_host);
+    if context_site == proof_site {
+        return true;
+    }
+
+    allowed_turnstile_host(proof_site)
+        && context_site
+            .strip_suffix(proof_site)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn normalize_hostname_for_match(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn strip_www_prefix(host: &str) -> &str {
+    host.strip_prefix("www.").unwrap_or(host)
+}
+
 fn internal_verification_context(
     headers: &HeaderMap,
     payload: &InternalCredentialVerificationRequest,
@@ -1160,8 +1191,7 @@ fn internal_verification_context(
     let host = payload
         .host
         .clone()
-        .or_else(|| header_str(headers, "X-Original-Host").map(ToOwned::to_owned))
-        .or_else(|| header_str(headers, "Host").map(ToOwned::to_owned));
+        .or_else(|| header_str(headers, "X-Original-Host").map(ToOwned::to_owned));
     let allowed_browser_context = origin
         .as_deref()
         .map(allowed_request_origin)
