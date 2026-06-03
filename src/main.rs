@@ -452,11 +452,13 @@ async fn main() -> anyhow::Result<()> {
         "CF-Turnstile-Token".parse().unwrap(),
         "X-Turnstile-Token".parse().unwrap(),
         "X-Browser-Proof".parse().unwrap(),
+        "X-Browser-Proof-Source".parse().unwrap(),
         "X-API-Key".parse().unwrap(),
     ])
     .expose_headers([
         "X-Browser-Proof".parse().unwrap(),
         "X-Browser-Proof-TTL".parse().unwrap(),
+        "X-Browser-Proof-Source".parse().unwrap(),
     ]);
 
     // Build the application with proper routing and middleware
