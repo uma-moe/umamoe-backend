@@ -67,6 +67,67 @@ struct TurnstileVerifyResponse {
     action: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct InternalCredentialVerificationRequest {
+    method: Option<String>,
+    path: Option<String>,
+    origin: Option<String>,
+    referer: Option<String>,
+    host: Option<String>,
+    record_usage: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct InternalBrowserProofRequest {
+    origin: Option<String>,
+    referer: Option<String>,
+    host: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalCredentialVerificationResponse {
+    valid: bool,
+    credential: &'static str,
+    message: &'static str,
+    usage_recorded: bool,
+    context: InternalVerificationContext,
+    api_key: Option<InternalApiKeyVerification>,
+    browser_proof: Option<InternalBrowserProofVerification>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalVerificationContext {
+    method: String,
+    path: String,
+    endpoint: String,
+    origin: Option<String>,
+    referer: Option<String>,
+    host: Option<String>,
+    client_ip: String,
+    allowed_browser_context: bool,
+    context_host: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalApiKeyVerification {
+    id: Uuid,
+    user_id: Uuid,
+    name: String,
+    usage_recorded: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalBrowserProofVerification {
+    subject: String,
+    user_id: Option<Uuid>,
+    issued_at: usize,
+    expires_at: usize,
+    action: String,
+    host: String,
+    context_matches_proof: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserProofClaims {
     typ: String,
@@ -258,7 +319,7 @@ async fn authorize_browser_request(
 
     // Let the first browser page load bootstrap its proof on a safe read.
     if can_bootstrap_browser_read(&method, &headers) {
-        let limit = env_u32("API_BROWSER_BOOTSTRAP_READS_PER_MINUTE", 6);
+        let limit = env_u32("API_BROWSER_BOOTSTRAP_READS_PER_MINUTE", 1);
         if let Some(retry_after) = check_rate_limit(
             format!("browser-bootstrap:{}", client_ip),
             limit,
@@ -372,8 +433,14 @@ pub async fn issue_internal_browser_proof(
     State(state): State<AppState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
+    payload: Option<Json<InternalBrowserProofRequest>>,
 ) -> Response {
     let client_ip = extract_client_ip(&headers, connect_info.map(|ci| ci.0));
+    let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
+    let headers = match internal_browser_context_headers(headers, &payload) {
+        Ok(headers) => headers,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
+    };
     let limit = env_u32("BROWSER_PROOF_INTERNAL_REQUESTS_PER_MINUTE", 120);
     if let Some(retry_after) = check_rate_limit(
         format!("proof-internal-ip:{}", client_ip),
@@ -423,6 +490,211 @@ pub async fn issue_internal_browser_proof(
             )
         }
     }
+}
+
+fn internal_browser_context_headers(
+    mut headers: HeaderMap,
+    payload: &InternalBrowserProofRequest,
+) -> Result<HeaderMap, &'static str> {
+    if let Some(origin) = payload
+        .origin
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let value = HeaderValue::from_str(origin.trim()).map_err(|_| "invalid_origin")?;
+        headers.insert("Origin", value);
+    }
+
+    if let Some(referer) = payload
+        .referer
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let value = HeaderValue::from_str(referer.trim()).map_err(|_| "invalid_referer")?;
+        headers.insert("Referer", value);
+    }
+
+    if let Some(host) = payload
+        .host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let value = HeaderValue::from_str(host.trim()).map_err(|_| "invalid_host")?;
+        headers.insert("Host", value);
+    }
+
+    Ok(headers)
+}
+
+pub async fn verify_internal_credential(
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    payload: Option<Json<InternalCredentialVerificationRequest>>,
+) -> Response {
+    let client_ip = extract_client_ip(&headers, connect_info.map(|ci| ci.0));
+    let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
+    let context = internal_verification_context(&headers, &payload, client_ip);
+    let should_record_usage = payload.record_usage.unwrap_or(true);
+
+    if let Some(raw_key) = extract_api_token(&headers) {
+        if raw_key.trim().is_empty() {
+            return internal_verification_error(
+                StatusCode::UNAUTHORIZED,
+                "api_key",
+                context,
+                "invalid_api_key",
+            );
+        }
+
+        match crate::middleware::api_key::resolve_api_key(&state.db, raw_key).await {
+            Ok(Some(key)) => {
+                let mut usage_recorded = false;
+                if should_record_usage && !state.user_writes_disabled {
+                    match crate::middleware::api_key::record_api_key_usage(
+                        &state.db,
+                        &key,
+                        &context.endpoint,
+                    )
+                    .await
+                    {
+                        Ok(()) => usage_recorded = true,
+                        Err(error) => {
+                            warn!(
+                                "Internal credential verifier failed to record API key usage: {}",
+                                error
+                            );
+                        }
+                    }
+                }
+
+                return (
+                    StatusCode::OK,
+                    Json(InternalCredentialVerificationResponse {
+                        valid: true,
+                        credential: "api_key",
+                        message: if usage_recorded {
+                            "valid_api_key_usage_recorded"
+                        } else {
+                            "valid_api_key"
+                        },
+                        usage_recorded,
+                        context,
+                        api_key: Some(InternalApiKeyVerification {
+                            id: key.id,
+                            user_id: key.user_id,
+                            name: key.name,
+                            usage_recorded,
+                        }),
+                        browser_proof: None,
+                        error: None,
+                    }),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                warn!(
+                    "Internal credential verifier rejected invalid API key from ip {}",
+                    context.client_ip
+                );
+                return internal_verification_error(
+                    StatusCode::UNAUTHORIZED,
+                    "api_key",
+                    context,
+                    "invalid_api_key",
+                );
+            }
+            Err(error) => {
+                error!(
+                    "Internal credential verifier API key lookup failed: {}",
+                    error
+                );
+                return internal_verification_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_key",
+                    context,
+                    "api_key_lookup_failed",
+                );
+            }
+        }
+    }
+
+    if let Some(proof) = extract_browser_proof(&headers) {
+        match verify_browser_proof(proof, state.redis_store.as_ref()).await {
+            Ok(claims) => {
+                let context_matches_proof = context
+                    .context_host
+                    .as_ref()
+                    .map(|host| host == &claims.host);
+                if context_matches_proof == Some(false) {
+                    warn!(
+                        "Internal credential verifier rejected browser proof context mismatch: proof host {}, context {:?}, ip {}",
+                        claims.host, context.context_host, context.client_ip
+                    );
+                    return internal_verification_error(
+                        StatusCode::FORBIDDEN,
+                        "browser_proof",
+                        context,
+                        "browser_context_mismatch",
+                    );
+                }
+
+                return (
+                    StatusCode::OK,
+                    Json(InternalCredentialVerificationResponse {
+                        valid: true,
+                        credential: "browser_proof",
+                        message: "valid_browser_proof",
+                        usage_recorded: false,
+                        context,
+                        api_key: None,
+                        browser_proof: Some(InternalBrowserProofVerification {
+                            subject: claims.sub,
+                            user_id: claims.uid,
+                            issued_at: claims.iat,
+                            expires_at: claims.exp,
+                            action: claims.action,
+                            host: claims.host,
+                            context_matches_proof,
+                        }),
+                        error: None,
+                    }),
+                )
+                    .into_response();
+            }
+            Err(BrowserProofError::Invalid(error)) => {
+                warn!(
+                    "Internal credential verifier rejected invalid browser proof from ip {}: {}",
+                    context.client_ip, error
+                );
+                return internal_verification_error(
+                    StatusCode::UNAUTHORIZED,
+                    "browser_proof",
+                    context,
+                    "invalid_browser_proof",
+                );
+            }
+            Err(BrowserProofError::Store(error)) => {
+                error!(
+                    "Internal credential verifier browser proof store unavailable: {}",
+                    error
+                );
+                return internal_verification_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "browser_proof",
+                    context,
+                    "browser_proof_unavailable",
+                );
+            }
+        }
+    }
+
+    internal_verification_error(
+        StatusCode::BAD_REQUEST,
+        "none",
+        context,
+        "credential_required",
+    )
 }
 
 async fn validate_turnstile_token(
@@ -677,6 +949,12 @@ fn extract_browser_proof(headers: &HeaderMap) -> Option<&str> {
         .or_else(|| cookie_value(headers, BROWSER_PROOF_COOKIE))
 }
 
+fn extract_api_token(headers: &HeaderMap) -> Option<&str> {
+    header_str(headers, "X-API-Key")
+        .or_else(|| header_str(headers, "X-API-Token"))
+        .or_else(|| header_str(headers, "X-API-Tokens"))
+}
+
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     header_str(headers, AUTHORIZATION.as_str())?.strip_prefix("Bearer ")
 }
@@ -848,6 +1126,115 @@ fn allowed_request_referer(referer: &str) -> bool {
     }
 
     false
+}
+
+fn internal_verification_context(
+    headers: &HeaderMap,
+    payload: &InternalCredentialVerificationRequest,
+    client_ip: String,
+) -> InternalVerificationContext {
+    let method = payload
+        .method
+        .as_deref()
+        .or_else(|| header_str(headers, "X-Original-Method"))
+        .or_else(|| header_str(headers, "X-Forwarded-Method"))
+        .unwrap_or("UNKNOWN")
+        .trim()
+        .to_ascii_uppercase();
+    let path = payload
+        .path
+        .as_deref()
+        .or_else(|| header_str(headers, "X-Original-Path"))
+        .or_else(|| header_str(headers, "X-Original-Uri"))
+        .or_else(|| header_str(headers, "X-Forwarded-Uri"))
+        .map(normalize_context_path)
+        .unwrap_or_else(|| "/internal/unknown".to_string());
+    let origin = payload
+        .origin
+        .clone()
+        .or_else(|| header_str(headers, "Origin").map(ToOwned::to_owned));
+    let referer = payload
+        .referer
+        .clone()
+        .or_else(|| header_str(headers, "Referer").map(ToOwned::to_owned));
+    let host = payload
+        .host
+        .clone()
+        .or_else(|| header_str(headers, "X-Original-Host").map(ToOwned::to_owned))
+        .or_else(|| header_str(headers, "Host").map(ToOwned::to_owned));
+    let allowed_browser_context = origin
+        .as_deref()
+        .map(allowed_request_origin)
+        .or_else(|| referer.as_deref().map(allowed_request_referer))
+        .unwrap_or(false);
+    let context_host = origin
+        .as_deref()
+        .and_then(uri_host)
+        .or_else(|| referer.as_deref().and_then(uri_host))
+        .or_else(|| host.as_deref().and_then(header_host));
+    let endpoint = crate::middleware::api_key::normalize_endpoint(&method, &path);
+
+    InternalVerificationContext {
+        method,
+        path,
+        endpoint,
+        origin,
+        referer,
+        host,
+        client_ip,
+        allowed_browser_context,
+        context_host,
+    }
+}
+
+fn normalize_context_path(path: &str) -> String {
+    let path = path.trim().split('?').next().unwrap_or(path).trim();
+    if path.is_empty() {
+        "/internal/unknown".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    }
+}
+
+fn uri_host(value: &str) -> Option<String> {
+    let uri = value.parse::<axum::http::Uri>().ok()?;
+    uri.host().map(|host| host.to_ascii_lowercase())
+}
+
+fn header_host(value: &str) -> Option<String> {
+    let value = value.trim();
+    let host = if let Some(bracketed) = value.strip_prefix('[') {
+        bracketed.split(']').next()?
+    } else {
+        value.split(':').next()?
+    }
+    .trim();
+
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+fn internal_verification_error(
+    status: StatusCode,
+    credential: &'static str,
+    context: InternalVerificationContext,
+    error: &'static str,
+) -> Response {
+    (
+        status,
+        Json(InternalCredentialVerificationResponse {
+            valid: false,
+            credential,
+            message: error,
+            usage_recorded: false,
+            context,
+            api_key: None,
+            browser_proof: None,
+            error: Some(error.to_string()),
+        }),
+    )
+        .into_response()
 }
 
 fn allowed_hosts() -> Vec<String> {

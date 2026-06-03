@@ -37,6 +37,34 @@ pub async fn resolve_api_key(
     .await
 }
 
+pub async fn record_api_key_usage(
+    db: &sqlx::PgPool,
+    key: &ApiKeyRecord,
+    endpoint: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE api_keys SET last_used = NOW(), total_requests = total_requests + 1 WHERE id = $1",
+    )
+    .bind(key.id)
+    .execute(db)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_usage (api_key_id, endpoint, date, requests)
+        VALUES ($1, $2, CURRENT_DATE, 1)
+        ON CONFLICT (api_key_id, endpoint, date)
+        DO UPDATE SET requests = api_key_usage.requests + 1
+        "#,
+    )
+    .bind(key.id)
+    .bind(endpoint)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
 /// Middleware layer that optionally resolves an `X-API-Key` header.
 ///
 /// * If the header is present and valid → updates `last_used`, bumps counters,
@@ -86,25 +114,7 @@ pub async fn api_key_tracking_middleware(
                     );
 
                     // Bump counters (best-effort)
-                    let _ = sqlx::query(
-                        "UPDATE api_keys SET last_used = NOW(), total_requests = total_requests + 1 WHERE id = $1",
-                    )
-                    .bind(key.id)
-                    .execute(&db)
-                    .await;
-
-                    let _ = sqlx::query(
-                        r#"
-                        INSERT INTO api_key_usage (api_key_id, endpoint, date, requests)
-                        VALUES ($1, $2, CURRENT_DATE, 1)
-                        ON CONFLICT (api_key_id, endpoint, date)
-                        DO UPDATE SET requests = api_key_usage.requests + 1
-                        "#,
-                    )
-                    .bind(key.id)
-                    .bind(&endpoint)
-                    .execute(&db)
-                    .await;
+                    let _ = record_api_key_usage(&db, &key, &endpoint).await;
                 }
                 Ok(None) => {
                     warn!(
@@ -125,7 +135,7 @@ pub async fn api_key_tracking_middleware(
 
 /// Collapse path parameters into placeholders so endpoint grouping is useful.
 /// `/api/v4/circles/123` → `GET /api/v4/circles/:id`
-fn normalize_endpoint(method: &str, path: &str) -> String {
+pub(crate) fn normalize_endpoint(method: &str, path: &str) -> String {
     let segments: Vec<&str> = path.split('/').collect();
     let normalized: Vec<&str> = segments
         .iter()

@@ -1,6 +1,11 @@
-use axum::{http::StatusCode, response::Json, routing::get, Router};
+use axum::{
+    http::StatusCode,
+    response::{IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
 use sqlx::PgPool;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info, warn, Level};
@@ -360,14 +365,15 @@ async fn main() -> anyhow::Result<()> {
     // Start background task to incrementally refresh suspicious-activity analysis
     tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
 
-    let internal_proof_host =
-        std::env::var("BROWSER_PROOF_INTERNAL_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let internal_proof_port = std::env::var("BROWSER_PROOF_INTERNAL_PORT")
+    let internal_api_host = std::env::var("INTERNAL_API_HOST")
+        .or_else(|_| std::env::var("BROWSER_PROOF_INTERNAL_HOST"))
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    let internal_api_port = std::env::var("INTERNAL_API_PORT")
+        .or_else(|_| std::env::var("BROWSER_PROOF_INTERNAL_PORT"))
         .unwrap_or_else(|_| "3201".to_string())
         .parse::<u16>()
-        .expect("BROWSER_PROOF_INTERNAL_PORT must be a valid number");
-    spawn_internal_browser_proof_server(state.clone(), internal_proof_host, internal_proof_port)
-        .await?;
+        .expect("INTERNAL_API_PORT must be a valid number");
+    spawn_internal_auth_server(state.clone(), internal_api_host, internal_api_port).await?;
 
     // Configure CORS - more permissive for development, strict for production
     let is_development = std::env::var("DEBUG_MODE").unwrap_or_default() == "true";
@@ -641,7 +647,7 @@ async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     })))
 }
 
-async fn spawn_internal_browser_proof_server(
+async fn spawn_internal_auth_server(
     state: AppState,
     host: String,
     port: u16,
@@ -649,16 +655,18 @@ async fn spawn_internal_browser_proof_server(
     let app = Router::new()
         .route(
             "/api/auth/browser-proof/internal",
-            axum::routing::post(middleware::turnstile::issue_internal_browser_proof),
+            post(middleware::turnstile::issue_internal_browser_proof),
         )
+        .route(
+            "/api/auth/verify/internal",
+            post(middleware::turnstile::verify_internal_credential),
+        )
+        .layer(axum::middleware::from_fn(internal_network_only_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
-    info!(
-        "🔒 Internal browser proof issuer listening on http://{}:{}",
-        host, port
-    );
+    info!("🔒 Internal auth API listening on http://{}:{}", host, port);
 
     tokio::spawn(async move {
         if let Err(error) = axum::serve(
@@ -667,11 +675,58 @@ async fn spawn_internal_browser_proof_server(
         )
         .await
         {
-            error!("Internal browser proof issuer stopped: {}", error);
+            error!("Internal auth API stopped: {}", error);
         }
     });
 
     Ok(())
+}
+
+async fn internal_network_only_middleware(
+    connect_info: Option<axum::extract::ConnectInfo<SocketAddr>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(addr) = connect_info.map(|ci| ci.0) else {
+        return internal_forbidden("missing_connect_info");
+    };
+
+    if !is_internal_client_ip(addr.ip()) {
+        warn!(
+            "Rejected internal API request from non-private address {}",
+            addr.ip()
+        );
+        return internal_forbidden("internal_network_required");
+    }
+
+    next.run(request).await
+}
+
+fn internal_forbidden(error: &'static str) -> axum::response::Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "valid": false,
+            "error": error,
+            "status": StatusCode::FORBIDDEN.as_u16()
+        })),
+    )
+        .into_response()
+}
+
+fn is_internal_client_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            ip.is_loopback() || ip.is_private() || (octets[0] == 169 && octets[1] == 254)
+        }
+        IpAddr::V6(ip) => {
+            let first_segment = ip.segments()[0];
+            ip.is_loopback()
+                || (first_segment & 0xfe00) == 0xfc00
+                || (first_segment & 0xffc0) == 0xfe80
+        }
+    }
 }
 
 /// One-time startup backfill: hash any plaintext emails still in the database.
@@ -773,7 +828,10 @@ async fn clear_stale_live_task(pool: PgPool) {
                             AND (
                                 last_live_update IS NULL
                                 OR last_live_update < (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp
-                                OR (last_updated IS NOT NULL AND last_updated > last_live_update)
+                                OR (
+                                    last_updated IS NOT NULL
+                                    AND last_updated > last_live_update + interval '10 minutes'
+                                )
                             )
                         "#,
         )
