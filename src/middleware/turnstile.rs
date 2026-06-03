@@ -441,7 +441,7 @@ pub async fn issue_internal_browser_proof(
         Ok(headers) => headers,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
     };
-    let limit = env_u32("BROWSER_PROOF_INTERNAL_REQUESTS_PER_MINUTE", 120);
+    let limit = env_u32("BROWSER_PROOF_INTERNAL_REQUESTS_PER_MINUTE", 12000);
     if let Some(retry_after) = check_rate_limit(
         format!("proof-internal-ip:{}", client_ip),
         limit,
@@ -1199,9 +1199,9 @@ fn internal_verification_context(
         .unwrap_or(false);
     let context_host = origin
         .as_deref()
-        .and_then(uri_host)
-        .or_else(|| referer.as_deref().and_then(uri_host))
-        .or_else(|| host.as_deref().and_then(header_host));
+        .and_then(browser_context_uri_host)
+        .or_else(|| referer.as_deref().and_then(browser_context_uri_host))
+        .or_else(|| host.as_deref().and_then(browser_context_header_host));
     let endpoint = crate::middleware::api_key::normalize_endpoint(&method, &path);
 
     InternalVerificationContext {
@@ -1233,6 +1233,16 @@ fn uri_host(value: &str) -> Option<String> {
     uri.host().map(|host| host.to_ascii_lowercase())
 }
 
+fn browser_context_uri_host(value: &str) -> Option<String> {
+    let host = uri_host(value)?;
+    is_browser_context_host(&host).then_some(host)
+}
+
+fn browser_context_header_host(value: &str) -> Option<String> {
+    let host = header_host(value)?;
+    is_browser_context_host(&host).then_some(host)
+}
+
 fn header_host(value: &str) -> Option<String> {
     let value = value.trim();
     let host = if let Some(bracketed) = value.strip_prefix('[') {
@@ -1243,6 +1253,14 @@ fn header_host(value: &str) -> Option<String> {
     .trim();
 
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+fn is_browser_context_host(host: &str) -> bool {
+    let host = strip_www_prefix(&normalize_hostname_for_match(host)).to_string();
+    allowed_hosts().iter().any(|allowed| {
+        let allowed = strip_www_prefix(allowed);
+        host == allowed || host.ends_with(&format!(".{}", allowed))
+    })
 }
 
 fn internal_verification_error(
