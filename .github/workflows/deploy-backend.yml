@@ -344,6 +344,28 @@ jobs:
               keepalive 32;
           }
 
+          upstream internal_backend {
+              server ${new_container}:${internal_app_port};
+              keepalive 16;
+          }
+
+          server {
+              listen ${internal_app_port};
+              access_log off;
+
+              location / {
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_read_timeout 60s;
+                  proxy_send_timeout 60s;
+                  proxy_pass http://internal_backend;
+              }
+          }
+
           server {
               listen 80;
               access_log off;
@@ -365,12 +387,18 @@ jobs:
           if docker inspect "$router_name" >/dev/null 2>&1; then
             docker exec "$router_name" nginx -t
             docker exec "$router_name" nginx -s reload
+            router_aliases="$(docker inspect --format "{{range .NetworkSettings.Networks}}{{range .Aliases}}{{println .}}{{end}}{{end}}" "$router_name" 2>/dev/null || true)"
+            if ! printf '%s\n' "$router_aliases" | grep -qx "$container_name"; then
+              docker network disconnect "$network_name" "$router_name" >/dev/null 2>&1 || true
+              docker network connect --alias "$container_name" "$network_name" "$router_name" >/dev/null
+            fi
           else
             docker rm -f "$router_name" >/dev/null 2>&1 || true
             if ! docker run -d \
               --name "$router_name" \
               --restart unless-stopped \
               --network "$network_name" \
+              --network-alias "$container_name" \
               -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
               -p "127.0.0.1:${host_port}:80" \
               "$router_image"; then
@@ -380,6 +408,7 @@ jobs:
                 --name "$router_name" \
                 --restart unless-stopped \
                 --network "$network_name" \
+                --network-alias "$container_name" \
                 -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
                 -p "127.0.0.1:${host_port}:80" \
                 "$router_image"
@@ -632,6 +661,28 @@ jobs:
               keepalive 32;
           }
 
+          upstream internal_backend {
+              server ${new_container}:${internal_app_port};
+              keepalive 16;
+          }
+
+          server {
+              listen ${internal_app_port};
+              access_log off;
+
+              location / {
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+                  proxy_read_timeout 60s;
+                  proxy_send_timeout 60s;
+                  proxy_pass http://internal_backend;
+              }
+          }
+
           server {
               listen 80;
               access_log off;
@@ -653,12 +704,18 @@ jobs:
           if docker inspect "$router_name" >/dev/null 2>&1; then
             docker exec "$router_name" nginx -t
             docker exec "$router_name" nginx -s reload
+            router_aliases="$(docker inspect --format "{{range .NetworkSettings.Networks}}{{range .Aliases}}{{println .}}{{end}}{{end}}" "$router_name" 2>/dev/null || true)"
+            if ! printf '%s\n' "$router_aliases" | grep -qx "$container_name"; then
+              docker network disconnect "$network_name" "$router_name" >/dev/null 2>&1 || true
+              docker network connect --alias "$container_name" "$network_name" "$router_name" >/dev/null
+            fi
           else
             docker rm -f "$router_name" >/dev/null 2>&1 || true
             if ! docker run -d \
               --name "$router_name" \
               --restart unless-stopped \
               --network "$network_name" \
+              --network-alias "$container_name" \
               -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
               -p "127.0.0.1:${host_port}:80" \
               "$router_image"; then
@@ -668,6 +725,7 @@ jobs:
                 --name "$router_name" \
                 --restart unless-stopped \
                 --network "$network_name" \
+                --network-alias "$container_name" \
                 -v "$router_config:/etc/nginx/conf.d/default.conf:ro" \
                 -p "127.0.0.1:${host_port}:80" \
                 "$router_image"
