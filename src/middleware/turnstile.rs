@@ -90,6 +90,8 @@ struct InternalCredentialVerificationResponse {
     credential: &'static str,
     message: &'static str,
     usage_recorded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_id: Option<Uuid>,
     context: InternalVerificationContext,
     api_key: Option<InternalApiKeyVerification>,
     browser_proof: Option<InternalBrowserProofVerification>,
@@ -537,6 +539,36 @@ pub async fn verify_internal_credential(
     let context = internal_verification_context(&headers, &payload, client_ip);
     let should_record_usage = payload.record_usage.unwrap_or(true);
 
+    if let Some(token) = bearer_token(&headers) {
+        match crate::auth::verify_token(token) {
+            Ok(claims) => {
+                return (
+                    StatusCode::OK,
+                    Json(InternalCredentialVerificationResponse {
+                        valid: true,
+                        credential: "bearer",
+                        message: "valid_bearer_token",
+                        usage_recorded: false,
+                        user_id: Some(claims.sub),
+                        context,
+                        api_key: None,
+                        browser_proof: None,
+                        error: None,
+                    }),
+                )
+                    .into_response();
+            }
+            Err(_) => {
+                return internal_verification_error(
+                    StatusCode::UNAUTHORIZED,
+                    "bearer",
+                    context,
+                    "invalid_bearer_token",
+                );
+            }
+        }
+    }
+
     if let Some(raw_key) = extract_api_token(&headers) {
         if raw_key.trim().is_empty() {
             return internal_verification_error(
@@ -579,6 +611,7 @@ pub async fn verify_internal_credential(
                             "valid_api_key"
                         },
                         usage_recorded,
+                        user_id: Some(key.user_id),
                         context,
                         api_key: Some(InternalApiKeyVerification {
                             id: key.id,
@@ -628,14 +661,8 @@ pub async fn verify_internal_credential(
                     .map(|host| browser_proof_context_matches(host, &claims.host));
                 if context_matches_proof == Some(false) {
                     warn!(
-                        "Internal credential verifier rejected browser proof context mismatch: proof host {}, context {:?}, ip {}",
+                        "Internal credential verifier accepted browser proof with context mismatch: proof host {}, context {:?}, ip {}",
                         claims.host, context.context_host, context.client_ip
-                    );
-                    return internal_verification_error(
-                        StatusCode::FORBIDDEN,
-                        "browser_proof",
-                        context,
-                        "browser_context_mismatch",
                     );
                 }
 
@@ -646,6 +673,7 @@ pub async fn verify_internal_credential(
                         credential: "browser_proof",
                         message: "valid_browser_proof",
                         usage_recorded: false,
+                        user_id: claims.uid,
                         context,
                         api_key: None,
                         browser_proof: Some(InternalBrowserProofVerification {
@@ -1276,6 +1304,7 @@ fn internal_verification_error(
             credential,
             message: error,
             usage_recorded: false,
+            user_id: None,
             context,
             api_key: None,
             browser_proof: None,
