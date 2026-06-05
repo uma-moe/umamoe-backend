@@ -487,10 +487,25 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(state.clone());
 
+    // Open endpoints: no API key / browser proof required.
+    // Keep the user-write guard so read-only deployments still block daily counter writes.
+    let open_routes = Router::new()
+        .nest("/api/stats", stats::public_router())
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    middleware::user_writes::user_write_guard_middleware,
+                ))
+                .layer(cors.clone()),
+        )
+        .with_state(state.clone());
+
     // Protected endpoints (Turnstile + restricted CORS)
     let protected_routes = Router::new()
         .nest("/api/docs", docs::router())
-        .nest("/api/stats", stats::router())
+        .nest("/api/stats", stats::protected_router())
         .nest("/api/tasks", tasks::router())
         .nest("/api/v3/tasks", tasks::router())
         .nest("/api/v4/partner", partner::router())
@@ -530,7 +545,10 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
 
     // Merge public and protected routes
-    let app = version_routes.merge(public_routes).merge(protected_routes);
+    let app = version_routes
+        .merge(open_routes)
+        .merge(public_routes)
+        .merge(protected_routes);
 
     // Server configuration
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());

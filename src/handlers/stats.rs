@@ -14,11 +14,14 @@ use crate::models::{
 };
 use crate::AppState;
 
-pub fn router() -> Router<AppState> {
+pub fn public_router() -> Router<AppState> {
     Router::new()
         .route("/daily-visit", post(track_daily_visit))
         .route("/", get(get_stats))
-        .route("/friendlist/:id", post(report_friendlist_full))
+}
+
+pub fn protected_router() -> Router<AppState> {
+    Router::new().route("/friendlist/:id", post(report_friendlist_full))
 }
 
 // New efficient daily visit tracking (only increments counter once per day per user)
