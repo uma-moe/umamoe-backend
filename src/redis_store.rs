@@ -64,4 +64,29 @@ impl RedisStore {
             .await
             .map_err(|error| error.to_string())
     }
+
+    pub async fn increment_with_expiry(&self, key: &str, ttl_seconds: u64) -> Result<u64, String> {
+        let mut connection = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let count: i64 = redis::cmd("INCR")
+            .arg(key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        if count == 1 {
+            redis::cmd("EXPIRE")
+                .arg(key)
+                .arg(ttl_seconds.max(1))
+                .query_async::<()>(&mut connection)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+
+        Ok(count.max(0) as u64)
+    }
 }

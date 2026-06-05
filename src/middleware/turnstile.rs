@@ -12,6 +12,7 @@ use axum::{
 use dashmap::DashMap;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     net::SocketAddr,
     sync::OnceLock,
@@ -24,6 +25,7 @@ use crate::{redis_store::RedisStore, AppState};
 
 const TURNSTILE_VERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 const BROWSER_PROOF_COOKIE: &str = "uma_browser_proof";
+const BROWSER_WARMUP_COOKIE: &str = "uma_browser_warmup";
 const BROWSER_PROOF_HEADER: &str = "X-Browser-Proof";
 const BROWSER_PROOF_TTL_HEADER: &str = "X-Browser-Proof-TTL";
 const BROWSER_PROOF_SOURCE_HEADER: &str = "X-Browser-Proof-Source";
@@ -47,6 +49,7 @@ struct IssuedBrowserProof {
     ttl_seconds: usize,
     subject: String,
     source: &'static str,
+    warmup_marker: Option<String>,
 }
 
 #[derive(Debug)]
@@ -94,6 +97,9 @@ pub struct InternalBrowserProofRequest {
     origin: Option<String>,
     referer: Option<String>,
     host: Option<String>,
+    client_ip: Option<String>,
+    user_agent: Option<String>,
+    warmup_marker: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -348,6 +354,7 @@ async fn authorize_browser_request(
                     &headers,
                     state.redis_store.as_ref(),
                     BROWSER_PROOF_SOURCE_TURNSTILE,
+                    None,
                 )
                 .await
                 {
@@ -407,25 +414,15 @@ async fn authorize_browser_request(
             return Err(rate_limited(retry_after));
         }
 
-        let issued_proof = match issue_browser_proof(
-            &headers,
-            state.redis_store.as_ref(),
-            BROWSER_PROOF_SOURCE_WARMUP,
-        )
-        .await
-        {
-            Ok(proof) => proof,
-            Err(e) => {
-                error!(
-                    "Failed to issue browser proof on bootstrap read from ip {} on {}: {}",
-                    client_ip, path, e
-                );
-                return Err(json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "browser_proof_unavailable",
-                ));
-            }
-        };
+        let warmup_marker =
+            match reserve_warmup_bootstrap(&headers, state.redis_store.as_ref(), client_ip, None)
+                .await
+            {
+                Ok(marker) => marker,
+                Err(response) => return Err(response),
+            };
+
+        let issued_proof = issue_warmup_marker(warmup_marker);
 
         return Ok(BrowserAuthorization {
             credential: "warmup_bootstrap",
@@ -538,6 +535,7 @@ pub async fn exchange_browser_proof(
         &headers,
         state.redis_store.as_ref(),
         BROWSER_PROOF_SOURCE_TURNSTILE,
+        None,
     )
     .await
     {
@@ -578,19 +576,26 @@ pub async fn issue_internal_browser_proof(
 ) -> Response {
     let client_ip = extract_client_ip(&headers, connect_info.map(|ci| ci.0));
     let payload = payload.map(|Json(payload)| payload).unwrap_or_default();
+    let browser_client_ip = payload
+        .client_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(client_ip.as_str())
+        .to_string();
     let headers = match internal_browser_context_headers(headers, &payload) {
         Ok(headers) => headers,
         Err(error) => return json_error(StatusCode::BAD_REQUEST, error),
     };
     let limit = env_u32("BROWSER_PROOF_INTERNAL_REQUESTS_PER_MINUTE", 12000);
     if let Some(retry_after) = check_rate_limit(
-        format!("proof-internal-ip:{}", client_ip),
+        format!("proof-internal-ip:{}", browser_client_ip),
         limit,
         Duration::from_secs(60),
     ) {
         warn!(
-            "Internal browser proof issuer rate limited for ip {}",
-            client_ip
+            "Internal browser proof issuer rate limited for browser ip {} via service ip {}",
+            browser_client_ip, client_ip
         );
         return rate_limited(retry_after);
     }
@@ -603,26 +608,24 @@ pub async fn issue_internal_browser_proof(
         return json_error(StatusCode::FORBIDDEN, "browser_context_required");
     }
 
-    let proof = match issue_browser_proof(
+    let warmup_marker = match reserve_warmup_bootstrap(
         &headers,
         state.redis_store.as_ref(),
-        BROWSER_PROOF_SOURCE_WARMUP,
+        &browser_client_ip,
+        payload.warmup_marker.as_deref(),
     )
     .await
     {
-        Ok(proof) => proof,
-        Err(e) => {
-            error!("Failed to create internal browser proof: {}", e);
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "browser_proof_unavailable",
-            );
-        }
+        Ok(marker) => marker,
+        Err(response) => return response,
     };
 
+    let proof = issue_warmup_marker(warmup_marker);
+
     info!(
-        "Issued internal browser proof for {} from ip {}",
+        "Issued internal browser warmup marker for {} from browser ip {} via service ip {}",
         proof.subject(),
+        browser_client_ip,
         client_ip
     );
 
@@ -668,6 +671,15 @@ fn internal_browser_context_headers(
     {
         let value = HeaderValue::from_str(host.trim()).map_err(|_| "invalid_host")?;
         headers.insert("Host", value);
+    }
+
+    if let Some(user_agent) = payload
+        .user_agent
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let value = HeaderValue::from_str(user_agent.trim()).map_err(|_| "invalid_user_agent")?;
+        headers.insert("User-Agent", value);
     }
 
     Ok(headers)
@@ -892,6 +904,15 @@ async fn validate_turnstile_token(
     headers: &HeaderMap,
     client_ip: Option<String>,
 ) -> Result<bool, TurnstileError> {
+    if accepts_local_turnstile_dev_token(token, headers) {
+        info!(
+            "Accepted local Turnstile dev token for origin {:?} host {:?}",
+            header_str(headers, "Origin"),
+            header_str(headers, "Host")
+        );
+        return Ok(true);
+    }
+
     let secret_key = std::env::var("TURNSTILE_SECRET_KEY")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -941,6 +962,32 @@ async fn validate_turnstile_token(
     Ok(true)
 }
 
+fn accepts_local_turnstile_dev_token(token: &str, headers: &HeaderMap) -> bool {
+    if !is_development() {
+        return false;
+    }
+
+    let Some(expected_token) = env_string("TURNSTILE_DEV_TOKEN") else {
+        return false;
+    };
+
+    if token.trim() != expected_token {
+        return false;
+    }
+
+    if let Some(origin) = header_str(headers, "Origin") {
+        if !allowed_request_origin(origin) {
+            warn!(
+                "Local Turnstile dev token rejected for disallowed origin '{}'",
+                origin
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
 async fn siteverify(
     token: &str,
     client_ip: Option<String>,
@@ -977,6 +1024,7 @@ async fn issue_browser_proof(
     headers: &HeaderMap,
     store: Option<&RedisStore>,
     source: &'static str,
+    warmup_marker: Option<String>,
 ) -> Result<IssuedBrowserProof, String> {
     let store = store.ok_or_else(|| "browser proof store is not configured".to_string())?;
     let user_id = bearer_token(headers).and_then(|token| {
@@ -1001,24 +1049,42 @@ async fn issue_browser_proof(
         ttl_seconds,
         subject,
         source,
+        warmup_marker,
     })
 }
 
+fn issue_warmup_marker(warmup_marker: String) -> IssuedBrowserProof {
+    IssuedBrowserProof {
+        token: String::new(),
+        ttl_seconds: browser_proof_ttl_seconds(BROWSER_PROOF_SOURCE_WARMUP),
+        subject: format!("warmup:{}", warmup_marker),
+        source: BROWSER_PROOF_SOURCE_WARMUP,
+        warmup_marker: Some(warmup_marker),
+    }
+}
+
 fn attach_browser_proof(response: &mut Response, proof: &IssuedBrowserProof) -> Result<(), String> {
-    let ttl_value =
-        HeaderValue::from_str(&proof.ttl_seconds.to_string()).map_err(|e| e.to_string())?;
     let source_value = HeaderValue::from_str(proof.source).map_err(|e| e.to_string())?;
 
     let headers = response.headers_mut();
-    headers.insert(BROWSER_PROOF_TTL_HEADER, ttl_value);
     headers.insert(BROWSER_PROOF_SOURCE_HEADER, source_value);
 
     if proof.source == BROWSER_PROOF_SOURCE_TURNSTILE {
+        let ttl_value =
+            HeaderValue::from_str(&proof.ttl_seconds.to_string()).map_err(|e| e.to_string())?;
         let cookie = browser_proof_cookie(&proof.token);
         let cookie_value = HeaderValue::from_str(&cookie).map_err(|e| e.to_string())?;
         let proof_value = HeaderValue::from_str(&proof.token).map_err(|e| e.to_string())?;
-        headers.insert(SET_COOKIE, cookie_value);
+        headers.insert(BROWSER_PROOF_TTL_HEADER, ttl_value);
+        headers.append(SET_COOKIE, cookie_value);
         headers.insert(BROWSER_PROOF_HEADER, proof_value);
+        let clear_marker = clear_warmup_marker_cookie();
+        let clear_marker_value = HeaderValue::from_str(&clear_marker).map_err(|e| e.to_string())?;
+        headers.append(SET_COOKIE, clear_marker_value);
+    } else if let Some(marker) = proof.warmup_marker.as_deref() {
+        let cookie = warmup_marker_cookie(marker);
+        let cookie_value = HeaderValue::from_str(&cookie).map_err(|e| e.to_string())?;
+        headers.append(SET_COOKIE, cookie_value);
     }
 
     Ok(())
@@ -1180,6 +1246,77 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     })
 }
 
+async fn reserve_warmup_bootstrap(
+    headers: &HeaderMap,
+    store: Option<&RedisStore>,
+    client_ip: &str,
+    marker_from_payload: Option<&str>,
+) -> Result<String, Response> {
+    let store = store
+        .ok_or_else(|| json_error(StatusCode::SERVICE_UNAVAILABLE, "browser_proof_unavailable"))?;
+    let ttl_seconds = warmup_lock_ttl_seconds();
+    let max_warmups = warmup_burst_limit();
+    let existing_marker = marker_from_payload
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            cookie_value(headers, BROWSER_WARMUP_COOKIE)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        });
+
+    let marker = existing_marker
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let marker_key = store.hashed_key("browser-warmup-marker", &marker);
+    let marker_count = increment_warmup_counter(store, &marker_key, ttl_seconds).await?;
+    if marker_count > max_warmups {
+        warn!(
+            "Browser warmup bootstrap rejected because marker exceeded burst count {} for ip {} host {}",
+            marker_count,
+            client_ip,
+            proof_host(headers)
+        );
+        return Err(rate_limited(ttl_seconds as u64));
+    }
+
+    let fingerprint = warmup_fingerprint(headers, client_ip);
+    let fingerprint_key = store.hashed_key("browser-warmup-fingerprint", &fingerprint);
+    let fingerprint_count = increment_warmup_counter(store, &fingerprint_key, ttl_seconds).await?;
+    if fingerprint_count > max_warmups {
+        warn!(
+            "Browser warmup bootstrap rejected because fingerprint exceeded burst count {} for ip {} host {}",
+            fingerprint_count,
+            client_ip,
+            proof_host(headers)
+        );
+        return Err(rate_limited(ttl_seconds as u64));
+    }
+
+    Ok(marker)
+}
+
+async fn increment_warmup_counter(
+    store: &RedisStore,
+    key: &str,
+    ttl_seconds: usize,
+) -> Result<u64, Response> {
+    store
+        .increment_with_expiry(key, ttl_seconds as u64)
+        .await
+        .map_err(|error| {
+            error!("Browser warmup counter update failed: {}", error);
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "browser_proof_unavailable")
+        })
+}
+
+fn warmup_fingerprint(headers: &HeaderMap, client_ip: &str) -> String {
+    let host = proof_host(headers);
+    let user_agent = header_str(headers, "User-Agent").unwrap_or("<none>");
+    let material = format!("{}|{}|{}", host, client_ip.trim(), user_agent.trim());
+    hex::encode(Sha256::digest(material.as_bytes()))
+}
+
 fn browser_proof_cookie(token: &str) -> String {
     let ttl = browser_proof_ttl_seconds(BROWSER_PROOF_SOURCE_TURNSTILE);
     let secure = std::env::var("BROWSER_PROOF_COOKIE_SECURE")
@@ -1195,6 +1332,41 @@ fn browser_proof_cookie(token: &str) -> String {
     format!(
         "{}={}; Max-Age={}; Path=/{}{}; HttpOnly; SameSite=Lax",
         BROWSER_PROOF_COOKIE, token, ttl, domain_attr, secure_attr
+    )
+}
+
+fn warmup_marker_cookie(marker: &str) -> String {
+    let ttl = warmup_lock_ttl_seconds();
+    let secure = std::env::var("BROWSER_PROOF_COOKIE_SECURE")
+        .map(|value| value != "false" && value != "0")
+        .unwrap_or_else(|_| !is_development());
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let domain_attr = std::env::var("BROWSER_PROOF_COOKIE_DOMAIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("; Domain={}", value.trim()))
+        .unwrap_or_default();
+
+    format!(
+        "{}={}; Max-Age={}; Path=/{}{}; HttpOnly; SameSite=Lax",
+        BROWSER_WARMUP_COOKIE, marker, ttl, domain_attr, secure_attr
+    )
+}
+
+fn clear_warmup_marker_cookie() -> String {
+    let secure = std::env::var("BROWSER_PROOF_COOKIE_SECURE")
+        .map(|value| value != "false" && value != "0")
+        .unwrap_or_else(|_| !is_development());
+    let secure_attr = if secure { "; Secure" } else { "" };
+    let domain_attr = std::env::var("BROWSER_PROOF_COOKIE_DOMAIN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("; Domain={}", value.trim()))
+        .unwrap_or_default();
+
+    format!(
+        "{}=; Max-Age=0; Path=/{}{}; HttpOnly; SameSite=Lax",
+        BROWSER_WARMUP_COOKIE, domain_attr, secure_attr
     )
 }
 
@@ -1573,8 +1745,16 @@ fn browser_proof_ttl_seconds(source: &str) -> usize {
     if source == BROWSER_PROOF_SOURCE_WARMUP {
         env_usize("BROWSER_PROOF_WARMUP_TTL_SECONDS", 30)
     } else {
-        env_usize("BROWSER_PROOF_TTL_SECONDS", 600)
+        env_usize("BROWSER_PROOF_TTL_SECONDS", 300)
     }
+}
+
+fn warmup_lock_ttl_seconds() -> usize {
+    env_usize("BROWSER_PROOF_WARMUP_LOCK_SECONDS", 120)
+}
+
+fn warmup_burst_limit() -> u64 {
+    env_u64("BROWSER_PROOF_WARMUP_BURST", 4)
 }
 
 fn env_bool(name: &str) -> bool {
@@ -1595,6 +1775,20 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn is_development() -> bool {
