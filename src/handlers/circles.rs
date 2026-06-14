@@ -210,6 +210,14 @@ fn display_yesterday_rank_sql(alias: &str) -> String {
     )
 }
 
+fn display_yesterday_rank_expr_sql(alias: &str, live_yesterday_rank_expr: &str) -> String {
+    format!(
+        "COALESCE({}::int, {})",
+        live_yesterday_rank_expr,
+        display_yesterday_rank_sql(alias)
+    )
+}
+
 fn display_live_points_sql(alias: &str) -> String {
     format!(
         "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {}.live_points END",
@@ -369,25 +377,29 @@ pub async fn get_circle(
     // Yesterday's tier gaps
     let y_points = circle.yesterday_points.unwrap_or(0);
     let y_rank = circle.yesterday_rank;
+    // Compare yesterday's points against today's tier, so crossing a tier line
+    // does not make the displayed threshold appear to jump by an entire bracket.
+    let y_tier_gap_rank = historical_tier_gap_rank(rank, y_rank);
 
-    let yesterday_fans_to_next_tier = if let Some(boundary) = next_tier_boundary(y_rank, y_points) {
-        match fetch_boundary_points_yesterday(&state.db, boundary).await? {
-            Some(bp) => Some((bp - y_points).max(0)),
-            None => Some(0),
-        }
-    } else {
-        Some(0)
-    };
+    let yesterday_fans_to_next_tier =
+        if let Some(boundary) = next_tier_boundary(y_tier_gap_rank, y_points) {
+            match fetch_boundary_points_yesterday(&state.db, boundary).await? {
+                Some(bp) => Some((bp - y_points).max(0)),
+                None => Some(0),
+            }
+        } else {
+            Some(0)
+        };
 
-    let yesterday_fans_to_lower_tier = if let Some(boundary) = lower_tier_boundary(y_rank, y_points)
-    {
-        match fetch_boundary_points_yesterday(&state.db, boundary).await? {
-            Some(bp) => Some((y_points - bp).max(0)),
-            None => Some(0),
-        }
-    } else {
-        Some(0)
-    };
+    let yesterday_fans_to_lower_tier =
+        if let Some(boundary) = lower_tier_boundary(y_tier_gap_rank, y_points) {
+            match fetch_boundary_points_yesterday(&state.db, boundary).await? {
+                Some(bp) => Some((y_points - bp).max(0)),
+                None => Some(0),
+            }
+        } else {
+            Some(0)
+        };
 
     Ok(Json(CircleResponse {
         circle,
@@ -508,7 +520,7 @@ pub async fn list_circles(
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
-    let yesterday_rank_column = display_yesterday_rank_sql("c");
+    let yesterday_rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
     let live_points_column = display_live_points_sql("c");
     let live_rank_column =
         display_live_rank_expr_sql("c", "COALESCE(lr.live_rank::int, c.live_rank)");
@@ -854,6 +866,13 @@ fn lower_tier_boundary(rank: Option<i32>, points: i64) -> Option<i32> {
     }
 }
 
+fn historical_tier_gap_rank(
+    current_rank: Option<i32>,
+    historical_rank: Option<i32>,
+) -> Option<i32> {
+    current_rank.or(historical_rank)
+}
+
 /// Fetch the effective current points of the circle at the given boundary rank
 async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
     let points_column = effective_points_sql("c");
@@ -933,7 +952,7 @@ async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, App
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
-    let yesterday_rank_column = display_yesterday_rank_sql("c");
+    let yesterday_rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
     let live_points_column = display_live_points_sql("c");
     let live_rank_column =
         display_live_rank_expr_sql("c", "COALESCE(lr.live_rank::int, c.live_rank)");
@@ -1189,4 +1208,31 @@ async fn add_viewer_to_tasks(pool: &PgPool, viewer_id: i64) -> Result<(), AppErr
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn yesterday_tier_gaps_are_anchored_to_current_rank() {
+        let current_rank = Some(501);
+        let yesterday_rank = Some(484);
+        let yesterday_points = 365_509_264;
+
+        let rank = historical_tier_gap_rank(current_rank, yesterday_rank);
+
+        assert_eq!(rank, current_rank);
+        assert_eq!(next_tier_boundary(rank, yesterday_points), Some(500));
+        assert_eq!(lower_tier_boundary(rank, yesterday_points), Some(1001));
+    }
+
+    #[test]
+    fn yesterday_tier_gaps_fall_back_without_current_rank() {
+        let rank = historical_tier_gap_rank(None, Some(484));
+
+        assert_eq!(rank, Some(484));
+        assert_eq!(next_tier_boundary(rank, 365_509_264), Some(100));
+        assert_eq!(lower_tier_boundary(rank, 365_509_264), Some(501));
+    }
 }
