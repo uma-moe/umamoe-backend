@@ -373,7 +373,7 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "3201".to_string())
         .parse::<u16>()
         .expect("INTERNAL_API_PORT must be a valid number");
-    spawn_internal_auth_server(state.clone(), internal_api_host, internal_api_port).await?;
+    spawn_internal_api_server(state.clone(), internal_api_host, internal_api_port).await?;
 
     // Configure CORS - more permissive for development, strict for production
     let is_development = std::env::var("DEBUG_MODE").unwrap_or_default() == "true";
@@ -463,11 +463,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Build the application with proper routing and middleware
     // Public-read endpoints still require an API key or browser proof to prevent scraping.
-    let public_routes = Router::new()
-        .nest("/api/v4/circles", circles::router())
-        .nest("/api/v4/rankings", rankings::router())
-        .nest("/api/v4/user/profile", profile::router())
-        .nest("/api/v4/shame", shame::router())
+    let public_routes = public_read_api_routes()
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -489,8 +485,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Open endpoints: no API key / browser proof required.
     // Keep the user-write guard so read-only deployments still block daily counter writes.
-    let open_routes = Router::new()
-        .nest("/api/stats", stats::public_router())
+    let open_routes = open_api_routes()
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -503,17 +498,7 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state.clone());
 
     // Protected endpoints (Turnstile + restricted CORS)
-    let protected_routes = Router::new()
-        .nest("/api/docs", docs::router())
-        .nest("/api/stats", stats::protected_router())
-        .nest("/api/tasks", tasks::router())
-        .nest("/api/v3/tasks", tasks::router())
-        .nest("/api/v4/partner", partner::router())
-        .nest("/api/v3", search::router())
-        .nest("/api/v4/affinity", affinity::router())
-        .nest("/api/auth", auth_handlers::public_router())
-        .nest("/api/auth", auth_handlers::authenticated_router())
-        .nest("/", sharing::router())
+    let protected_routes = protected_api_routes()
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -533,10 +518,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(state.clone());
 
-    let version_routes = Router::new()
-        .route("/api/health", get(health_check))
-        .route("/api/ver", get(version::get_version))
-        .route("/api/ver/history", get(version::get_version_history))
+    let version_routes = version_api_routes()
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
@@ -568,6 +550,39 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn public_read_api_routes() -> Router<AppState> {
+    Router::new()
+        .nest("/api/v4/circles", circles::router())
+        .nest("/api/v4/rankings", rankings::router())
+        .nest("/api/v4/user/profile", profile::router())
+        .nest("/api/v4/shame", shame::router())
+}
+
+fn open_api_routes() -> Router<AppState> {
+    Router::new().nest("/api/stats", stats::public_router())
+}
+
+fn protected_api_routes() -> Router<AppState> {
+    Router::new()
+        .nest("/api/docs", docs::router())
+        .nest("/api/stats", stats::protected_router())
+        .nest("/api/tasks", tasks::router())
+        .nest("/api/v3/tasks", tasks::router())
+        .nest("/api/v4/partner", partner::router())
+        .nest("/api/v3", search::router())
+        .nest("/api/v4/affinity", affinity::router())
+        .nest("/api/auth", auth_handlers::public_router())
+        .nest("/api/auth", auth_handlers::authenticated_router())
+        .nest("/", sharing::router())
+}
+
+fn version_api_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/health", get(health_check))
+        .route("/api/ver", get(version::get_version))
+        .route("/api/ver/history", get(version::get_version_history))
 }
 
 async fn baseline_migrations_from_env(
@@ -667,12 +682,22 @@ async fn health_check() -> Result<Json<serde_json::Value>, StatusCode> {
     })))
 }
 
-async fn spawn_internal_auth_server(
-    state: AppState,
-    host: String,
-    port: u16,
-) -> anyhow::Result<()> {
-    let app = Router::new()
+async fn spawn_internal_api_server(state: AppState, host: String, port: u16) -> anyhow::Result<()> {
+    let data_routes = Router::new()
+        .merge(open_api_routes())
+        .merge(public_read_api_routes())
+        .merge(protected_api_routes())
+        .layer(
+            ServiceBuilder::new().layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                middleware::user_writes::user_write_guard_middleware,
+            )),
+        )
+        .with_state(state.clone());
+
+    let version_routes = version_api_routes().with_state(state.clone());
+
+    let internal_auth_routes = Router::new()
         .route(
             "/api/auth/browser-proof/internal",
             post(middleware::turnstile::issue_internal_browser_proof),
@@ -681,12 +706,16 @@ async fn spawn_internal_auth_server(
             "/api/auth/verify/internal",
             post(middleware::turnstile::verify_internal_credential),
         )
-        .layer(axum::middleware::from_fn(internal_network_only_middleware))
-        .layer(TraceLayer::new_for_http())
         .with_state(state);
 
+    let app = version_routes
+        .merge(data_routes)
+        .merge(internal_auth_routes)
+        .layer(axum::middleware::from_fn(internal_network_only_middleware))
+        .layer(TraceLayer::new_for_http());
+
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
-    info!("🔒 Internal auth API listening on http://{}:{}", host, port);
+    info!("🔒 Internal API listening on http://{}:{}", host, port);
 
     tokio::spawn(async move {
         if let Err(error) = axum::serve(
@@ -695,7 +724,7 @@ async fn spawn_internal_auth_server(
         )
         .await
         {
-            error!("Internal auth API stopped: {}", error);
+            error!("Internal API stopped: {}", error);
         }
     });
 
