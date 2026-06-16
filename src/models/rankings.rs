@@ -26,6 +26,10 @@ pub struct UserFanRankingMonthly {
     /// Circle the user was in at end of month
     pub circle_id: Option<i64>,
     pub circle_name: Option<String>,
+    /// Circle tier index at that month (1=D, 11=SS)
+    pub club_rank: Option<i32>,
+    /// Circle tier label at that month (D, D+, C, C+, B, B+, A, A+, S, S+, SS)
+    pub club_rank_name: Option<String>,
     /// Cumulative fans at start of next month (daily_fans[1] of M+1)
     pub next_month_start: Option<i64>,
 }

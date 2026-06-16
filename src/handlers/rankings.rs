@@ -6,6 +6,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
+    club_rank::{monthly_club_rank_joins, monthly_club_rank_selects},
     errors::AppError,
     models::{
         AlltimeRankingsResponse, GainsRankingsResponse, MonthlyRankingsResponse,
@@ -161,15 +162,21 @@ pub async fn get_monthly_rankings(
     } else {
         ("$3", "$4")
     };
+    let club_rank_joins = monthly_club_rank_joins("r");
+    let (club_rank_expr, club_rank_name_expr) = monthly_club_rank_selects("r");
     let data_sql = format!(
         "SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score, \
          r.year, r.month, r.total_fans, r.monthly_gain, r.active_days, \
          r.avg_daily, r.avg_3d, r.avg_7d, r.avg_monthly, r.rank, \
-         r.circle_id, r.circle_name, r.next_month_start \
+         r.circle_id, r.circle_name, \
+         {club_rank_expr} AS club_rank, \
+         {club_rank_name_expr} AS club_rank_name, \
+         r.next_month_start \
          FROM {} r \
          LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id \
+         {} \
          WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
-        table_name, where_clause, order_by, lp, op
+        table_name, club_rank_joins, where_clause, order_by, lp, op
     );
     let rankings: Vec<UserFanRankingMonthly> = bind_search_and_page(
         sqlx::query_as(&data_sql)

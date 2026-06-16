@@ -7,6 +7,7 @@ use axum::{
 use sqlx::FromRow;
 use uuid::Uuid;
 
+use crate::club_rank::{monthly_club_rank_joins, monthly_club_rank_selects};
 use crate::errors::AppError;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::models::profile::{
@@ -146,22 +147,29 @@ async fn get_profile(
     .await?;
 
     // 4) Fan history — monthly rankings (graceful fallback if views have old schema)
-    let monthly = sqlx::query_as::<_, UserFanRankingMonthly>(
+    let club_rank_joins = monthly_club_rank_joins("r");
+    let (club_rank_expr, club_rank_name_expr) = monthly_club_rank_selects("r");
+    let monthly_sql = format!(
         r#"
          SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score,
              r.year, r.month, r.total_fans, r.monthly_gain,
              r.active_days, r.avg_daily, r.avg_3d, r.avg_7d, r.avg_monthly, r.rank,
-             r.circle_id, r.circle_name, r.next_month_start
+             r.circle_id, r.circle_name,
+             {club_rank_expr} AS club_rank,
+             {club_rank_name_expr} AS club_rank_name,
+             r.next_month_start
          FROM user_fan_rankings_monthly r
          LEFT JOIN viewer_suspicion_scores s ON s.viewer_id = r.viewer_id
+         {club_rank_joins}
          WHERE r.viewer_id = $1
          ORDER BY r.year DESC, r.month DESC
-        "#,
-    )
-    .bind(viewer_id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+        "#
+    );
+    let monthly = sqlx::query_as::<_, UserFanRankingMonthly>(&monthly_sql)
+        .bind(viewer_id)
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
 
     // 5) Rolling gains
     let rolling = sqlx::query_as::<_, UserFanRankingGains>(

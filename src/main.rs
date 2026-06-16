@@ -14,6 +14,7 @@ use tracing_subscriber::EnvFilter;
 mod auth;
 mod cache;
 mod cheat_analysis;
+mod club_rank;
 mod database;
 mod errors;
 mod handlers;
