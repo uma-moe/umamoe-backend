@@ -21,14 +21,14 @@ services:
     image: umamoe-resources:local
     container_name: umamoe-local-resources
     environment:
-      ALLOWED_ORIGINS: ${LOCAL_ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3004,http://127.0.0.1:3004}
-      API_PROTECTION_BYPASS: ${API_PROTECTION_BYPASS:-true}
+      ALLOWED_ORIGINS: ${LOCAL_ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3004,http://127.0.0.1:3004,http://localhost:3008,http://127.0.0.1:3008}
+      API_PROTECTION_BYPASS: ${LOCAL_API_PROTECTION_BYPASS:-true}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-umamoe}
       RESOURCES_INTERNAL_HOST: 0.0.0.0
       RESOURCES_INTERNAL_PORT: 3204
       AUTH_INTERNAL_BASE_URL: ${LOCAL_AUTH_INTERNAL_BASE_URL:-http://umamoe-backend:3201}
-      API_PROTECTION_DRY_RUN_BOOTSTRAP: ${API_PROTECTION_DRY_RUN_BOOTSTRAP:-true}
+      API_PROTECTION_DRY_RUN_BOOTSTRAP: ${LOCAL_API_PROTECTION_DRY_RUN_BOOTSTRAP:-true}
       RUST_LOG: ${LOCAL_RESOURCES_RUST_LOG:-umamoe_resources=info,info}
     ports:
       - "127.0.0.1:${LOCAL_RESOURCES_PORT:-3004}:3000"
@@ -59,7 +59,7 @@ services:
       BASELINE_MIGRATIONS_BEFORE: ${BASELINE_MIGRATIONS_BEFORE:-}
       BASELINE_MIGRATIONS_UP_TO: ${BASELINE_MIGRATIONS_UP_TO:-}
       IGNORE_MIGRATION_VERSION_MISMATCH: ${IGNORE_MIGRATION_VERSION_MISMATCH:-true}
-      ALLOWED_ORIGINS: ${LOCAL_ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3004,http://127.0.0.1:3004}
+      ALLOWED_ORIGINS: ${LOCAL_ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3004,http://127.0.0.1:3004,http://localhost:3008,http://127.0.0.1:3008}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:4200}
       OAUTH_REDIRECT_BASE_URL: ${OAUTH_REDIRECT_BASE_URL:-http://localhost:3001}
       SEARCH_SERVICE_URL: http://umamoe-search:3202
@@ -80,8 +80,8 @@ services:
       TURNSTILE_DEV_TOKEN: ${TURNSTILE_DEV_TOKEN:-local-dev-turnstile-token}
       TURNSTILE_ALLOWED_HOSTS: ${LOCAL_TURNSTILE_ALLOWED_HOSTS:-localhost,127.0.0.1,umamoe-backend}
       TURNSTILE_ACTION: ${TURNSTILE_ACTION:-api_request}
-      API_PROTECTION_BYPASS: ${API_PROTECTION_BYPASS:-true}
-      API_PROTECTION_DRY_RUN: ${API_PROTECTION_DRY_RUN:-true}
+      API_PROTECTION_BYPASS: ${LOCAL_API_PROTECTION_BYPASS:-true}
+      API_PROTECTION_DRY_RUN: ${LOCAL_API_PROTECTION_DRY_RUN:-true}
       TURNSTILE_BYPASS: ${TURNSTILE_BYPASS:-false}
       BROWSER_PROOF_WARMUP_BURST: ${BROWSER_PROOF_WARMUP_BURST:-4}
       BROWSER_PROOF_WARMUP_LOCK_SECONDS: ${BROWSER_PROOF_WARMUP_LOCK_SECONDS:-120}
@@ -117,9 +117,9 @@ services:
       SEARCH_PORT: 3002
       SEARCH_INTERNAL_PORT: 3202
       SYNC_INTERVAL_SECS: ${SYNC_INTERVAL_SECS:-300}
-      ALLOWED_ORIGINS: ${LOCAL_ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3004,http://127.0.0.1:3004}
-      API_PROTECTION_BYPASS: ${API_PROTECTION_BYPASS:-true}
-      API_PROTECTION_DRY_RUN_BOOTSTRAP: ${API_PROTECTION_DRY_RUN_BOOTSTRAP:-true}
+      ALLOWED_ORIGINS: ${LOCAL_ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3004,http://127.0.0.1:3004,http://localhost:3008,http://127.0.0.1:3008}
+      API_PROTECTION_BYPASS: ${LOCAL_API_PROTECTION_BYPASS:-true}
+      API_PROTECTION_DRY_RUN_BOOTSTRAP: ${LOCAL_API_PROTECTION_DRY_RUN_BOOTSTRAP:-true}
       AUTH_INTERNAL_BASE_URL: ${LOCAL_AUTH_INTERNAL_BASE_URL:-http://umamoe-backend:3201}
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-umamoe}
@@ -144,6 +144,28 @@ services:
         aliases:
           - umamoe-search
           - umamoe-search-beta
+
+  embeds:
+    build:
+      context: ../umamoe-embeds
+    image: umamoe-embeds:local
+    container_name: umamoe-local-embeds
+    env_file:
+      - ../umamoe-embeds/local.env
+    ports:
+      - "127.0.0.1:${LOCAL_EMBEDS_PORT:-3008}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      backend:
+        condition: service_started
+      search:
+        condition: service_started
+    networks:
+      default:
+        aliases:
+          - umamoe-embeds
+          - umamoe-embeds-beta
 
 networks:
   default:

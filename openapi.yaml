@@ -466,6 +466,14 @@ components:
         circle_name:
           type: string
           nullable: true
+        club_rank:
+          type: integer
+          nullable: true
+          description: "Circle tier index for this row's circle (1=D, 2=D+, ... 11=SS)"
+        club_rank_name:
+          type: string
+          nullable: true
+          description: "Circle tier label for this row's circle (D, D+, C, C+, B, B+, A, A+, S, S+, SS)"
         next_month_start:
           type: integer
           format: int64

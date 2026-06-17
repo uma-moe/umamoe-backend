@@ -16,8 +16,23 @@ pub struct ProfileResponse {
     pub fan_history: FanHistory,
     pub inheritance: Option<super::inheritance::Inheritance>,
     pub support_card: Option<super::support_cards::SupportCard>,
+    pub borrow_stats: Option<BorrowStats>,
     pub team_stadium: Vec<TeamStadiumMember>,
     pub veterans: Vec<VeteranCharacter>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct BorrowStats {
+    pub trainer_id: String,
+    pub inheritance_id: i64,
+    pub support_card_id: i32,
+    pub view_count: i64,
+    pub copy_count: i64,
+    pub theoretical_copy_count: i32,
+    pub last_known_follower_num: Option<i32>,
+    pub last_viewed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_copied_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_recheck_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
