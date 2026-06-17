@@ -166,6 +166,27 @@ pub struct BrowserProofClaims {
     source: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedBrowserProof {
+    proof_id: String,
+    subject: String,
+    issued_at: usize,
+}
+
+impl VerifiedBrowserProof {
+    pub(crate) fn proof_id(&self) -> &str {
+        &self.proof_id
+    }
+
+    pub(crate) fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub(crate) fn issued_at(&self) -> usize {
+        self.issued_at
+    }
+}
+
 #[derive(Debug)]
 enum TurnstileError {
     MissingSecret,
@@ -1166,6 +1187,31 @@ async fn verify_browser_proof(
     } else {
         verify_signed_browser_proof(token).map_err(BrowserProofError::Invalid)
     }
+}
+
+pub(crate) async fn require_turnstile_browser_proof(
+    headers: &HeaderMap,
+    store: Option<&RedisStore>,
+) -> Result<VerifiedBrowserProof, &'static str> {
+    let Some(proof) = extract_browser_proof(headers) else {
+        return Err("browser_proof_required");
+    };
+
+    let claims = match verify_browser_proof(proof, store).await {
+        Ok(claims) => claims,
+        Err(BrowserProofError::Invalid(_)) => return Err("invalid_browser_proof"),
+        Err(BrowserProofError::Store(_)) => return Err("browser_proof_unavailable"),
+    };
+
+    if claims.source != BROWSER_PROOF_SOURCE_TURNSTILE {
+        return Err("browser_proof_required");
+    }
+
+    Ok(VerifiedBrowserProof {
+        proof_id: claims.jti,
+        subject: claims.sub,
+        issued_at: claims.iat,
+    })
 }
 
 fn verify_signed_browser_proof(token: &str) -> Result<BrowserProofClaims, String> {

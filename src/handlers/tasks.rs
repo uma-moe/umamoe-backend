@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ConnectInfo, Path, State},
+    extract::{Path, State},
     http::HeaderMap,
     response::Json,
     routing::{get, post},
@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::net::SocketAddr;
 use validator::Validate;
 
 use crate::errors::AppError;
+use crate::middleware::turnstile::require_turnstile_browser_proof;
 use crate::models::{CreateTaskRequest, TaskResponse, TrainerSubmissionRequest};
 use crate::AppState;
 
@@ -49,14 +49,6 @@ impl BorrowInteraction {
             Self::View => "view",
             Self::Copy => "copy",
         }
-    }
-
-    fn bucket_seconds(self) -> i64 {
-        match self {
-            Self::View => env_i64("BORROW_VIEW_BUCKET_SECONDS", 30 * 60),
-            Self::Copy => env_i64("BORROW_COPY_BUCKET_SECONDS", 10 * 60),
-        }
-        .max(60)
     }
 }
 
@@ -130,6 +122,12 @@ struct BorrowCounts {
     view_count: i64,
     copy_count: i64,
     theoretical_copy_count: i32,
+}
+
+#[derive(Clone, Debug)]
+struct BorrowActor {
+    hash: String,
+    bucket_start: chrono::DateTime<Utc>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -318,7 +316,6 @@ async fn report_trainer_unavailable(
 async fn track_borrow_view_batch(
     State(state): State<AppState>,
     headers: HeaderMap,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
     AxumJson(payload): AxumJson<BorrowViewBatchPayload>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if payload.views.len() > MAX_BORROW_VIEW_BATCH_SIZE {
@@ -361,8 +358,7 @@ async fn track_borrow_view_batch(
         tracing::error!("Failed to encode borrow view batch: {}", error);
         AppError::DatabaseError("Failed to track borrow views".to_string())
     })?;
-    let actor_hash = borrow_actor_hash(&headers, connect_info.map(|info| info.0));
-    let bucket_start = borrow_bucket_start(BorrowInteraction::View.bucket_seconds());
+    let actor = require_borrow_browser_actor(&state, &headers).await?;
 
     let (received_count, accepted_count, duplicate_count) = sqlx::query_as::<_, (i64, i64, i64)>(
         r#"
@@ -442,8 +438,8 @@ async fn track_borrow_view_batch(
             "#,
     )
     .bind(rows_json)
-    .bind(actor_hash)
-    .bind(bucket_start)
+    .bind(&actor.hash)
+    .bind(actor.bucket_start)
     .fetch_one(&state.db)
     .await
     .map_err(|error| {
@@ -464,7 +460,6 @@ async fn track_borrow_interaction(
     State(state): State<AppState>,
     Path((trainer_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
     payload: Option<AxumJson<BorrowInteractionPayload>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let Some(action) = BorrowInteraction::from_path(&interaction) else {
@@ -479,7 +474,6 @@ async fn track_borrow_interaction(
         BorrowContext::from_payload(payload.map(|AxumJson(payload)| payload)),
         action,
         &headers,
-        connect_info,
     )
     .await
 }
@@ -490,7 +484,6 @@ async fn track_trainer_copy(
     State(state): State<AppState>,
     Path(trainer_id): Path<String>,
     headers: HeaderMap,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     track_borrow(
         &state,
@@ -498,7 +491,6 @@ async fn track_trainer_copy(
         BorrowContext::from_payload(None),
         BorrowInteraction::Copy,
         &headers,
-        connect_info,
     )
     .await
 }
@@ -509,11 +501,9 @@ async fn track_borrow(
     context: BorrowContext,
     action: BorrowInteraction,
     headers: &HeaderMap,
-    connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let trainer_id = validate_trainer_id(trainer_id)?;
-    let actor_hash = borrow_actor_hash(headers, connect_info.map(|info| info.0));
-    let bucket_start = borrow_bucket_start(action.bucket_seconds());
+    let actor = require_borrow_browser_actor(state, headers).await?;
 
     let inserted_bucket = sqlx::query_scalar::<_, i32>(
         r#"
@@ -530,8 +520,8 @@ async fn track_borrow(
     .bind(context.inheritance_id)
     .bind(context.support_card_id)
     .bind(action.as_str())
-    .bind(&actor_hash)
-    .bind(bucket_start)
+    .bind(&actor.hash)
+    .bind(actor.bucket_start)
     .fetch_optional(&state.db)
     .await
     .map_err(|error| {
@@ -557,8 +547,8 @@ async fn track_borrow(
         .bind(context.inheritance_id)
         .bind(context.support_card_id)
         .bind(action.as_str())
-        .bind(&actor_hash)
-        .bind(bucket_start)
+        .bind(&actor.hash)
+        .bind(actor.bucket_start)
         .execute(&state.db)
         .await
         .map_err(|error| {
@@ -901,60 +891,47 @@ fn validate_trainer_id(trainer_id: &str) -> Result<&str, AppError> {
     Ok(trainer_id)
 }
 
-fn borrow_bucket_start(bucket_seconds: i64) -> chrono::DateTime<Utc> {
-    let now = Utc::now();
-    let bucket_timestamp = now.timestamp().div_euclid(bucket_seconds) * bucket_seconds;
-    Utc.timestamp_opt(bucket_timestamp, 0)
+async fn require_borrow_browser_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<BorrowActor, AppError> {
+    if has_api_key_header(headers) {
+        return Err(AppError::Forbidden("api_key_not_allowed".to_string()));
+    }
+
+    let proof = require_turnstile_browser_proof(headers, state.redis_store.as_ref())
+        .await
+        .map_err(|error| match error {
+            "browser_proof_unavailable" => {
+                AppError::DatabaseError("browser_proof_unavailable".to_string())
+            }
+            other => AppError::Forbidden(other.to_string()),
+        })?;
+    let material = format!("browser-proof:{}:{}", proof.subject(), proof.proof_id());
+    let issued_at = i64::try_from(proof.issued_at()).unwrap_or(i64::MAX);
+    let bucket_start = Utc
+        .timestamp_opt(issued_at, 0)
         .single()
-        .unwrap_or(now)
+        .unwrap_or_else(Utc::now);
+
+    Ok(BorrowActor {
+        hash: hex::encode(Sha256::digest(material.as_bytes())),
+        bucket_start,
+    })
 }
 
-fn borrow_actor_hash(headers: &HeaderMap, addr: Option<SocketAddr>) -> String {
-    let material = header_str(headers, "X-API-Key")
-        .or_else(|| header_str(headers, "X-API-Token"))
-        .map(|value| format!("api:{}", value.trim()))
-        .or_else(|| {
-            header_str(headers, "Authorization")
-                .and_then(|value| value.trim().strip_prefix("Bearer "))
-                .map(|value| format!("bearer:{}", value.trim()))
+fn has_api_key_header(headers: &HeaderMap) -> bool {
+    ["X-API-Key", "X-API-Token", "X-API-Tokens"]
+        .iter()
+        .any(|name| {
+            header_str(headers, name)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
         })
-        .unwrap_or_else(|| {
-            let client_ip = extract_client_ip(headers, addr);
-            let user_agent = header_str(headers, "User-Agent").unwrap_or("<none>").trim();
-            format!("browser:{}:{}", client_ip, user_agent)
-        });
-
-    hex::encode(Sha256::digest(material.as_bytes()))
-}
-
-fn extract_client_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> String {
-    if let Some(cf_ip) = header_str(headers, "CF-Connecting-IP") {
-        return cf_ip.to_string();
-    }
-
-    if let Some(forwarded_for) = header_str(headers, "X-Forwarded-For") {
-        if let Some(first_ip) = forwarded_for.split(',').next() {
-            return first_ip.trim().to_string();
-        }
-    }
-
-    if let Some(real_ip) = header_str(headers, "X-Real-IP") {
-        return real_ip.to_string();
-    }
-
-    addr.map(|addr| addr.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
-}
-
-fn env_i64(name: &str, default: i64) -> i64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or(default)
 }
 
 /// Get trainer availability status
