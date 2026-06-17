@@ -6,7 +6,7 @@ use axum::{
     Json as AxumJson, Router,
 };
 use chrono::{TimeZone, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -16,6 +16,8 @@ use validator::Validate;
 use crate::errors::AppError;
 use crate::models::{CreateTaskRequest, TaskResponse, TrainerSubmissionRequest};
 use crate::AppState;
+
+const MAX_BORROW_VIEW_BATCH_SIZE: usize = 100;
 
 /// Reset the tasks id sequence if it falls behind (e.g. after manual inserts).
 /// Called once on the first sequence-collision retry so subsequent inserts succeed.
@@ -66,6 +68,29 @@ struct BorrowInteractionPayload {
     support_card_experience: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BorrowViewBatchPayload {
+    views: Vec<BorrowViewPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BorrowViewPayload {
+    trainer_id: String,
+    inheritance_id: Option<i64>,
+    support_card_id: Option<i32>,
+    support_card_limit_break: Option<i32>,
+    support_card_experience: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct BorrowViewBatchRow {
+    trainer_id: String,
+    inheritance_id: i64,
+    support_card_id: i32,
+    support_card_limit_break: Option<i32>,
+    support_card_experience: Option<i32>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BorrowContext {
     inheritance_id: i64,
@@ -77,11 +102,25 @@ struct BorrowContext {
 impl BorrowContext {
     fn from_payload(payload: Option<BorrowInteractionPayload>) -> Self {
         let payload = payload.unwrap_or_default();
+        Self::from_parts(
+            payload.inheritance_id,
+            payload.support_card_id,
+            payload.support_card_limit_break,
+            payload.support_card_experience,
+        )
+    }
+
+    fn from_parts(
+        inheritance_id: Option<i64>,
+        support_card_id: Option<i32>,
+        support_card_limit_break: Option<i32>,
+        support_card_experience: Option<i32>,
+    ) -> Self {
         Self {
-            inheritance_id: payload.inheritance_id.unwrap_or(0).max(0),
-            support_card_id: payload.support_card_id.unwrap_or(0).max(0),
-            support_card_limit_break: payload.support_card_limit_break.filter(|value| *value >= 0),
-            support_card_experience: payload.support_card_experience.filter(|value| *value >= 0),
+            inheritance_id: inheritance_id.unwrap_or(0).max(0),
+            support_card_id: support_card_id.unwrap_or(0).max(0),
+            support_card_limit_break: support_card_limit_break.filter(|value| *value >= 0),
+            support_card_experience: support_card_experience.filter(|value| *value >= 0),
         }
     }
 }
@@ -101,6 +140,7 @@ pub fn router() -> Router<AppState> {
             "/report-unavailable/:trainer_id",
             post(report_trainer_unavailable),
         )
+        .route("/borrow/views", post(track_borrow_view_batch))
         .route(
             "/borrow/:trainer_id/:interaction",
             post(track_borrow_interaction),
@@ -272,6 +312,151 @@ async fn report_trainer_unavailable(
         "success": true,
         "task_created": true,
         "message": "Trainer scheduled for immediate update"
+    })))
+}
+
+async fn track_borrow_view_batch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    AxumJson(payload): AxumJson<BorrowViewBatchPayload>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if payload.views.len() > MAX_BORROW_VIEW_BATCH_SIZE {
+        return Err(AppError::BadRequest(format!(
+            "Borrow view batch is too large. Maximum is {} views.",
+            MAX_BORROW_VIEW_BATCH_SIZE
+        )));
+    }
+
+    if payload.views.is_empty() {
+        return Ok(Json(json!({
+            "success": true,
+            "submitted_count": 0,
+            "received_count": 0,
+            "accepted_count": 0,
+            "duplicate_count": 0
+        })));
+    }
+
+    let mut rows = Vec::with_capacity(payload.views.len());
+    for view in payload.views {
+        let trainer_id = validate_trainer_id(&view.trainer_id)?.to_string();
+        let context = BorrowContext::from_parts(
+            view.inheritance_id,
+            view.support_card_id,
+            view.support_card_limit_break,
+            view.support_card_experience,
+        );
+        rows.push(BorrowViewBatchRow {
+            trainer_id,
+            inheritance_id: context.inheritance_id,
+            support_card_id: context.support_card_id,
+            support_card_limit_break: context.support_card_limit_break,
+            support_card_experience: context.support_card_experience,
+        });
+    }
+
+    let submitted_count = rows.len();
+    let rows_json = serde_json::to_value(&rows).map_err(|error| {
+        tracing::error!("Failed to encode borrow view batch: {}", error);
+        AppError::DatabaseError("Failed to track borrow views".to_string())
+    })?;
+    let actor_hash = borrow_actor_hash(&headers, connect_info.map(|info| info.0));
+    let bucket_start = borrow_bucket_start(BorrowInteraction::View.bucket_seconds());
+
+    let (received_count, accepted_count, duplicate_count) = sqlx::query_as::<_, (i64, i64, i64)>(
+        r#"
+            WITH incoming_raw AS (
+                SELECT *
+                FROM jsonb_to_recordset($1::jsonb) AS item(
+                    trainer_id TEXT,
+                    inheritance_id BIGINT,
+                    support_card_id INTEGER,
+                    support_card_limit_break INTEGER,
+                    support_card_experience INTEGER
+                )
+            ),
+            incoming AS (
+                SELECT DISTINCT ON (trainer_id, inheritance_id, support_card_id)
+                    trainer_id,
+                    inheritance_id,
+                    support_card_id,
+                    support_card_limit_break,
+                    support_card_experience
+                FROM incoming_raw
+                ORDER BY trainer_id, inheritance_id, support_card_id
+            ),
+            updated_existing AS (
+                UPDATE borrow_interaction_buckets bucket
+                SET event_count = bucket.event_count + 1,
+                    updated_at = NOW()
+                FROM incoming
+                WHERE bucket.trainer_id = incoming.trainer_id
+                  AND bucket.inheritance_id = incoming.inheritance_id
+                  AND bucket.support_card_id = incoming.support_card_id
+                  AND bucket.interaction_type = 'view'
+                  AND bucket.actor_hash = $2
+                  AND bucket.bucket_start = $3
+                RETURNING bucket.trainer_id
+            ),
+            inserted AS (
+                INSERT INTO borrow_interaction_buckets (
+                    trainer_id, inheritance_id, support_card_id,
+                    interaction_type, actor_hash, bucket_start, event_count, created_at, updated_at
+                )
+                SELECT trainer_id, inheritance_id, support_card_id, 'view', $2, $3, 1, NOW(), NOW()
+                FROM incoming
+                ON CONFLICT DO NOTHING
+                RETURNING trainer_id, inheritance_id, support_card_id
+            ),
+            updated_totals AS (
+                INSERT INTO borrow_interaction_totals (
+                    trainer_id, inheritance_id, support_card_id,
+                    support_card_limit_break, support_card_experience,
+                    view_count, last_viewed_at, created_at, updated_at
+                )
+                SELECT
+                    incoming.trainer_id,
+                    incoming.inheritance_id,
+                    incoming.support_card_id,
+                    incoming.support_card_limit_break,
+                    incoming.support_card_experience,
+                    1,
+                    NOW(),
+                    NOW(),
+                    NOW()
+                FROM inserted
+                JOIN incoming USING (trainer_id, inheritance_id, support_card_id)
+                ON CONFLICT (trainer_id, inheritance_id, support_card_id) DO UPDATE SET
+                    view_count = borrow_interaction_totals.view_count + 1,
+                    support_card_limit_break = EXCLUDED.support_card_limit_break,
+                    support_card_experience = EXCLUDED.support_card_experience,
+                    last_viewed_at = NOW(),
+                    updated_at = NOW()
+                RETURNING trainer_id
+            )
+            SELECT
+                (SELECT COUNT(*) FROM incoming)::bigint AS received_count,
+                (SELECT COUNT(*) FROM updated_totals)::bigint AS accepted_count,
+                (SELECT COUNT(*) FROM updated_existing)::bigint AS duplicate_count
+            "#,
+    )
+    .bind(rows_json)
+    .bind(actor_hash)
+    .bind(bucket_start)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!("Failed to track borrow view batch: {}", error);
+        AppError::DatabaseError("Failed to track borrow views".to_string())
+    })?;
+
+    Ok(Json(json!({
+        "success": true,
+        "submitted_count": submitted_count,
+        "received_count": received_count,
+        "accepted_count": accepted_count,
+        "duplicate_count": duplicate_count
     })))
 }
 
