@@ -81,6 +81,13 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing - production uses WARN/ERROR only, development uses INFO
@@ -362,6 +369,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Start background task to clean up expired cache entries every 10 minutes
     tokio::spawn(cache_cleanup_task());
+
+    // Start background task to clean up short-lived borrow anti-spam buckets
+    tokio::spawn(cleanup_borrow_interaction_buckets_task(pool.clone()));
 
     // Start background task to incrementally refresh suspicious-activity analysis
     tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
@@ -1128,6 +1138,52 @@ async fn cache_cleanup_task() {
         );
 
         tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+    }
+}
+
+async fn cleanup_borrow_interaction_buckets_task(pool: PgPool) {
+    let retention_seconds =
+        env_u64("BORROW_INTERACTION_BUCKET_RETENTION_SECONDS", 24 * 60 * 60).max(600);
+    let interval_seconds = env_u64(
+        "BORROW_INTERACTION_BUCKET_CLEANUP_INTERVAL_SECONDS",
+        60 * 60,
+    )
+    .max(300);
+
+    info!(
+        "Starting borrow interaction bucket cleanup task (retention={}s, interval={}s)",
+        retention_seconds, interval_seconds
+    );
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(180)).await;
+
+    loop {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM borrow_interaction_buckets
+            WHERE bucket_start < NOW() - ($1::bigint * interval '1 second')
+            "#,
+        )
+        .bind(retention_seconds as i64)
+        .execute(&pool)
+        .await;
+
+        match result {
+            Ok(result) => {
+                if result.rows_affected() > 0 {
+                    info!(
+                        "Cleaned up {} expired borrow interaction bucket rows",
+                        result.rows_affected()
+                    );
+                }
+            }
+            Err(error) => warn!(
+                "Failed to clean up expired borrow interaction buckets: {}",
+                error
+            ),
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(interval_seconds)).await;
     }
 }
 

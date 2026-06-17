@@ -793,7 +793,7 @@ async fn maybe_create_full_follower_recheck(
 
     let task_data = json!({
         "id": trainer_id,
-        "action": "recheck",
+        "action": "search",
         "reason": "borrow_theoretical_full_followers",
         "inheritance_id": context.inheritance_id,
         "support_card_id": context.support_card_id,
@@ -811,13 +811,13 @@ async fn maybe_create_full_follower_recheck(
             WHERE NOT EXISTS (
                 SELECT 1
                 FROM tasks
-                WHERE task_type IN ('friend/search', 'friend/recheck')
+                WHERE task_type = 'friend/search'
                   AND status IN ('pending', 'processing')
                   AND (task_data->>'id' = $4 OR task_data->>'friend_viewer_id' = $4)
             )
             "#,
         )
-        .bind("friend/recheck")
+        .bind("friend/search")
         .bind(&task_data)
         .bind(5i32)
         .bind(trainer_id)

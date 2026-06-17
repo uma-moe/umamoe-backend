@@ -73,6 +73,9 @@ CREATE INDEX IF NOT EXISTS idx_borrow_interaction_totals_recent_copies
 CREATE INDEX IF NOT EXISTS idx_borrow_interaction_buckets_actor_recent
     ON borrow_interaction_buckets (actor_hash, bucket_start DESC);
 
+CREATE INDEX IF NOT EXISTS idx_borrow_interaction_buckets_bucket_start
+    ON borrow_interaction_buckets (bucket_start);
+
 CREATE INDEX IF NOT EXISTS idx_borrow_interaction_buckets_combo_recent
     ON borrow_interaction_buckets (
         trainer_id, inheritance_id, support_card_id, interaction_type, bucket_start DESC
