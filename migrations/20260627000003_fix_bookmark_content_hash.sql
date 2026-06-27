@@ -4,17 +4,9 @@
 -- counts are visible in bookmark records and can change independently from the
 -- white factor id arrays, the old comparison could miss real changes.
 --
--- Preserve bookmarks that were known to match under the old hash before
--- recalculating content_hash with the fixed definition. Bookmarks already
--- stale under the old definition stay stale.
-
-BEGIN;
-
-CREATE TEMP TABLE _bookmark_hash_matches ON COMMIT DROP AS
-SELECT ub.id
-FROM user_bookmarks ub
-JOIN inheritance i ON i.account_id = ub.account_id
-WHERE ub.bookmarked_hash IS NOT DISTINCT FROM i.content_hash;
+-- This migration is intentionally schema/function-only. Existing rows are
+-- recomputed by a Rust background job in small autocommit batches so deploying
+-- this cannot rewrite the full inheritance table in one startup transaction.
 
 CREATE OR REPLACE FUNCTION inheritance_content_hash()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
@@ -61,16 +53,15 @@ CREATE TRIGGER trg_inheritance_content_hash
     BEFORE INSERT OR UPDATE ON inheritance
     FOR EACH ROW EXECUTE FUNCTION inheritance_content_hash();
 
--- Recompute every row with the new trigger definition.
-UPDATE inheritance
-SET content_hash = content_hash;
+CREATE TABLE IF NOT EXISTS bookmark_content_hash_backfill_queue (
+    account_id VARCHAR(255) PRIMARY KEY,
+    queued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processed_at TIMESTAMPTZ,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
--- Carry forward snapshots for bookmarks that matched immediately before the
--- hash definition changed. Existing modified bookmarks keep their old snapshot.
-UPDATE user_bookmarks ub
-SET bookmarked_hash = i.content_hash
-FROM inheritance i, _bookmark_hash_matches m
-WHERE m.id = ub.id
-  AND i.account_id = ub.account_id;
-
-COMMIT;
+CREATE INDEX IF NOT EXISTS idx_bookmark_content_hash_backfill_pending
+    ON bookmark_content_hash_backfill_queue (queued_at, account_id)
+    WHERE processed_at IS NULL;

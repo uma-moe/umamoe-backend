@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use sqlx::PgPool;
+use sqlx::{pool::PoolConnection, PgPool, Postgres};
 use std::net::{IpAddr, SocketAddr};
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -349,33 +349,44 @@ async fn main() -> anyhow::Result<()> {
         user_writes_disabled,
     };
 
-    // Start background task to refresh materialized views every hour
-    tokio::spawn(refresh_stats_task(pool.clone()));
-
-    // Start background task to refresh circle live ranks every 5 minutes
-    tokio::spawn(refresh_circle_ranks_task(pool.clone()));
-
-    // Start background task to refresh user fan rankings every hour
-    tokio::spawn(refresh_user_rankings_task(pool.clone()));
-
-    if user_writes_disabled {
-        warn!("🔒 Daily stats table writes are disabled in user-write read-only mode");
+    let db_background_jobs_disabled = skip_migrations
+        || env_flag("DISABLE_DB_BACKGROUND_JOBS")
+        || env_flag("DISABLE_DB_MAINTENANCE_TASKS");
+    if user_writes_disabled || db_background_jobs_disabled {
+        warn!(
+            "Skipping DB-writing background jobs (user_writes_disabled={}, skip_or_disabled={})",
+            user_writes_disabled, db_background_jobs_disabled
+        );
     } else {
+        // Start background task to refresh materialized views every hour
+        tokio::spawn(refresh_stats_task(pool.clone()));
+
+        // Start background task to refresh circle live ranks every 5 minutes
+        tokio::spawn(refresh_circle_ranks_task(pool.clone()));
+
+        // Start background task to refresh user fan rankings every hour
+        tokio::spawn(refresh_user_rankings_task(pool.clone()));
+
         // Start background task to ensure daily stats entries exist
         tokio::spawn(ensure_daily_stats_task(pool.clone()));
-    }
 
-    // Start background task to clear stale live_points/live_rank every hour
-    tokio::spawn(clear_stale_live_task(pool.clone()));
+        // Start background task to clear stale live_points/live_rank every hour
+        tokio::spawn(clear_stale_live_task(pool.clone()));
+    }
 
     // Start background task to clean up expired cache entries every 10 minutes
     tokio::spawn(cache_cleanup_task());
 
-    // Start background task to clean up short-lived borrow anti-spam buckets
-    tokio::spawn(cleanup_borrow_interaction_buckets_v2_task(pool.clone()));
+    if !(user_writes_disabled || db_background_jobs_disabled) {
+        // Start background task to clean up short-lived borrow anti-spam buckets
+        tokio::spawn(cleanup_borrow_interaction_buckets_v2_task(pool.clone()));
 
-    // Start background task to incrementally refresh suspicious-activity analysis
-    tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
+        // Start background task to incrementally refresh suspicious-activity analysis
+        tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
+
+        // Start background task to repair bookmark content-hash snapshots in small batches
+        tokio::spawn(backfill_bookmark_hashes_task(pool.clone()));
+    }
 
     let internal_api_host = std::env::var("INTERNAL_API_HOST")
         .or_else(|_| std::env::var("BROWSER_PROOF_INTERNAL_HOST"))
@@ -879,6 +890,108 @@ async fn backfill_email_hashes(pool: &PgPool) {
 
 // Background task to refresh materialized views periodically
 // Background task that nulls out stale live_points / live_rank for circles.
+async fn acquire_maintenance_connection(
+    pool: &PgPool,
+    lock_name: &str,
+) -> Option<PoolConnection<Postgres>> {
+    let mut conn = match pool.acquire().await {
+        Ok(conn) => conn,
+        Err(error) => {
+            warn!(
+                "Skipping maintenance job {} because no DB connection was available: {}",
+                lock_name, error
+            );
+            return None;
+        }
+    };
+
+    match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(hashtext($1)::bigint)")
+        .bind(lock_name)
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(true) => Some(conn),
+        Ok(false) => {
+            info!(
+                "Skipping maintenance job {} because another backend owns the lock",
+                lock_name
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                "Skipping maintenance job {} because the advisory lock failed: {}",
+                lock_name, error
+            );
+            None
+        }
+    }
+}
+
+async fn release_maintenance_lock(conn: &mut PoolConnection<Postgres>, lock_name: &str) {
+    if let Err(error) = sqlx::query("SELECT pg_advisory_unlock(hashtext($1)::bigint)")
+        .bind(lock_name)
+        .execute(&mut **conn)
+        .await
+    {
+        warn!(
+            "Failed to release maintenance lock {}: {}",
+            lock_name, error
+        );
+    }
+}
+
+async fn current_timeout_settings(
+    conn: &mut PoolConnection<Postgres>,
+) -> Result<(String, String), sqlx::Error> {
+    sqlx::query_as("SELECT current_setting('statement_timeout'), current_setting('lock_timeout')")
+        .fetch_one(&mut **conn)
+        .await
+}
+
+async fn set_maintenance_timeouts(
+    conn: &mut PoolConnection<Postgres>,
+    statement_timeout_seconds: u64,
+    lock_timeout_seconds: u64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT set_config('statement_timeout', $1, false), set_config('lock_timeout', $2, false)",
+    )
+    .bind(format!("{}s", statement_timeout_seconds))
+    .bind(format!("{}s", lock_timeout_seconds))
+    .execute(&mut **conn)
+    .await?;
+    Ok(())
+}
+
+async fn restore_timeout_settings(
+    conn: &mut PoolConnection<Postgres>,
+    previous_statement_timeout: &str,
+    previous_lock_timeout: &str,
+) {
+    if let Err(error) = sqlx::query(
+        "SELECT set_config('statement_timeout', $1, false), set_config('lock_timeout', $2, false)",
+    )
+    .bind(previous_statement_timeout)
+    .bind(previous_lock_timeout)
+    .execute(&mut **conn)
+    .await
+    {
+        warn!("Failed to restore maintenance DB timeouts: {}", error);
+    }
+}
+
+fn safe_materialized_view_name(view_name: &str) -> Option<&'static str> {
+    match view_name {
+        "stats_counts" => Some("stats_counts"),
+        "circle_live_ranks" => Some("circle_live_ranks"),
+        "user_fan_rankings_monthly_current" => Some("user_fan_rankings_monthly_current"),
+        "user_fan_rankings_alltime" => Some("user_fan_rankings_alltime"),
+        "user_fan_rankings_gains" => Some("user_fan_rankings_gains"),
+        _ => None,
+    }
+}
+
 async fn clear_stale_live_task(pool: PgPool) {
     info!("🔄 Starting stale live-data cleanup task (runs every hour)");
     tokio::time::sleep(tokio::time::Duration::from_secs(45)).await;
@@ -1097,27 +1210,254 @@ async fn refresh_user_rankings_task(pool: PgPool) {
     }
 }
 
-/// Refresh a materialized view, falling back to non-concurrent if needed
+/// Refresh a materialized view without letting every backend container run it at once.
 async fn refresh_mat_view(pool: &PgPool, view_name: &str) {
+    let Some(view_name) = safe_materialized_view_name(view_name) else {
+        warn!(
+            "Refusing to refresh unknown materialized view {}",
+            view_name
+        );
+        return;
+    };
+
+    let lock_name = format!("matview_refresh:{}", view_name);
+    let Some(mut conn) = acquire_maintenance_connection(pool, &lock_name).await else {
+        return;
+    };
+
     let start = std::time::Instant::now();
     let sql_concurrent = format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {}", view_name);
     let sql_full = format!("REFRESH MATERIALIZED VIEW {}", view_name);
+    let previous_timeouts = current_timeout_settings(&mut conn).await.ok();
+    if let Err(error) = set_maintenance_timeouts(
+        &mut conn,
+        env_u64("MATVIEW_REFRESH_STATEMENT_TIMEOUT_SECONDS", 300).max(30),
+        env_u64("MATVIEW_REFRESH_LOCK_TIMEOUT_SECONDS", 3).max(1),
+    )
+    .await
+    {
+        warn!(
+            "Failed to set maintenance DB timeouts before refreshing {}: {}",
+            view_name, error
+        );
+        release_maintenance_lock(&mut conn, &lock_name).await;
+        return;
+    }
 
-    match sqlx::query(&sql_concurrent).execute(pool).await {
+    match sqlx::query(&sql_concurrent).execute(&mut *conn).await {
         Ok(_) => info!(
             "✅ {} refreshed in {:.1}s",
             view_name,
             start.elapsed().as_secs_f64()
         ),
-        Err(_) => match sqlx::query(&sql_full).execute(pool).await {
-            Ok(_) => info!(
-                "✅ {} refreshed (non-concurrent) in {:.1}s",
-                view_name,
-                start.elapsed().as_secs_f64()
-            ),
-            Err(e) => warn!("⚠️ Failed to refresh {}: {}", view_name, e),
-        },
+        Err(error) if env_flag("MATVIEW_REFRESH_ALLOW_NONCONCURRENT") => {
+            warn!(
+                "Concurrent refresh failed for {}, trying non-concurrent refresh: {}",
+                view_name, error
+            );
+            match sqlx::query(&sql_full).execute(&mut *conn).await {
+                Ok(_) => info!(
+                    "✅ {} refreshed (non-concurrent) in {:.1}s",
+                    view_name,
+                    start.elapsed().as_secs_f64()
+                ),
+                Err(e) => warn!("⚠️ Failed to refresh {}: {}", view_name, e),
+            }
+        }
+        Err(error) => warn!("Failed to refresh {}: {}", view_name, error),
     }
+
+    if let Some((statement_timeout, lock_timeout)) = previous_timeouts {
+        restore_timeout_settings(&mut conn, &statement_timeout, &lock_timeout).await;
+    }
+    release_maintenance_lock(&mut conn, &lock_name).await;
+}
+
+#[derive(Debug, Default)]
+struct BookmarkHashBackfillStats {
+    queued_accounts: i64,
+    pending_queued_accounts: i64,
+    processed_accounts: i64,
+    updated_inheritances: i64,
+    updated_bookmarks: i64,
+}
+
+async fn backfill_bookmark_hashes_task(pool: PgPool) {
+    if env_flag("DISABLE_BOOKMARK_HASH_BACKFILL") {
+        warn!("Bookmark content-hash backfill task disabled by env");
+        return;
+    }
+
+    let start_delay_seconds = env_u64("BOOKMARK_HASH_BACKFILL_START_DELAY_SECONDS", 300);
+    let interval_seconds = env_u64("BOOKMARK_HASH_BACKFILL_INTERVAL_SECONDS", 5).max(1);
+    let idle_interval_seconds =
+        env_u64("BOOKMARK_HASH_BACKFILL_IDLE_INTERVAL_SECONDS", 3600).max(60);
+    let queue_batch_size =
+        env_u64("BOOKMARK_HASH_BACKFILL_QUEUE_BATCH_SIZE", 5000).clamp(100, 50_000) as i64;
+    let process_batch_size =
+        env_u64("BOOKMARK_HASH_BACKFILL_BATCH_SIZE", 100).clamp(1, 1000) as i64;
+
+    warn!(
+        "Starting bookmark hash backfill task (queue_batch={}, process_batch={}, interval={}s)",
+        queue_batch_size, process_batch_size, interval_seconds
+    );
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(start_delay_seconds)).await;
+
+    loop {
+        match run_bookmark_hash_backfill_batch(&pool, queue_batch_size, process_batch_size).await {
+            Ok(stats) => {
+                if stats.queued_accounts > 0
+                    || stats.processed_accounts > 0
+                    || stats.updated_inheritances > 0
+                    || stats.updated_bookmarks > 0
+                {
+                    warn!(
+                        "Bookmark hash backfill batch: queued={}, pending_queued={}, processed_accounts={}, updated_inheritances={}, updated_bookmarks={}",
+                        stats.queued_accounts,
+                        stats.pending_queued_accounts,
+                        stats.processed_accounts,
+                        stats.updated_inheritances,
+                        stats.updated_bookmarks
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(interval_seconds)).await;
+                } else {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(idle_interval_seconds))
+                        .await;
+                }
+            }
+            Err(error) => {
+                warn!("Bookmark hash backfill batch failed: {}", error);
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            }
+        }
+    }
+}
+
+async fn run_bookmark_hash_backfill_batch(
+    pool: &PgPool,
+    queue_batch_size: i64,
+    process_batch_size: i64,
+) -> anyhow::Result<BookmarkHashBackfillStats> {
+    use sqlx::Row;
+
+    let lock_name = "bookmark_content_hash_backfill";
+    let Some(mut conn) = acquire_maintenance_connection(pool, lock_name).await else {
+        return Ok(BookmarkHashBackfillStats::default());
+    };
+
+    let previous_timeouts = current_timeout_settings(&mut conn).await.ok();
+    let result = async {
+        set_maintenance_timeouts(
+            &mut conn,
+            env_u64("BOOKMARK_HASH_BACKFILL_STATEMENT_TIMEOUT_SECONDS", 30).max(5),
+            env_u64("BOOKMARK_HASH_BACKFILL_LOCK_TIMEOUT_SECONDS", 2).max(1),
+        )
+        .await?;
+
+        let queued_accounts: i64 = sqlx::query_scalar(
+            r#"
+            WITH queued AS (
+                INSERT INTO bookmark_content_hash_backfill_queue (account_id)
+                SELECT account_id
+                FROM (
+                    SELECT DISTINCT ub.account_id
+                    FROM user_bookmarks ub
+                    LEFT JOIN bookmark_content_hash_backfill_queue q
+                        ON q.account_id = ub.account_id
+                    WHERE ub.account_id IS NOT NULL
+                      AND q.account_id IS NULL
+                    ORDER BY ub.account_id
+                    LIMIT $1
+                ) pending
+                ON CONFLICT (account_id) DO NOTHING
+                RETURNING 1
+            )
+            SELECT COUNT(*)::bigint FROM queued
+            "#,
+        )
+        .bind(queue_batch_size)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        let row = sqlx::query(
+            r#"
+            WITH batch AS MATERIALIZED (
+                SELECT account_id
+                FROM bookmark_content_hash_backfill_queue
+                WHERE processed_at IS NULL
+                ORDER BY queued_at, account_id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            ),
+            old_matches AS MATERIALIZED (
+                SELECT ub.id, ub.account_id
+                FROM user_bookmarks ub
+                JOIN inheritance i ON i.account_id = ub.account_id
+                JOIN batch b ON b.account_id = ub.account_id
+                WHERE ub.bookmarked_hash IS NOT DISTINCT FROM i.content_hash
+            ),
+            updated_inheritance AS (
+                UPDATE inheritance i
+                SET content_hash = i.content_hash
+                FROM batch b
+                WHERE i.account_id = b.account_id
+                RETURNING i.account_id, i.content_hash
+            ),
+            updated_bookmarks AS (
+                UPDATE user_bookmarks ub
+                SET bookmarked_hash = ui.content_hash
+                FROM updated_inheritance ui
+                JOIN old_matches m ON m.account_id = ui.account_id
+                WHERE ub.id = m.id
+                RETURNING ub.id
+            ),
+            marked AS (
+                UPDATE bookmark_content_hash_backfill_queue q
+                SET
+                    processed_at = NOW(),
+                    attempts = attempts + 1,
+                    last_error = NULL,
+                    updated_at = NOW()
+                FROM batch b
+                WHERE q.account_id = b.account_id
+                RETURNING q.account_id
+            )
+            SELECT
+                (SELECT COUNT(*)::bigint FROM marked) AS processed_accounts,
+                (SELECT COUNT(*)::bigint FROM updated_inheritance) AS updated_inheritances,
+                (SELECT COUNT(*)::bigint FROM updated_bookmarks) AS updated_bookmarks
+            "#,
+        )
+        .bind(process_batch_size)
+        .fetch_one(&mut *conn)
+        .await?;
+
+        let pending_queued_accounts: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)::bigint
+            FROM bookmark_content_hash_backfill_queue
+            WHERE processed_at IS NULL
+            "#,
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+
+        Ok(BookmarkHashBackfillStats {
+            queued_accounts,
+            pending_queued_accounts,
+            processed_accounts: row.get("processed_accounts"),
+            updated_inheritances: row.get("updated_inheritances"),
+            updated_bookmarks: row.get("updated_bookmarks"),
+        })
+    }
+    .await;
+
+    if let Some((statement_timeout, lock_timeout)) = previous_timeouts {
+        restore_timeout_settings(&mut conn, &statement_timeout, &lock_timeout).await;
+    }
+    release_maintenance_lock(&mut conn, lock_name).await;
+    result
 }
 
 // Background task to clean up expired cache entries
