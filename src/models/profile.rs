@@ -24,6 +24,7 @@ pub struct ProfileResponse {
 #[derive(Debug, Serialize, FromRow)]
 pub struct BorrowStats {
     pub trainer_id: String,
+    pub borrow_key: String,
     pub inheritance_id: i64,
     pub support_card_id: i32,
     pub view_count: i64,

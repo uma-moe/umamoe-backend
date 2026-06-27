@@ -1,5 +1,6 @@
 pub mod affinity;
 pub mod auth;
+pub mod borrow;
 pub mod circles;
 pub mod docs;
 pub mod partner;

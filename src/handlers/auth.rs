@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, Query, State},
     response::{Json, Redirect},
     routing::{delete, get, post},
-    Router,
+    Json as AxumJson, Router,
 };
 use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
@@ -11,9 +11,10 @@ use oauth2::{
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::borrow_key;
 use crate::errors::AppError;
 use crate::middleware::auth::AuthenticatedUser;
 use crate::models::auth::{
@@ -1258,13 +1259,14 @@ async fn revoke_api_key(
 ///
 /// Bookmarks are keyed by `account_id` (stable per trainer), not by
 /// `inheritance_id` (regenerated on every 7-day refresh). Each record
-/// carries an `is_stale` flag that is true when the trainer's inheritance
-/// has changed since the user bookmarked it — cheap to compute because
-/// `inheritance.content_hash` is a STORED generated column.
+/// carries an `is_stale` flag that is true when the visible inheritance/support
+/// combo has changed since the user bookmarked it. Legacy content-hash
+/// bookmarks are accepted while they still match and then lazily upgraded.
 async fn list_bookmarks(
     user: AuthenticatedUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<UnifiedAccountRecord>>, AppError> {
+    let user_id = user.user_id;
     let rows = sqlx::query(
         r#"
         SELECT
@@ -1272,6 +1274,9 @@ async fn list_bookmarks(
             t.name AS trainer_name,
             t.follower_num,
             t.last_updated,
+            i.content_hash,
+            ub.bookmarked_hash,
+            ub.bookmarked_borrow_key,
             i.inheritance_id,
             i.main_parent_id,
             i.parent_left_id,
@@ -1310,35 +1315,62 @@ async fn list_bookmarks(
             (COALESCE(i.base_affinity, 0) + COALESCE(i.race_affinity, 0)) AS affinity_score,
             sc.support_card_id,
             sc.limit_break_count,
-            sc.experience,
-            (ub.bookmarked_hash IS DISTINCT FROM i.content_hash) AS is_stale
+            sc.experience
         FROM user_bookmarks ub
         JOIN inheritance i ON i.account_id = ub.account_id
         JOIN trainer t ON t.account_id = i.account_id
-        LEFT JOIN support_card sc ON sc.account_id = i.account_id
+        LEFT JOIN LATERAL (
+            SELECT support_card_id, limit_break_count, experience
+            FROM support_card sc
+            WHERE sc.account_id = i.account_id
+            ORDER BY
+                CASE
+                    WHEN ub.support_card_id IS NOT NULL
+                     AND sc.support_card_id = ub.support_card_id
+                     AND (
+                         ub.support_card_limit_break IS NULL
+                         OR sc.limit_break_count IS NOT DISTINCT FROM ub.support_card_limit_break
+                     )
+                     AND (
+                         ub.support_card_experience IS NULL
+                         OR sc.experience = ub.support_card_experience
+                     )
+                    THEN 0
+                    WHEN ub.support_card_id IS NOT NULL
+                     AND sc.support_card_id = ub.support_card_id
+                    THEN 1
+                    ELSE 2
+                END,
+                sc.support_card_id
+            LIMIT 1
+        ) sc ON true
         WHERE ub.user_id = $1
         ORDER BY ub.created_at DESC
         "#,
     )
-    .bind(user.user_id)
+    .bind(user_id)
     .fetch_all(&state.db)
     .await?;
 
+    let mut upgrades = Vec::new();
     let records = rows
         .into_iter()
         .map(|row| {
             use sqlx::Row;
             let account_id: String = row.get("account_id");
-            let support_card = row
+            let bookmarked_hash: Option<String> = row.get("bookmarked_hash");
+            let bookmarked_borrow_key: Option<String> = row.get("bookmarked_borrow_key");
+            let content_hash: Option<String> = row.get("content_hash");
+            let support_card_id = row
                 .try_get::<Option<i32>, _>("support_card_id")
                 .ok()
-                .flatten()
-                .map(|_| SupportCard {
-                    account_id: account_id.clone(),
-                    support_card_id: row.get("support_card_id"),
-                    limit_break_count: row.get("limit_break_count"),
-                    experience: row.get("experience"),
-                });
+                .flatten();
+            let support_card = support_card_id.map(|support_card_id| SupportCard {
+                account_id: account_id.clone(),
+                support_card_id,
+                limit_break_count: row.get("limit_break_count"),
+                experience: row.get("experience"),
+            });
             let inheritance = Some(Inheritance {
                 inheritance_id: row.get("inheritance_id"),
                 account_id: account_id.clone(),
@@ -1378,6 +1410,44 @@ async fn list_bookmarks(
                 white_stars_sum: row.get("white_stars_sum"),
                 affinity_score: row.try_get("affinity_score").ok(),
             });
+            let current_hash =
+                borrow_key::key_from_profile(inheritance.as_ref(), support_card.as_ref());
+            let has_borrow_key = bookmarked_borrow_key.is_some();
+            let matches_current = bookmarked_borrow_key
+                .as_deref()
+                .map(|hash| hash.eq_ignore_ascii_case(&current_hash))
+                .unwrap_or(false);
+            let matches_unsafe_borrow_hash = !has_borrow_key
+                && bookmarked_hash
+                    .as_deref()
+                    .map(|hash| hash.eq_ignore_ascii_case(&current_hash))
+                    .unwrap_or(false);
+            let matches_legacy_content = !has_borrow_key
+                && match (bookmarked_hash.as_deref(), content_hash.as_deref()) {
+                    (Some(saved), Some(current)) => saved == current,
+                    (None, None) => true,
+                    _ => false,
+                };
+            let is_stale =
+                !(matches_current || matches_legacy_content || matches_unsafe_borrow_hash);
+
+            if !has_borrow_key && (matches_legacy_content || matches_unsafe_borrow_hash) {
+                upgrades.push(BookmarkHashUpgrade {
+                    account_id: account_id.clone(),
+                    previous_hash: bookmarked_hash.clone(),
+                    previous_borrow_key: bookmarked_borrow_key.clone(),
+                    next_hash: current_hash,
+                    legacy_hash: matches_unsafe_borrow_hash
+                        .then_some(content_hash.clone())
+                        .flatten(),
+                    support_card_id: support_card.as_ref().map(|card| card.support_card_id),
+                    support_card_limit_break: support_card
+                        .as_ref()
+                        .and_then(|card| card.limit_break_count),
+                    support_card_experience: support_card.as_ref().map(|card| card.experience),
+                });
+            }
+
             UnifiedAccountRecord {
                 account_id,
                 trainer_name: row.get("trainer_name"),
@@ -1385,23 +1455,84 @@ async fn list_bookmarks(
                 last_updated: row.get("last_updated"),
                 inheritance,
                 support_card,
-                is_stale: Some(row.get::<bool, _>("is_stale")),
+                is_stale: Some(is_stale),
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    if !state.user_writes_disabled {
+        for upgrade in upgrades {
+            if let Err(error) = sqlx::query(
+                r#"
+                UPDATE user_bookmarks
+                SET
+                    bookmarked_borrow_key = $3,
+                    bookmarked_hash = COALESCE($4, bookmarked_hash),
+                    support_card_id = $5,
+                    support_card_limit_break = $6,
+                    support_card_experience = $7
+                WHERE user_id = $1
+                  AND account_id = $2
+                  AND bookmarked_hash IS NOT DISTINCT FROM $8
+                  AND bookmarked_borrow_key IS NOT DISTINCT FROM $9
+                "#,
+            )
+            .bind(user_id)
+            .bind(&upgrade.account_id)
+            .bind(&upgrade.next_hash)
+            .bind(&upgrade.legacy_hash)
+            .bind(upgrade.support_card_id)
+            .bind(upgrade.support_card_limit_break)
+            .bind(upgrade.support_card_experience)
+            .bind(&upgrade.previous_hash)
+            .bind(&upgrade.previous_borrow_key)
+            .execute(&state.db)
+            .await
+            {
+                warn!(
+                    "Failed to lazily upgrade bookmark hash for {}: {}",
+                    upgrade.account_id, error
+                );
+            }
+        }
+    }
 
     Ok(Json(records))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct AddBookmarkRequest {
+    borrow_key: Option<String>,
+    support_card_id: Option<i32>,
+    support_card_limit_break: Option<i32>,
+    support_card_experience: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
+struct BookmarkHashUpgrade {
+    account_id: String,
+    previous_hash: Option<String>,
+    previous_borrow_key: Option<String>,
+    next_hash: String,
+    legacy_hash: Option<String>,
+    support_card_id: Option<i32>,
+    support_card_limit_break: Option<i32>,
+    support_card_experience: Option<i32>,
+}
+
 /// POST /api/auth/bookmarks/:account_id — add a bookmark.
 ///
-/// Snapshots the current `content_hash` so we can detect when the inheritance
-/// later changes. Idempotent: re-bookmarking refreshes the snapshot.
+/// Snapshots both the legacy content hash and the stable `bk1:` combo key used
+/// by borrow tracking. The legacy hash keeps rollback safe; the borrow key lets
+/// new code detect when the visible inheritance/support-card combo changes.
+/// Idempotent: re-bookmarking refreshes both snapshots.
 async fn add_bookmark(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(account_id): Path<String>,
+    payload: Option<AxumJson<AddBookmarkRequest>>,
 ) -> Result<Json<BookmarkEntry>, AppError> {
+    let payload = payload.map(|AxumJson(payload)| payload).unwrap_or_default();
     let count =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_bookmarks WHERE user_id = $1")
             .bind(user.user_id)
@@ -1414,32 +1545,113 @@ async fn add_bookmark(
         ));
     }
 
-    // Verify an inheritance row exists for this account, and grab its hash
-    // (may be NULL for rows that predate the content_hash trigger).
-    let hash_row: Option<(Option<String>,)> =
-        sqlx::query_as("SELECT content_hash FROM inheritance WHERE account_id = $1")
-            .bind(&account_id)
-            .fetch_optional(&state.db)
-            .await?;
+    let inheritance = sqlx::query_as::<_, Inheritance>(
+        "SELECT * FROM inheritance WHERE account_id = $1 ORDER BY inheritance_id DESC LIMIT 1",
+    )
+    .bind(&account_id)
+    .fetch_optional(&state.db)
+    .await?;
 
-    let Some((current_hash,)) = hash_row else {
+    let Some(inheritance) = inheritance else {
         return Err(AppError::NotFound(
             "No inheritance found for this account".into(),
         ));
     };
 
+    let content_hash = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT content_hash FROM inheritance WHERE account_id = $1 ORDER BY inheritance_id DESC LIMIT 1",
+    )
+    .bind(&account_id)
+    .fetch_one(&state.db)
+    .await?;
+
+    let support_card = if let Some(support_card_id) = payload.support_card_id {
+        sqlx::query_as::<_, SupportCard>(
+            r#"
+            SELECT account_id, support_card_id, limit_break_count, experience
+            FROM support_card
+            WHERE account_id = $1
+              AND support_card_id = $2
+            ORDER BY
+                CASE
+                    WHEN $3::integer IS NULL
+                      OR limit_break_count IS NOT DISTINCT FROM $3
+                    THEN 0
+                    ELSE 1
+                END,
+                CASE
+                    WHEN $4::integer IS NULL
+                      OR experience = $4
+                    THEN 0
+                    ELSE 1
+                END
+            LIMIT 1
+            "#,
+        )
+        .bind(&account_id)
+        .bind(support_card_id)
+        .bind(payload.support_card_limit_break)
+        .bind(payload.support_card_experience)
+        .fetch_optional(&state.db)
+        .await?
+    } else {
+        sqlx::query_as::<_, SupportCard>(
+            r#"
+            SELECT account_id, support_card_id, limit_break_count, experience
+            FROM support_card
+            WHERE account_id = $1
+            ORDER BY support_card_id
+            LIMIT 1
+            "#,
+        )
+        .bind(&account_id)
+        .fetch_optional(&state.db)
+        .await?
+    };
+
+    let current_borrow_key = borrow_key::normalize_stable_borrow_key(payload.borrow_key.as_deref())
+        .unwrap_or_else(|| borrow_key::key_from_profile(Some(&inheritance), support_card.as_ref()));
+    let saved_support_card_id = payload
+        .support_card_id
+        .or_else(|| support_card.as_ref().map(|card| card.support_card_id));
+    let saved_support_card_limit_break = payload.support_card_limit_break.or_else(|| {
+        support_card
+            .as_ref()
+            .and_then(|card| card.limit_break_count)
+    });
+    let saved_support_card_experience = payload
+        .support_card_experience
+        .or_else(|| support_card.as_ref().map(|card| card.experience));
+
     let row = sqlx::query_as::<_, BookmarkEntry>(
         r#"
-        INSERT INTO user_bookmarks (user_id, account_id, bookmarked_hash)
-        VALUES ($1, $2, $3)
+        INSERT INTO user_bookmarks (
+            user_id,
+            account_id,
+            bookmarked_hash,
+            bookmarked_borrow_key,
+            support_card_id,
+            support_card_limit_break,
+            support_card_experience
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (user_id, account_id)
-        DO UPDATE SET bookmarked_hash = EXCLUDED.bookmarked_hash
+        DO UPDATE SET
+            bookmarked_hash = EXCLUDED.bookmarked_hash,
+            bookmarked_borrow_key = EXCLUDED.bookmarked_borrow_key,
+            support_card_id = EXCLUDED.support_card_id,
+            support_card_limit_break = EXCLUDED.support_card_limit_break,
+            support_card_experience = EXCLUDED.support_card_experience
         RETURNING id, account_id, bookmarked_hash, created_at
         "#,
     )
     .bind(user.user_id)
     .bind(&account_id)
-    .bind(&current_hash)
+    .bind(&content_hash)
+    .bind(&current_borrow_key)
+    .bind(saved_support_card_id)
+    .bind(saved_support_card_limit_break)
+    .bind(saved_support_card_experience)
     .fetch_one(&state.db)
     .await?;
 

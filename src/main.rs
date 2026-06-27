@@ -12,6 +12,7 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
 mod auth;
+mod borrow_key;
 mod cache;
 mod cheat_analysis;
 mod club_rank;
@@ -24,8 +25,8 @@ mod notify;
 mod redis_store;
 
 use handlers::{
-    affinity, auth as auth_handlers, circles, docs, partner, profile, rankings, search, shame,
-    sharing, stats, tasks, version,
+    affinity, auth as auth_handlers, borrow, circles, docs, partner, profile, rankings, search,
+    shame, sharing, stats, tasks, version,
 };
 use notify::TaskNotifier;
 
@@ -371,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(cache_cleanup_task());
 
     // Start background task to clean up short-lived borrow anti-spam buckets
-    tokio::spawn(cleanup_borrow_interaction_buckets_task(pool.clone()));
+    tokio::spawn(cleanup_borrow_interaction_buckets_v2_task(pool.clone()));
 
     // Start background task to incrementally refresh suspicious-activity analysis
     tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
@@ -578,6 +579,8 @@ fn open_api_routes() -> Router<AppState> {
 fn protected_api_routes() -> Router<AppState> {
     Router::new()
         .nest("/api/docs", docs::router())
+        .nest("/api/borrow", borrow::router())
+        .nest("/api/v3/borrow", borrow::router())
         .nest("/api/stats", stats::protected_router())
         .nest("/api/tasks", tasks::router())
         .nest("/api/v3/tasks", tasks::router())
@@ -1141,7 +1144,7 @@ async fn cache_cleanup_task() {
     }
 }
 
-async fn cleanup_borrow_interaction_buckets_task(pool: PgPool) {
+async fn cleanup_borrow_interaction_buckets_v2_task(pool: PgPool) {
     let retention_seconds =
         env_u64("BORROW_INTERACTION_BUCKET_RETENTION_SECONDS", 24 * 60 * 60).max(600);
     let interval_seconds = env_u64(
@@ -1149,10 +1152,11 @@ async fn cleanup_borrow_interaction_buckets_task(pool: PgPool) {
         60 * 60,
     )
     .max(300);
+    let trend_retention_days = env_u64("BORROW_INTERACTION_TREND_RETENTION_DAYS", 14).max(7);
 
     info!(
-        "Starting borrow interaction bucket cleanup task (retention={}s, interval={}s)",
-        retention_seconds, interval_seconds
+        "Starting borrow interaction cleanup task (bucket_retention={}s, trend_retention={}d, interval={}s)",
+        retention_seconds, trend_retention_days, interval_seconds
     );
 
     tokio::time::sleep(tokio::time::Duration::from_secs(180)).await;
@@ -1160,7 +1164,7 @@ async fn cleanup_borrow_interaction_buckets_task(pool: PgPool) {
     loop {
         let result = sqlx::query(
             r#"
-            DELETE FROM borrow_interaction_buckets
+            DELETE FROM borrow_interaction_buckets_v2
             WHERE bucket_start < NOW() - ($1::bigint * interval '1 second')
             "#,
         )
@@ -1181,6 +1185,28 @@ async fn cleanup_borrow_interaction_buckets_task(pool: PgPool) {
                 "Failed to clean up expired borrow interaction buckets: {}",
                 error
             ),
+        }
+
+        let trend_result = sqlx::query(
+            r#"
+            DELETE FROM borrow_interaction_trends
+            WHERE trend_date < CURRENT_DATE - ($1::integer)
+            "#,
+        )
+        .bind(trend_retention_days as i32)
+        .execute(&pool)
+        .await;
+
+        match trend_result {
+            Ok(result) => {
+                if result.rows_affected() > 0 {
+                    info!(
+                        "Cleaned up {} expired borrow trend rows",
+                        result.rows_affected()
+                    );
+                }
+            }
+            Err(error) => warn!("Failed to clean up expired borrow trend rows: {}", error),
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(interval_seconds)).await;
