@@ -383,8 +383,18 @@ async fn main() -> anyhow::Result<()> {
 
         // Start background task to incrementally refresh suspicious-activity analysis
         tokio::spawn(refresh_cheat_analysis_task(pool.clone()));
+    }
 
-        // Start background task to repair bookmark content-hash snapshots in small batches
+    let bookmark_hash_backfill_disabled =
+        skip_migrations || env_flag("DISABLE_BOOKMARK_HASH_BACKFILL");
+    if bookmark_hash_backfill_disabled {
+        warn!(
+            "Skipping bookmark hash backfill (skip_migrations={}, disabled_by_env={})",
+            skip_migrations,
+            env_flag("DISABLE_BOOKMARK_HASH_BACKFILL")
+        );
+    } else {
+        // This is a resumable schema-repair job, not a user write. It is safe to run on beta.
         tokio::spawn(backfill_bookmark_hashes_task(pool.clone()));
     }
 
