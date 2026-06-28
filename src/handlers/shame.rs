@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     response::Json,
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/hall", get(get_hall_of_shame))
         .route("/viewer/:viewer_id", get(get_viewer_report))
-        .route("/refresh", post(refresh_now))
 }
 
 // ---------------------------------------------------------------------------
@@ -1667,63 +1666,6 @@ async fn get_viewer_report(
         short_career_snapshots,
         short_career_snapshots_total,
         last_refreshed_at,
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// Manual refresh (admin / debugging)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, Default)]
-pub struct RefreshParams {
-    /// Accepted for API back-compat; the Rust pipeline is always a full
-    /// rebuild because incremental folding requires keeping per-viewer
-    /// open-session state which the simplified pipeline intentionally
-    /// drops.
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub full: bool,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RefreshResult {
-    pub snapshots_processed: i64,
-    pub viewers_scored: i64,
-    pub last_snapshot_id: i64,
-    pub duration_ms: i64,
-}
-
-async fn refresh_now(
-    State(state): State<AppState>,
-    Query(_params): Query<RefreshParams>,
-) -> Result<Json<RefreshResult>, AppError> {
-    // Token-gate so this isn't an unauthenticated DoS.
-    let token = std::env::var("CHEAT_ANALYSIS_REFRESH_TOKEN").ok();
-    if token.is_none() && std::env::var("DEBUG_MODE").unwrap_or_default() != "true" {
-        return Err(AppError::Forbidden(
-            "Refresh disabled; set CHEAT_ANALYSIS_REFRESH_TOKEN".into(),
-        ));
-    }
-
-    info!("▶ manual suspicious-activity analysis rebuild requested");
-    let stats = crate::cheat_analysis::run_full_rebuild(&state.db)
-        .await
-        .map_err(|e| {
-            AppError::DatabaseError(format!("suspicious-activity analysis rebuild failed: {e}"))
-        })?;
-    info!(
-        "✅ manual suspicious-activity analysis rebuild finished: {} snapshots, {} viewers scored, last_snapshot_id={} in {} ms",
-        stats.snapshots_processed,
-        stats.viewers_scored,
-        stats.last_snapshot_id,
-        stats.duration_ms
-    );
-
-    Ok(Json(RefreshResult {
-        snapshots_processed: stats.snapshots_processed,
-        viewers_scored: stats.viewers_scored,
-        last_snapshot_id: stats.last_snapshot_id,
-        duration_ms: stats.duration_ms,
     }))
 }
 

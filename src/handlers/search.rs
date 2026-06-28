@@ -535,7 +535,7 @@ pub async fn unified_search(
     // This caches search results for common filter combinations
     // IMPORTANT: Must include ALL filter parameters to avoid returning wrong cached results
     let search_cache_key = format!(
-        "search:p{}:l{}:sort={}:order={}:player={}:follower={}:type={}:main={}:excl_main={}:parent={}:pleft={}:pright={}:excl_p={}:rank={}:rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mpb={}:mpp={}:mpg={}:mpw={}:win={}:wh={}:mmb={}:mmp={}:mmg={}:mwf={}:mwh={}:owh={}:omwf={}:bsum={}:psum={}:gsum={}:wsum={}:sc={}:lb={}:exp={}:trainer={}:desired={}:mws={}:p2m={}:p2ws={}:affp2={}:lw={}:mlw={}:llw={}:rlw={}",
+        "search:borrow-stats-v2:p{}:l{}:sort={}:order={}:player={}:follower={}:type={}:main={}:excl_main={}:parent={}:pleft={}:pright={}:excl_p={}:rank={}:rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mpb={}:mpp={}:mpg={}:mpw={}:win={}:wh={}:mmb={}:mmp={}:mmg={}:mwf={}:mwh={}:owh={}:omwf={}:bsum={}:psum={}:gsum={}:wsum={}:sc={}:lb={}:exp={}:trainer={}:desired={}:mws={}:p2m={}:p2ws={}:affp2={}:lw={}:mlw={}:llw={}:rlw={}",
         page, limit,
         params.sort_by.as_deref().unwrap_or("default"),
         params.sort_order.as_deref().unwrap_or("desc"),
@@ -711,6 +711,8 @@ async fn execute_search_query(
             t.name as trainer_name,
             t.follower_num,
             t.last_updated,
+            bit.borrow_view_count,
+            bit.borrow_copy_count,
             -- Inheritance fields
             i.inheritance_id,
             i.main_parent_id,
@@ -811,6 +813,33 @@ async fn execute_search_query(
         FROM inheritance i
         INNER JOIN trainer t ON i.account_id = t.account_id
         LEFT JOIN support_card sc ON i.account_id = sc.account_id
+        LEFT JOIN LATERAL (
+            SELECT
+                COALESCE(MAX(view_count), 0)::bigint AS borrow_view_count,
+                COALESCE(MAX(copy_count), 0)::bigint AS borrow_copy_count
+            FROM (
+                SELECT view_count, copy_count
+                FROM borrow_interaction_totals_v2 bit_v2
+                WHERE bit_v2.trainer_id = i.account_id
+                  AND (
+                    bit_v2.borrow_key = 'legacy:' || i.inheritance_id::text || ':' || COALESCE(sc.support_card_id, 0)::text
+                    OR (
+                        bit_v2.inheritance_id = i.inheritance_id
+                        AND bit_v2.support_card_id = COALESCE(sc.support_card_id, 0)
+                        AND bit_v2.support_card_limit_break IS NOT DISTINCT FROM sc.limit_break_count
+                        AND bit_v2.support_card_experience IS NOT DISTINCT FROM sc.experience
+                    )
+                  )
+                UNION ALL
+                SELECT view_count, copy_count
+                FROM borrow_interaction_totals bit_legacy
+                WHERE bit_legacy.trainer_id = i.account_id
+                  AND bit_legacy.inheritance_id = i.inheritance_id
+                  AND bit_legacy.support_card_id = COALESCE(sc.support_card_id, 0)
+                  AND bit_legacy.support_card_limit_break IS NOT DISTINCT FROM sc.limit_break_count
+                  AND bit_legacy.support_card_experience IS NOT DISTINCT FROM sc.experience
+            ) borrow_counts
+        ) bit ON TRUE
         WHERE 1=1
     "#,
     );
@@ -1318,6 +1347,21 @@ async fn execute_search_query(
                 )
             }
         }
+        Some("trending") | Some("trend") | Some("popular") => {
+            let trending_expr =
+                "(COALESCE(bit.borrow_copy_count, 0) * 3 + COALESCE(bit.borrow_view_count, 0))";
+            if has_optional_scoring {
+                format!(
+                    " ORDER BY {} DESC, {} DESC, bit.borrow_copy_count DESC, bit.borrow_view_count DESC, t.account_id ASC",
+                    total_score_expr, trending_expr
+                )
+            } else {
+                format!(
+                    " ORDER BY {} DESC, bit.borrow_copy_count DESC, bit.borrow_view_count DESC, t.account_id ASC",
+                    trending_expr
+                )
+            }
+        }
         Some("white_sparks_score") => {
             // Sort primarily by combined optional sparks score
             format!(
@@ -1455,6 +1499,8 @@ async fn execute_search_query(
             account_id,
             trainer_name: row.get("trainer_name"),
             follower_num: row.get("follower_num"),
+            borrow_view_count: row.get("borrow_view_count"),
+            borrow_copy_count: row.get("borrow_copy_count"),
             last_updated: row.get("last_updated"),
             inheritance,
             support_card,

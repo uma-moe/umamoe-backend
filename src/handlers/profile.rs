@@ -230,13 +230,28 @@ async fn get_profile(
         SELECT trainer_id, borrow_key, inheritance_id, support_card_id, view_count, copy_count,
                theoretical_copy_count, last_known_follower_num,
                last_viewed_at, last_copied_at, last_recheck_at
-        FROM borrow_interaction_totals_v2
-        WHERE trainer_id = $1
-          AND (
-            borrow_key = $2
-            OR (inheritance_id = $3 AND support_card_id = $4)
-          )
-        ORDER BY CASE WHEN borrow_key = $2 THEN 0 ELSE 1 END
+        FROM (
+            SELECT trainer_id, borrow_key, inheritance_id, support_card_id, view_count, copy_count,
+                   theoretical_copy_count, last_known_follower_num,
+                   last_viewed_at, last_copied_at, last_recheck_at
+            FROM borrow_interaction_totals_v2
+            WHERE trainer_id = $1
+              AND (
+                borrow_key = $2
+                OR (inheritance_id = $3 AND support_card_id = $4)
+              )
+            UNION ALL
+            SELECT trainer_id,
+                   'legacy:' || inheritance_id::text || ':' || support_card_id::text AS borrow_key,
+                   inheritance_id, support_card_id, view_count, copy_count,
+                   theoretical_copy_count, last_known_follower_num,
+                   last_viewed_at, last_copied_at, last_recheck_at
+            FROM borrow_interaction_totals
+            WHERE trainer_id = $1
+              AND inheritance_id = $3
+              AND support_card_id = $4
+        ) borrow_stats
+        ORDER BY view_count DESC, copy_count DESC, CASE WHEN borrow_key = $2 THEN 0 ELSE 1 END
         LIMIT 1
         "#,
     )

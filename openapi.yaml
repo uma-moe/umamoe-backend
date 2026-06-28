@@ -104,6 +104,12 @@ components:
         follower_num:
           type: integer
           nullable: true
+        borrow_view_count:
+          type: integer
+          format: int64
+        borrow_copy_count:
+          type: integer
+          format: int64
         last_updated:
           type: string
           format: date-time
@@ -1441,22 +1447,6 @@ components:
           format: date-time
           nullable: true
 
-    ShameRefreshResult:
-      type: object
-      properties:
-        snapshots_processed:
-          type: integer
-          format: int64
-        viewers_scored:
-          type: integer
-          format: int64
-        last_snapshot_id:
-          type: integer
-          format: int64
-        duration_ms:
-          type: integer
-          format: int64
-
 security:
   - ApiKeyAuth: []
   - BrowserProofAuth: []
@@ -2183,33 +2173,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ShameViewerReport"
-
-  /api/v4/shame/refresh:
-    post:
-      tags: [Shame]
-      summary: Rebuild suspicious activity analysis now
-      operationId: refreshShameAnalysis
-      description: Manual/debug endpoint. In production it requires `CHEAT_ANALYSIS_REFRESH_TOKEN` to be configured server-side and is intended for admin use.
-      parameters:
-        - name: full
-          in: query
-          schema:
-            type: boolean
-            default: false
-          description: Accepted for backward compatibility; the Rust pipeline always performs a full rebuild.
-      responses:
-        "200":
-          description: Refresh result
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ShameRefreshResult"
-        "403":
-          description: Refresh disabled or forbidden
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
 
   # ── System ──────────────────────────────────────────────────
   /api/health:

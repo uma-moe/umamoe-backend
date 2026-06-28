@@ -168,6 +168,10 @@ pub struct UnifiedAccountRecord {
     pub account_id: String,
     pub trainer_name: String,
     pub follower_num: Option<i32>,
+    #[serde(default)]
+    pub borrow_view_count: i64,
+    #[serde(default)]
+    pub borrow_copy_count: i64,
     #[serde(serialize_with = "option_naive_datetime_as_utc::serialize")]
     pub last_updated: Option<NaiveDateTime>,
     pub inheritance: Option<super::inheritance::Inheritance>,

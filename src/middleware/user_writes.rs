@@ -46,10 +46,8 @@ fn is_auth_flow_get(path: &str) -> bool {
 }
 
 fn is_allowed_read_only_post(path: &str) -> bool {
-    matches!(
-        path,
-        "/api/auth/browser-proof" | "/api/v4/partner/lookup" | "/api/v4/shame/refresh"
-    ) || path.starts_with("/api/stats/friendlist/")
+    matches!(path, "/api/auth/browser-proof" | "/api/v4/partner/lookup")
+        || path.starts_with("/api/stats/friendlist/")
 }
 
 #[cfg(test)]
@@ -92,10 +90,6 @@ mod tests {
 
     #[test]
     fn allows_backend_generated_or_non_db_posts() {
-        assert!(!is_user_write_request(
-            &Method::POST,
-            "/api/v4/shame/refresh"
-        ));
         assert!(!is_user_write_request(
             &Method::POST,
             "/api/auth/browser-proof"

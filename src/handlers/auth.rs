@@ -1452,6 +1452,8 @@ async fn list_bookmarks(
                 account_id,
                 trainer_name: row.get("trainer_name"),
                 follower_num: row.get("follower_num"),
+                borrow_view_count: 0,
+                borrow_copy_count: 0,
                 last_updated: row.get("last_updated"),
                 inheritance,
                 support_card,
