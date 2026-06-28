@@ -535,7 +535,7 @@ pub async fn unified_search(
     // This caches search results for common filter combinations
     // IMPORTANT: Must include ALL filter parameters to avoid returning wrong cached results
     let search_cache_key = format!(
-        "search:borrow-stats-merged-v2:p{}:l{}:sort={}:order={}:player={}:follower={}:type={}:main={}:excl_main={}:parent={}:pleft={}:pright={}:excl_p={}:rank={}:rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mpb={}:mpp={}:mpg={}:mpw={}:win={}:wh={}:mmb={}:mmp={}:mmg={}:mwf={}:mwh={}:owh={}:omwf={}:bsum={}:psum={}:gsum={}:wsum={}:sc={}:lb={}:exp={}:trainer={}:desired={}:mws={}:p2m={}:p2ws={}:affp2={}:lw={}:mlw={}:llw={}:rlw={}",
+        "search:borrow-stats-trainer-merge-v2:p{}:l{}:sort={}:order={}:player={}:follower={}:type={}:main={}:excl_main={}:parent={}:pleft={}:pright={}:excl_p={}:rank={}:rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mpb={}:mpp={}:mpg={}:mpw={}:win={}:wh={}:mmb={}:mmp={}:mmg={}:mwf={}:mwh={}:owh={}:omwf={}:bsum={}:psum={}:gsum={}:wsum={}:sc={}:lb={}:exp={}:trainer={}:desired={}:mws={}:p2m={}:p2ws={}:affp2={}:lw={}:mlw={}:llw={}:rlw={}",
         page, limit,
         params.sort_by.as_deref().unwrap_or("default"),
         params.sort_order.as_deref().unwrap_or("desc"),
@@ -820,8 +820,10 @@ async fn execute_search_query(
             FROM borrow_interaction_totals_v2 bit_v2
             WHERE bit_v2.trainer_id = i.account_id
               AND (
-                bit_v2.borrow_key = 'legacy:' || i.inheritance_id::text || ':' || COALESCE(sc.support_card_id, 0)::text
+                bit_v2.borrow_key = 'legacy-trainer:' || i.account_id
                 OR (
+                    bit_v2.borrow_key LIKE 'bk1:%'
+                    AND
                     bit_v2.inheritance_id = i.inheritance_id
                     AND bit_v2.support_card_id = COALESCE(sc.support_card_id, 0)
                     AND bit_v2.support_card_limit_break IS NOT DISTINCT FROM sc.limit_break_count

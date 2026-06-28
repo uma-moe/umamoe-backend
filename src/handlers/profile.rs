@@ -224,6 +224,12 @@ async fn get_profile(
         .as_ref()
         .map(|support_card| support_card.support_card_id)
         .unwrap_or(0);
+    let support_card_limit_break = support_card
+        .as_ref()
+        .and_then(|support_card| support_card.limit_break_count);
+    let support_card_experience = support_card
+        .as_ref()
+        .map(|support_card| support_card.experience);
     let borrow_key = borrow_key::key_from_profile(inheritance.as_ref(), support_card.as_ref());
     let borrow_stats = sqlx::query_as::<_, BorrowStats>(
         r#"
@@ -234,7 +240,14 @@ async fn get_profile(
             WHERE trainer_id = $1
               AND (
                 borrow_key = $2
-                OR (inheritance_id = $3 AND support_card_id = $4)
+                OR borrow_key = 'legacy-trainer:' || $1
+                OR (
+                    borrow_key LIKE 'bk1:%'
+                    AND inheritance_id = $3
+                    AND support_card_id = $4
+                    AND support_card_limit_break IS NOT DISTINCT FROM $5
+                    AND support_card_experience IS NOT DISTINCT FROM $6
+                )
               )
         )
         SELECT
@@ -257,6 +270,8 @@ async fn get_profile(
     .bind(&borrow_key)
     .bind(inheritance_id)
     .bind(support_card_id)
+    .bind(support_card_limit_break)
+    .bind(support_card_experience)
     .fetch_optional(&state.db)
     .await?;
 
