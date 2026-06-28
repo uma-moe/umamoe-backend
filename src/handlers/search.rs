@@ -535,7 +535,7 @@ pub async fn unified_search(
     // This caches search results for common filter combinations
     // IMPORTANT: Must include ALL filter parameters to avoid returning wrong cached results
     let search_cache_key = format!(
-        "search:borrow-stats-v2:p{}:l{}:sort={}:order={}:player={}:follower={}:type={}:main={}:excl_main={}:parent={}:pleft={}:pright={}:excl_p={}:rank={}:rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mpb={}:mpp={}:mpg={}:mpw={}:win={}:wh={}:mmb={}:mmp={}:mmg={}:mwf={}:mwh={}:owh={}:omwf={}:bsum={}:psum={}:gsum={}:wsum={}:sc={}:lb={}:exp={}:trainer={}:desired={}:mws={}:p2m={}:p2ws={}:affp2={}:lw={}:mlw={}:llw={}:rlw={}",
+        "search:borrow-stats-merged-v2:p{}:l{}:sort={}:order={}:player={}:follower={}:type={}:main={}:excl_main={}:parent={}:pleft={}:pright={}:excl_p={}:rank={}:rarity={}:blue={}:pink={}:green={}:white={}:blue9={}:pink9={}:green9={}:mpb={}:mpp={}:mpg={}:mpw={}:win={}:wh={}:mmb={}:mmp={}:mmg={}:mwf={}:mwh={}:owh={}:omwf={}:bsum={}:psum={}:gsum={}:wsum={}:sc={}:lb={}:exp={}:trainer={}:desired={}:mws={}:p2m={}:p2ws={}:affp2={}:lw={}:mlw={}:llw={}:rlw={}",
         page, limit,
         params.sort_by.as_deref().unwrap_or("default"),
         params.sort_order.as_deref().unwrap_or("desc"),
@@ -815,30 +815,19 @@ async fn execute_search_query(
         LEFT JOIN support_card sc ON i.account_id = sc.account_id
         LEFT JOIN LATERAL (
             SELECT
-                COALESCE(MAX(view_count), 0)::bigint AS borrow_view_count,
-                COALESCE(MAX(copy_count), 0)::bigint AS borrow_copy_count
-            FROM (
-                SELECT view_count, copy_count
-                FROM borrow_interaction_totals_v2 bit_v2
-                WHERE bit_v2.trainer_id = i.account_id
-                  AND (
-                    bit_v2.borrow_key = 'legacy:' || i.inheritance_id::text || ':' || COALESCE(sc.support_card_id, 0)::text
-                    OR (
-                        bit_v2.inheritance_id = i.inheritance_id
-                        AND bit_v2.support_card_id = COALESCE(sc.support_card_id, 0)
-                        AND bit_v2.support_card_limit_break IS NOT DISTINCT FROM sc.limit_break_count
-                        AND bit_v2.support_card_experience IS NOT DISTINCT FROM sc.experience
-                    )
-                  )
-                UNION ALL
-                SELECT view_count, copy_count
-                FROM borrow_interaction_totals bit_legacy
-                WHERE bit_legacy.trainer_id = i.account_id
-                  AND bit_legacy.inheritance_id = i.inheritance_id
-                  AND bit_legacy.support_card_id = COALESCE(sc.support_card_id, 0)
-                  AND bit_legacy.support_card_limit_break IS NOT DISTINCT FROM sc.limit_break_count
-                  AND bit_legacy.support_card_experience IS NOT DISTINCT FROM sc.experience
-            ) borrow_counts
+                COALESCE(SUM(bit_v2.view_count), 0)::bigint AS borrow_view_count,
+                COALESCE(SUM(bit_v2.copy_count), 0)::bigint AS borrow_copy_count
+            FROM borrow_interaction_totals_v2 bit_v2
+            WHERE bit_v2.trainer_id = i.account_id
+              AND (
+                bit_v2.borrow_key = 'legacy:' || i.inheritance_id::text || ':' || COALESCE(sc.support_card_id, 0)::text
+                OR (
+                    bit_v2.inheritance_id = i.inheritance_id
+                    AND bit_v2.support_card_id = COALESCE(sc.support_card_id, 0)
+                    AND bit_v2.support_card_limit_break IS NOT DISTINCT FROM sc.limit_break_count
+                    AND bit_v2.support_card_experience IS NOT DISTINCT FROM sc.experience
+                )
+              )
         ) bit ON TRUE
         WHERE 1=1
     "#,

@@ -227,32 +227,30 @@ async fn get_profile(
     let borrow_key = borrow_key::key_from_profile(inheritance.as_ref(), support_card.as_ref());
     let borrow_stats = sqlx::query_as::<_, BorrowStats>(
         r#"
-        SELECT trainer_id, borrow_key, inheritance_id, support_card_id, view_count, copy_count,
-               theoretical_copy_count, last_known_follower_num,
-               last_viewed_at, last_copied_at, last_recheck_at
-        FROM (
-            SELECT trainer_id, borrow_key, inheritance_id, support_card_id, view_count, copy_count,
-                   theoretical_copy_count, last_known_follower_num,
-                   last_viewed_at, last_copied_at, last_recheck_at
+        WITH matched AS (
+            SELECT view_count, copy_count, theoretical_copy_count,
+                   last_known_follower_num, last_viewed_at, last_copied_at, last_recheck_at
             FROM borrow_interaction_totals_v2
             WHERE trainer_id = $1
               AND (
                 borrow_key = $2
                 OR (inheritance_id = $3 AND support_card_id = $4)
               )
-            UNION ALL
-            SELECT trainer_id,
-                   'legacy:' || inheritance_id::text || ':' || support_card_id::text AS borrow_key,
-                   inheritance_id, support_card_id, view_count, copy_count,
-                   theoretical_copy_count, last_known_follower_num,
-                   last_viewed_at, last_copied_at, last_recheck_at
-            FROM borrow_interaction_totals
-            WHERE trainer_id = $1
-              AND inheritance_id = $3
-              AND support_card_id = $4
-        ) borrow_stats
-        ORDER BY view_count DESC, copy_count DESC, CASE WHEN borrow_key = $2 THEN 0 ELSE 1 END
-        LIMIT 1
+        )
+        SELECT
+            $1::text AS trainer_id,
+            $2::text AS borrow_key,
+            $3::bigint AS inheritance_id,
+            $4::int AS support_card_id,
+            COALESCE(SUM(view_count), 0)::bigint AS view_count,
+            COALESCE(SUM(copy_count), 0)::bigint AS copy_count,
+            COALESCE(SUM(theoretical_copy_count), 0)::int AS theoretical_copy_count,
+            MAX(last_known_follower_num) AS last_known_follower_num,
+            MAX(last_viewed_at) AS last_viewed_at,
+            MAX(last_copied_at) AS last_copied_at,
+            MAX(last_recheck_at) AS last_recheck_at
+        FROM matched
+        HAVING COUNT(*) > 0
         "#,
     )
     .bind(&account_id)

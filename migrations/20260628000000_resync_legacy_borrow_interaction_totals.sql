@@ -1,8 +1,10 @@
--- Replay legacy borrow totals into the stable-key tables.
+-- Replay legacy borrow totals into v2 legacy-key rows.
 --
 -- The initial v2 migration copied the legacy rows once. Some live deployments
 -- can still have fresher legacy totals, so keep this idempotent catch-up step
--- before relying on v2/search-index counters for display and trending.
+-- before relying on v2/search-index counters for display and trending. The
+-- source v1 table is left untouched; readers merge v2 bk1 rows with these v2
+-- legacy rows for the same visible borrow entry.
 
 INSERT INTO borrow_interaction_totals_v2 (
     trainer_id,
