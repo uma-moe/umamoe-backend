@@ -163,8 +163,8 @@ pub struct PartnerDirectResult {
 /// Returned immediately when a lookup task is queued. Frontend opens
 /// `GET /api/v4/partner/lookup/{task_id}/stream` for progress + final result.
 ///
-/// When `result` is present the data was served directly from the DB and
-/// no bot task was created — `task_id` will be `None`.
+/// When `result`/`saved` is present the data was served directly from the DB
+/// and no bot task was created — `task_id` will be `None`.
 #[derive(Debug, Serialize)]
 pub struct PartnerLookupResponse {
     /// `None` when the result was served directly from the DB.
@@ -173,7 +173,12 @@ pub struct PartnerLookupResponse {
     /// True when the request was made by an authenticated user and the result
     /// will be persisted in `partner_inheritance` for future fast access.
     pub will_persist: bool,
-    /// Populated immediately when the trainer ID already exists in our DB.
+    /// Populated immediately when the trainer ID already exists in our global
+    /// trainer / inheritance tables.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<PartnerDirectResult>,
+    /// Populated immediately when the requestor is a logged-in user and we
+    /// already have a saved `partner_inheritance` row for this account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved: Option<PartnerInheritance>,
 }
