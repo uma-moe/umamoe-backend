@@ -88,8 +88,32 @@ async fn create_lookup(
     let user_id_str = user.as_ref().map(|u| u.user_id.to_string());
     let will_persist = user_id_str.is_some();
 
-    // For trainer IDs (12 digits) check our DB first — no need to queue a
-    // bot task if we already have fresh inheritance data.
+    // For logged-in users, check the per-user cache first. A previous
+    // lookup may already have the full inheritance stored for this account.
+    if let Some(user) = user.as_ref() {
+        if lookup_kind == "trainer" {
+            let cached = sqlx::query_as::<_, PartnerInheritance>(
+                "SELECT * FROM partner_inheritance WHERE user_id = $1 AND account_id = $2",
+            )
+            .bind(user.user_id)
+            .bind(&partner_id)
+            .fetch_optional(&state.db)
+            .await?;
+
+            if let Some(saved) = cached {
+                return Ok(Json(PartnerLookupResponse {
+                    task_id: None,
+                    status: "completed".into(),
+                    will_persist,
+                    result: None,
+                    saved: Some(saved),
+                }));
+            }
+        }
+    }
+
+    // For trainer IDs (12 digits) check our global DB next — no need to
+    // queue a bot task if we already have fresh inheritance data.
     if lookup_kind == "trainer" {
         #[derive(sqlx::FromRow)]
         struct TrainerRow {
@@ -112,23 +136,25 @@ async fn create_lookup(
         .fetch_optional(&state.db)
         .await?;
 
-        if trainer_row.is_some() || inheritance_row.is_some() {
-            let t = trainer_row;
+        // Only use the global cache when the inheritance row is present;
+        // trainer metadata alone is not enough to satisfy a lookup.
+        if inheritance_row.is_some() {
             let record = PartnerDirectResult {
                 account_id: partner_id.clone(),
-                trainer_name: t
+                trainer_name: trainer_row
                     .as_ref()
                     .map(|r| r.trainer_name.clone())
                     .unwrap_or_default(),
-                follower_num: t.as_ref().and_then(|r| r.follower_num),
-                last_updated: t.as_ref().and_then(|r| r.last_updated),
+                follower_num: trainer_row.as_ref().and_then(|r| r.follower_num),
+                last_updated: trainer_row.as_ref().and_then(|r| r.last_updated),
                 inheritance: inheritance_row,
             };
             return Ok(Json(PartnerLookupResponse {
                 task_id: None,
                 status: "completed".into(),
-                will_persist: false,
+                will_persist,
                 result: Some(record),
+                saved: None,
             }));
         }
     }
@@ -177,6 +203,7 @@ async fn create_lookup(
         status,
         will_persist,
         result: None,
+        saved: None,
     }))
 }
 
@@ -453,7 +480,7 @@ async fn delete_saved(
 ///
 /// Each entry already contains the full inheritance payload (fetched by the
 /// bot previously and cached client-side). We upsert directly without
-/// scheduling new bot tasks � the data is already known.
+/// scheduling new bot tasks — the data is already known.
 ///
 /// Entries that conflict on `(user_id, account_id)` are skipped (DO NOTHING)
 /// so that newer server-side data is never overwritten by stale local cache.
