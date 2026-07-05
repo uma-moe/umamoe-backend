@@ -596,7 +596,7 @@ pub async fn unified_search(
         if let Some(cached) =
             crate::cache::get::<SearchResponse<UnifiedAccountRecord>>(&search_cache_key)
         {
-            tracing::info!("🎯 CACHE HIT: search results");
+            tracing::debug!("search cache hit");
             return Ok(Json(cached));
         }
     }
@@ -620,12 +620,7 @@ pub async fn unified_search(
     let svc_ms = t.elapsed().as_millis();
 
     let response = match svc_body {
-        Ok(svc_resp) => {
-            if svc_ms >= 150 {
-                tracing::warn!("SEARCH [svc]: {}ms | q={}", svc_ms, query_string);
-            }
-            svc_resp
-        }
+        Ok(svc_resp) => svc_resp,
         Err(e) => {
             tracing::warn!(
                 "SEARCH [svc→pg]: svc failed ({}ms): {} | q={}",
@@ -674,7 +669,7 @@ pub async fn unified_search(
         };
 
         if crate::cache::set(&search_cache_key, &response, cache_ttl).is_ok() {
-            tracing::info!(
+            tracing::debug!(
                 "💾 CACHE SET: search results (ttl={}s)",
                 cache_ttl.as_secs()
             );
@@ -758,7 +753,7 @@ async fn execute_search_query(
 
     // Log what we're scoring
     if !optional_white_sparks_ids.is_empty() || !optional_main_white_factors_ids.is_empty() {
-        tracing::info!(
+        tracing::debug!(
             "🎯 OPTIONAL SCORING: white_sparks_ids={:?}, main_white_factors_ids={:?}",
             optional_white_sparks_ids,
             optional_main_white_factors_ids
@@ -1002,7 +997,7 @@ async fn execute_search_query(
     // main_parent_white_sparks - REQUIRED filter for main parent's white factors
     let main_parent_white_groups = process_spark_groups(&params.main_parent_white_sparks);
     if !main_parent_white_groups.is_empty() {
-        tracing::info!(
+        tracing::debug!(
             "🔍 MAIN_PARENT_WHITE_SPARKS filter (SEARCH): {:?}",
             main_parent_white_groups
         );
@@ -1551,7 +1546,7 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
         && (params.max_follower_num == Some(999) || params.max_follower_num == Some(1000));
 
     if is_blank_query {
-        tracing::info!("📊 COUNT: Using stats_counts table (instant)");
+        tracing::debug!("count using stats_counts shortcut");
         // Use materialized view for instant count (no actual counting!)
         let count: i64 =
             sqlx::query_scalar("SELECT COALESCE(trainer_count, 0) FROM stats_counts LIMIT 1")
@@ -1620,10 +1615,10 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
 
     // Try to get cached count (cache for 5 minutes)
     if let Some(cached_count) = crate::cache::get::<i64>(&cache_key) {
-        tracing::info!("🎯 CACHE HIT: count - {}", cached_count);
+        tracing::debug!("count cache hit: {}", cached_count);
         return Ok(cached_count);
     }
-    tracing::info!("❌ CACHE MISS: count query");
+    tracing::debug!("count cache miss");
 
     // Unified count query: always start from inheritance
     // OPTIMIZATION: Wrap in subquery with LIMIT to prevent slow full table scans
@@ -2006,7 +2001,7 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
     let row = query.fetch_one(&state.db).await?;
     let count: i64 = row.get::<i64, _>(0);
     let query_duration = query_start.elapsed();
-    tracing::info!(
+    tracing::debug!(
         "⏱️  COUNT QUERY EXECUTED: {}ms (result={})",
         query_duration.as_millis(),
         count
@@ -2014,7 +2009,7 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
 
     // Cache the count for 5 minutes (counts don't change frequently)
     if crate::cache::set(&cache_key, &count, std::time::Duration::from_secs(300)).is_ok() {
-        tracing::info!("💾 CACHE SET: count={}", count);
+        tracing::debug!("count cache set: {}", count);
     }
 
     Ok(count)

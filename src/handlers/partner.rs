@@ -14,8 +14,9 @@
 //!      a NOTIFY → backend's listener fans out → SSE delivers the result.
 //!
 //! Logged-in users additionally have `GET /saved` to list previously fetched
-//! partners ordered by `updated_at DESC` and `DELETE /saved/{account_id}` to
-//! remove an entry.
+//! partners ordered by `updated_at DESC`, `DELETE /saved/id/{id}` to remove one
+//! saved runner, and legacy `DELETE /saved/{account_id}` to remove entries for
+//! a trainer.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -37,7 +38,7 @@ use crate::errors::AppError;
 use crate::middleware::auth::{AuthenticatedUser, OptionalUser};
 use crate::models::{
     AnonMigrateEntry, Inheritance, PartnerDirectResult, PartnerInheritance, PartnerLookupRequest,
-    PartnerLookupResponse,
+    PartnerLookupResponse, INHERITANCE_SELECT_COLUMNS,
 };
 use crate::AppState;
 
@@ -48,7 +49,8 @@ pub fn router() -> Router<AppState> {
         .route("/lookup", post(create_lookup))
         .route("/lookup/:task_id/stream", get(stream_lookup))
         .route("/saved", get(list_saved))
-        .route("/saved/:account_id", delete(delete_saved))
+        .route("/saved/id/:saved_id", delete(delete_saved_by_id))
+        .route("/saved/:account_id", delete(delete_saved_by_account))
         .route("/saved/migrate", post(migrate_anon))
 }
 
@@ -105,12 +107,13 @@ async fn create_lookup(
         .fetch_optional(&state.db)
         .await?;
 
-        let inheritance_row = sqlx::query_as::<_, Inheritance>(
-            "SELECT * FROM inheritance WHERE account_id = $1 ORDER BY inheritance_id DESC LIMIT 1",
-        )
-        .bind(&partner_id)
-        .fetch_optional(&state.db)
-        .await?;
+        let inheritance_sql = format!(
+            "SELECT {INHERITANCE_SELECT_COLUMNS} FROM inheritance WHERE account_id = $1 ORDER BY inheritance_id DESC LIMIT 1"
+        );
+        let inheritance_row = sqlx::query_as::<_, Inheritance>(&inheritance_sql)
+            .bind(&partner_id)
+            .fetch_optional(&state.db)
+            .await?;
 
         if trainer_row.is_some() || inheritance_row.is_some() {
             let t = trainer_row;
@@ -362,6 +365,11 @@ async fn build_completion_event(state: &AppState, task_id: i32, status: &str) ->
         .and_then(|r| r.get("account_id"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    let content_hash = task_data
+        .get("result")
+        .and_then(|r| r.get("content_hash"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let mut payload = json!({
         "task_id": task_id,
@@ -375,15 +383,28 @@ async fn build_completion_event(state: &AppState, task_id: i32, status: &str) ->
     if status == "completed" {
         if let (Some(uid_str), Some(acct)) = (user_id_str, account_id.as_deref()) {
             if let Ok(uid) = uuid::Uuid::parse_str(uid_str) {
-                let row = sqlx::query_as::<_, PartnerInheritance>(
-                    "SELECT * FROM partner_inheritance WHERE user_id = $1 AND account_id = $2",
-                )
-                .bind(uid)
-                .bind(acct)
-                .fetch_optional(&state.db)
-                .await
-                .ok()
-                .flatten();
+                let row = if let Some(hash) = content_hash.as_deref() {
+                    sqlx::query_as::<_, PartnerInheritance>(
+                        "SELECT * FROM partner_inheritance WHERE user_id = $1 AND account_id = $2 AND content_hash = $3",
+                    )
+                    .bind(uid)
+                    .bind(acct)
+                    .bind(hash)
+                    .fetch_optional(&state.db)
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    sqlx::query_as::<_, PartnerInheritance>(
+                        "SELECT * FROM partner_inheritance WHERE user_id = $1 AND account_id = $2 ORDER BY updated_at DESC, id DESC LIMIT 1",
+                    )
+                    .bind(uid)
+                    .bind(acct)
+                    .fetch_optional(&state.db)
+                    .await
+                    .ok()
+                    .flatten()
+                };
                 if let Some(r) = row {
                     payload["inheritance"] =
                         serde_json::to_value(&r).unwrap_or(serde_json::Value::Null);
@@ -429,8 +450,26 @@ async fn list_saved(
     Ok(Json(rows))
 }
 
-/// Delete a saved partner entry for the authenticated user.
-async fn delete_saved(
+/// Delete a single saved partner entry for the authenticated user.
+async fn delete_saved_by_id(
+    State(state): State<AppState>,
+    user: AuthenticatedUser,
+    Path(saved_id): Path<i32>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result = sqlx::query("DELETE FROM partner_inheritance WHERE user_id = $1 AND id = $2")
+        .bind(user.user_id)
+        .bind(saved_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "deleted": result.rows_affected(),
+    })))
+}
+
+/// Legacy delete route. Removes every saved partner entry for a trainer.
+async fn delete_saved_by_account(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(account_id): Path<String>,
@@ -480,7 +519,7 @@ async fn migrate_anon(
             r#"
             INSERT INTO partner_inheritance (
                 user_id, account_id,
-                main_parent_id, parent_left_id, parent_right_id,
+                main_parent_id, scenario_id, parent_left_id, parent_right_id,
                 parent_rank, parent_rarity,
                 blue_sparks, pink_sparks, green_sparks, white_sparks,
                 win_count, white_count,
@@ -497,22 +536,23 @@ async fn migrate_anon(
                 created_at, updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7,
-                $8, $9, $10, $11, $12, $13,
-                $14, $15, $16, $17, $18,
-                $19, $20, $21, $22, $23,
-                $24, $25, $26, $27, $28,
-                $29, $30, $31, $32,
-                $33, $34, $35, $36,
-                $37, $38, $39,
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19,
+                $20, $21, $22, $23, $24,
+                $25, $26, $27, $28, $29,
+                $30, $31, $32, $33,
+                $34, $35, $36, $37,
+                $38, $39, $40,
                 NOW(), NOW()
             )
-            ON CONFLICT (user_id, account_id) DO NOTHING
+            ON CONFLICT (user_id, account_id, content_hash) DO NOTHING
             "#,
         )
         .bind(user.user_id)
         .bind(&e.account_id)
         .bind(e.main_parent_id)
+        .bind(e.scenario_id)
         .bind(e.parent_left_id)
         .bind(e.parent_right_id)
         .bind(e.parent_rank)

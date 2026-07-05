@@ -17,6 +17,7 @@ use crate::models::profile::{
 };
 use crate::models::{
     Inheritance, SupportCard, UserFanRankingAlltime, UserFanRankingGains, UserFanRankingMonthly,
+    INHERITANCE_SELECT_COLUMNS, SUPPORT_CARD_SELECT_COLUMNS,
 };
 use crate::AppState;
 
@@ -203,18 +204,20 @@ async fn get_profile(
     .unwrap_or(None);
 
     // 7) Inheritance
-    let inheritance =
-        sqlx::query_as::<_, Inheritance>("SELECT * FROM inheritance WHERE account_id = $1")
-            .bind(&account_id)
-            .fetch_optional(&state.db)
-            .await?;
+    let inheritance_sql =
+        format!("SELECT {INHERITANCE_SELECT_COLUMNS} FROM inheritance WHERE account_id = $1");
+    let inheritance = sqlx::query_as::<_, Inheritance>(&inheritance_sql)
+        .bind(&account_id)
+        .fetch_optional(&state.db)
+        .await?;
 
     // 8) Support card
-    let support_card =
-        sqlx::query_as::<_, SupportCard>("SELECT * FROM support_card WHERE account_id = $1")
-            .bind(&account_id)
-            .fetch_optional(&state.db)
-            .await?;
+    let support_card_sql =
+        format!("SELECT {SUPPORT_CARD_SELECT_COLUMNS} FROM support_card WHERE account_id = $1");
+    let support_card = sqlx::query_as::<_, SupportCard>(&support_card_sql)
+        .bind(&account_id)
+        .fetch_optional(&state.db)
+        .await?;
 
     let inheritance_id = inheritance
         .as_ref()

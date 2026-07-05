@@ -23,16 +23,19 @@ fn validate_partner_lookup_id(value: &str) -> Result<(), ValidationError> {
 }
 
 /// Persistent storage row for a partner inheritance lookup result.
-/// One row per (user_id, account_id). Re-lookups upsert the row and bump
-/// `updated_at`.
+/// One row per (user_id, account_id, content_hash). Re-lookups of the same
+/// runner upsert the row and bump `updated_at`; different runners from the
+/// same trainer remain separately selectable.
 #[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct PartnerInheritance {
     pub id: i32,
     #[serde(skip_serializing)]
     pub user_id: Uuid,
     pub account_id: String,
+    pub content_hash: String,
 
     pub main_parent_id: i32,
+    pub scenario_id: i32,
     pub parent_left_id: i32,
     pub parent_right_id: i32,
     pub parent_rank: i32,
@@ -94,6 +97,8 @@ pub struct PartnerInheritance {
 pub struct AnonMigrateEntry {
     pub account_id: String,
     pub main_parent_id: i32,
+    #[serde(default)]
+    pub scenario_id: i32,
     pub parent_left_id: i32,
     pub parent_right_id: i32,
     pub parent_rank: i32,

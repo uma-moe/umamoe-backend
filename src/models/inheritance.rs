@@ -1,6 +1,45 @@
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
+pub const INHERITANCE_SELECT_COLUMNS: &str = r#"
+    inheritance_id,
+    account_id,
+    main_parent_id,
+    parent_left_id,
+    parent_right_id,
+    parent_rank,
+    parent_rarity,
+    blue_sparks,
+    pink_sparks,
+    green_sparks,
+    white_sparks,
+    win_count,
+    white_count,
+    main_blue_factors,
+    main_pink_factors,
+    main_green_factors,
+    main_white_factors,
+    main_white_count,
+    left_blue_factors,
+    left_pink_factors,
+    left_green_factors,
+    left_white_factors,
+    left_white_count,
+    right_blue_factors,
+    right_pink_factors,
+    right_green_factors,
+    right_white_factors,
+    right_white_count,
+    main_win_saddles,
+    left_win_saddles,
+    right_win_saddles,
+    race_results,
+    blue_stars_sum,
+    pink_stars_sum,
+    green_stars_sum,
+    white_stars_sum
+"#;
+
 #[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct Inheritance {
     pub inheritance_id: i32,

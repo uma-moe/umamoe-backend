@@ -22,7 +22,7 @@ use crate::models::auth::{
     LinkAccountRequest, LinkResponse, LinkedAccountResponse, UserResponse, VerifyAccountRequest,
     VerifyResponse,
 };
-use crate::models::{Inheritance, SupportCard, UnifiedAccountRecord};
+use crate::models::{Inheritance, SupportCard, UnifiedAccountRecord, INHERITANCE_SELECT_COLUMNS};
 use crate::AppState;
 
 // ── Types ───────────────────────────────────────────────────────
@@ -1547,12 +1547,13 @@ async fn add_bookmark(
         ));
     }
 
-    let inheritance = sqlx::query_as::<_, Inheritance>(
-        "SELECT * FROM inheritance WHERE account_id = $1 ORDER BY inheritance_id DESC LIMIT 1",
-    )
-    .bind(&account_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let inheritance_sql = format!(
+        "SELECT {INHERITANCE_SELECT_COLUMNS} FROM inheritance WHERE account_id = $1 ORDER BY inheritance_id DESC LIMIT 1"
+    );
+    let inheritance = sqlx::query_as::<_, Inheritance>(&inheritance_sql)
+        .bind(&account_id)
+        .fetch_optional(&state.db)
+        .await?;
 
     let Some(inheritance) = inheritance else {
         return Err(AppError::NotFound(
