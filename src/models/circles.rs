@@ -26,14 +26,13 @@ pub struct Circle {
     pub yesterday_updated: Option<NaiveDateTime>,
     pub yesterday_points: Option<i64>,
     pub yesterday_rank: Option<i32>,
-    /// Live fan count for top-100 circles, updated every 5 minutes.
-    /// `None` for circles outside the live-tracking window.
+    /// Live fan count for circles in the live-tracking window.
+    /// Top-100 rows may update every 5 minutes; broader top-10k/11k rows may update hourly.
     pub live_points: Option<i64>,
-    /// Live rank for top-100 circles, updated every 5 minutes.
+    /// Live rank for circles in the live-tracking window.
     /// `None` for circles outside the live-tracking window.
     pub live_rank: Option<i32>,
-    /// Timestamp of the last live_points update. Used to determine whether live data is fresh
-    /// (within 1 day). `None` if live tracking has never run for this circle.
+    /// Timestamp of the last live_points update. `None` if live tracking has never run for this circle.
     #[serde(serialize_with = "option_naive_datetime_as_utc::serialize")]
     pub last_live_update: Option<NaiveDateTime>,
 }

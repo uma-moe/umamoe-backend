@@ -1003,7 +1003,14 @@ fn safe_materialized_view_name(view_name: &str) -> Option<&'static str> {
 }
 
 async fn clear_stale_live_task(pool: PgPool) {
+    let stale_after_minutes =
+        env_u64("CIRCLE_LIVE_STALE_AFTER_MINUTES", 90).clamp(15, 24 * 60) as i32;
+
     info!("🔄 Starting stale live-data cleanup task (runs every hour)");
+    info!(
+        "Circle live-data stale threshold: {} minutes",
+        stale_after_minutes
+    );
     tokio::time::sleep(tokio::time::Duration::from_secs(45)).await;
     loop {
         match sqlx::query(
@@ -1013,14 +1020,15 @@ async fn clear_stale_live_task(pool: PgPool) {
                         WHERE (live_points IS NOT NULL OR live_rank IS NOT NULL)
                             AND (
                                 last_live_update IS NULL
-                                OR last_live_update < (date_trunc('day', NOW() AT TIME ZONE 'Asia/Tokyo') AT TIME ZONE 'Asia/Tokyo')::timestamp
+                                OR last_live_update < (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - ($1::int * interval '1 minute')
                                 OR (
                                     last_updated IS NOT NULL
-                                    AND last_updated > last_live_update + interval '10 minutes'
+                                    AND last_updated > last_live_update + ($1::int * interval '1 minute')
                                 )
                             )
                         "#,
         )
+        .bind(stale_after_minutes)
         .execute(&pool)
         .await
         {

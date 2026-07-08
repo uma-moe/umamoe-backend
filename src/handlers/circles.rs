@@ -105,6 +105,10 @@ fn valid_live_sql(alias: &str) -> String {
     format!("{}.live_rank > 0 AND {}.live_points > 0", alias, alias)
 }
 
+fn positive_rank_sql(expr: &str) -> String {
+    format!("CASE WHEN {expr} > 0 THEN {expr} ELSE NULL END")
+}
+
 fn disbanded_name_sql(alias: &str) -> String {
     format!(
         "CASE WHEN COALESCE({}.archived, false) AND {}.name NOT LIKE '% ( DISBANDED )' THEN {}.name || ' ( DISBANDED )' ELSE {}.name END",
@@ -147,33 +151,37 @@ fn effective_points_sql(alias: &str) -> String {
 }
 
 fn rank_fallback_sql(alias: &str) -> String {
+    let monthly_rank = positive_rank_sql(&format!("{}.monthly_rank", alias));
+    let live_rank = positive_rank_sql(&format!("{}.live_rank", alias));
+    let last_month_rank = positive_rank_sql(&format!("{}.last_month_rank", alias));
+    let display_last_month_rank = format!("COALESCE({last_month_rank}, {monthly_rank})");
+
     format!(
         "CASE \
-            WHEN {} AND {} THEN {}.monthly_rank \
-            WHEN {} AND {} THEN {}.live_rank \
-            WHEN {} THEN {}.monthly_rank \
-            WHEN {} AND {} THEN COALESCE({}.last_month_rank, {}.monthly_rank) \
-            WHEN {} THEN {}.monthly_rank \
-            WHEN {} THEN {}.live_rank \
-            ELSE {}.monthly_rank \
+            WHEN {} AND {} THEN {} \
+            WHEN {} AND {} THEN {} \
+            WHEN {} THEN {} \
+            WHEN {} AND {} THEN {} \
+            WHEN {} THEN {} \
+            WHEN {} THEN {} \
+            ELSE {} \
         END",
         tallying_sql(),
         archived_sql(alias),
-        alias,
+        monthly_rank,
         tallying_sql(),
         valid_live_sql(alias),
-        alias,
+        live_rank,
         tallying_sql(),
-        alias,
+        monthly_rank,
         post_tally_display_sql(),
         row_has_new_last_month_sql(alias),
-        alias,
-        alias,
+        display_last_month_rank,
         post_tally_display_sql(),
-        alias,
+        monthly_rank,
         valid_live_sql(alias),
-        alias,
-        alias,
+        live_rank,
+        monthly_rank,
     )
 }
 
@@ -200,30 +208,36 @@ fn display_yesterday_points_sql(alias: &str) -> String {
 }
 
 fn display_yesterday_rank_sql(alias: &str) -> String {
+    let yesterday_rank = positive_rank_sql(&format!("{}.yesterday_rank", alias));
+    let last_month_rank = positive_rank_sql(&format!("{}.last_month_rank", alias));
+
     format!(
-        "CASE WHEN {} AND {} THEN COALESCE({}.last_month_rank, {}.yesterday_rank) ELSE {}.yesterday_rank END",
+        "CASE WHEN {} AND {} THEN COALESCE({}, {}) ELSE {} END",
         post_tally_display_sql(),
         row_has_new_last_month_sql(alias),
-        alias,
-        alias,
-        alias,
+        last_month_rank,
+        yesterday_rank,
+        yesterday_rank,
     )
 }
 
 fn display_yesterday_rank_expr_sql(alias: &str, live_yesterday_rank_expr: &str) -> String {
+    let live_yesterday_rank = positive_rank_sql(&format!("{}::int", live_yesterday_rank_expr));
+
     format!(
-        "COALESCE({}::int, {})",
-        live_yesterday_rank_expr,
+        "COALESCE({}, {})",
+        live_yesterday_rank,
         display_yesterday_rank_sql(alias)
     )
 }
 
 fn display_live_points_sql(alias: &str) -> String {
     format!(
-        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {}.live_points END",
+        "CASE WHEN {} OR ({} AND {}) OR NOT COALESCE(({}), false) THEN NULL ELSE {}.live_points END",
         post_tally_display_sql(),
         tallying_sql(),
         archived_sql(alias),
+        valid_live_sql(alias),
         alias,
     )
 }
@@ -516,14 +530,22 @@ pub async fn list_circles(
 
     let points_column = effective_points_sql("c");
     let rank_fallback_column = rank_fallback_sql("c");
-    let rank_column = format!("COALESCE(lr.live_rank::int, {})", rank_fallback_column);
+    let rank_column = format!(
+        "COALESCE({}, {})",
+        positive_rank_sql("lr.live_rank::int"),
+        rank_fallback_column
+    );
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
     let yesterday_rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
     let live_points_column = display_live_points_sql("c");
-    let live_rank_column =
-        display_live_rank_expr_sql("c", "COALESCE(lr.live_rank::int, c.live_rank)");
+    let live_rank_expr = format!(
+        "COALESCE({}, {})",
+        positive_rank_sql("lr.live_rank::int"),
+        positive_rank_sql("c.live_rank")
+    );
+    let live_rank_column = display_live_rank_expr_sql("c", &live_rank_expr);
     let last_live_update_column = display_last_live_update_sql("c");
     // Build dynamic query
     let mut count_query = format!(
@@ -806,7 +828,7 @@ pub async fn get_rank_thresholds(
 /// 1=D, 2=D+, 3=C, 4=C+, 5=B, 6=B+, 7=A, 8=A+, 9=S, 10=S+, 11=SS
 fn compute_club_rank(rank: Option<i32>, monthly_point: Option<i64>) -> i32 {
     match rank {
-        None => match monthly_point {
+        None | Some(..=0) => match monthly_point {
             None | Some(0) => 1,
             _ => 2,
         },
@@ -870,7 +892,9 @@ fn historical_tier_gap_rank(
     current_rank: Option<i32>,
     historical_rank: Option<i32>,
 ) -> Option<i32> {
-    current_rank.or(historical_rank)
+    current_rank
+        .filter(|rank| *rank > 0)
+        .or_else(|| historical_rank.filter(|rank| *rank > 0))
 }
 
 /// Fetch the effective current points of the circle at the given boundary rank
@@ -948,14 +972,22 @@ async fn fetch_boundary_points_last_month(
 /// Fetch circle by ID
 async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, AppError> {
     let rank_fallback_column = rank_fallback_sql("c");
-    let rank_column = format!("COALESCE(lr.live_rank::int, {})", rank_fallback_column);
+    let rank_column = format!(
+        "COALESCE({}, {})",
+        positive_rank_sql("lr.live_rank::int"),
+        rank_fallback_column
+    );
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
     let yesterday_rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
     let live_points_column = display_live_points_sql("c");
-    let live_rank_column =
-        display_live_rank_expr_sql("c", "COALESCE(lr.live_rank::int, c.live_rank)");
+    let live_rank_expr = format!(
+        "COALESCE({}, {})",
+        positive_rank_sql("lr.live_rank::int"),
+        positive_rank_sql("c.live_rank")
+    );
+    let live_rank_column = display_live_rank_expr_sql("c", &live_rank_expr);
     let last_live_update_column = display_last_live_update_sql("c");
 
     let circle = sqlx::query_as::<_, Circle>(&format!(
@@ -1234,5 +1266,12 @@ mod tests {
         assert_eq!(rank, Some(484));
         assert_eq!(next_tier_boundary(rank, 365_509_264), Some(100));
         assert_eq!(lower_tier_boundary(rank, 365_509_264), Some(501));
+    }
+
+    #[test]
+    fn zero_ranks_are_treated_as_unranked() {
+        assert_eq!(compute_club_rank(Some(0), Some(0)), 1);
+        assert_eq!(compute_club_rank(Some(0), Some(1)), 2);
+        assert_eq!(historical_tier_gap_rank(Some(0), Some(484)), Some(484));
     }
 }

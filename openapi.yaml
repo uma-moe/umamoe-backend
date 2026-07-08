@@ -255,11 +255,11 @@ components:
           type: integer
           format: int64
           nullable: true
-          description: Top-100 circles only, updates every 5 minutes. Hidden during carryover where it would conflict with the completed-month display payload.
+          description: Live fan count for circles in the live refresh window. Top-100 rows may update every 5 minutes; broader top-10k/11k rows may update hourly. Hidden during carryover where it would conflict with the completed-month display payload.
         live_rank:
           type: integer
           nullable: true
-          description: Top-100 circles only, updates every 5 minutes. Hidden during carryover where it would conflict with the completed-month display payload.
+          description: Live rank for circles in the live refresh window. Top-100 rows may update every 5 minutes; broader top-10k/11k rows may update hourly. Hidden during carryover where it would conflict with the completed-month display payload.
         last_live_update:
           type: string
           format: date-time
