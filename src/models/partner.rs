@@ -162,7 +162,7 @@ pub struct PartnerDirectResult {
     pub follower_num: Option<i32>,
     #[serde(serialize_with = "crate::models::common::option_naive_datetime_as_utc::serialize")]
     pub last_updated: Option<chrono::NaiveDateTime>,
-    pub inheritance: Option<crate::models::Inheritance>,
+    pub inheritance: Option<serde_json::Value>,
 }
 
 /// Returned immediately when a lookup task is queued. Frontend opens

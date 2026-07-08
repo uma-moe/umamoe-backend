@@ -63,6 +63,38 @@ async fn fix_task_sequence(pool: &sqlx::PgPool) {
     .await;
 }
 
+fn direct_result_from_completed_task(task_data: &serde_json::Value) -> Option<PartnerDirectResult> {
+    let result = task_data.get("result")?;
+    let inheritance = result
+        .get("inheritance")
+        .cloned()
+        .unwrap_or_else(|| result.clone());
+    let account_id = inheritance
+        .get("account_id")
+        .or_else(|| result.get("account_id"))
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let trainer_name = inheritance
+        .get("trainer_name")
+        .or_else(|| result.get("trainer_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let follower_num = inheritance
+        .get("follower_num")
+        .or_else(|| result.get("follower_num"))
+        .and_then(|v| v.as_i64())
+        .and_then(|n| i32::try_from(n).ok());
+
+    Some(PartnerDirectResult {
+        account_id,
+        trainer_name,
+        follower_num,
+        last_updated: None,
+        inheritance: Some(inheritance),
+    })
+}
+
 /// Queue a partner lookup task. Returns a task id that the client uses to
 /// open an SSE stream for the result.
 async fn create_lookup(
@@ -125,8 +157,39 @@ async fn create_lookup(
                     .unwrap_or_default(),
                 follower_num: t.as_ref().and_then(|r| r.follower_num),
                 last_updated: t.as_ref().and_then(|r| r.last_updated),
-                inheritance: inheritance_row,
+                inheritance: inheritance_row.and_then(|row| serde_json::to_value(row).ok()),
             };
+            return Ok(Json(PartnerLookupResponse {
+                task_id: None,
+                status: "completed".into(),
+                will_persist: false,
+                result: Some(record),
+            }));
+        }
+    }
+
+    if lookup_kind == "practice_partner" && !will_persist {
+        let cached_task_data: Option<serde_json::Value> = sqlx::query_scalar(
+            r#"
+            SELECT task_data
+            FROM tasks
+            WHERE task_type = $1
+              AND status = 'completed'
+              AND task_data->>'partner_id' = $2
+              AND task_data->'result' IS NOT NULL
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC, id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(TASK_TYPE)
+        .bind(&partner_id)
+        .fetch_optional(&state.db)
+        .await?;
+
+        if let Some(record) = cached_task_data
+            .as_ref()
+            .and_then(direct_result_from_completed_task)
+        {
             return Ok(Json(PartnerLookupResponse {
                 task_id: None,
                 status: "completed".into(),
@@ -356,18 +419,22 @@ async fn build_completion_event(state: &AppState, task_id: i32, status: &str) ->
             .flatten();
 
     let (task_data, error_message) = row.unwrap_or((serde_json::Value::Null, None));
+    let task_result = task_data.get("result");
+    let task_inheritance = task_result
+        .and_then(|result| result.get("inheritance"))
+        .or(task_result);
 
     // Try to load the persisted partner_inheritance row using the user_id +
     // resulting account_id stashed in task_data.
     let user_id_str = task_data.get("user_id").and_then(|v| v.as_str());
-    let account_id = task_data
-        .get("result")
+    let account_id = task_inheritance
         .and_then(|r| r.get("account_id"))
+        .or_else(|| task_result.and_then(|r| r.get("account_id")))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let content_hash = task_data
-        .get("result")
+    let content_hash = task_inheritance
         .and_then(|r| r.get("content_hash"))
+        .or_else(|| task_result.and_then(|r| r.get("content_hash")))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -415,8 +482,8 @@ async fn build_completion_event(state: &AppState, task_id: i32, status: &str) ->
         // Fall back to whatever the bot stashed in task_data.result for anon
         // (or unpersisted) lookups.
         if payload.get("inheritance").is_none() {
-            if let Some(result) = task_data.get("result") {
-                payload["inheritance"] = result.clone();
+            if let Some(inheritance) = task_inheritance {
+                payload["inheritance"] = inheritance.clone();
             }
         }
     }
