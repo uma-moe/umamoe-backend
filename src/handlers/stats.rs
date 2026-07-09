@@ -64,11 +64,12 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsRespon
     let row = sqlx::query(
         r#"
         SELECT
-            COALESCE((TO_JSONB(s)->>'accounts_24h')::bigint, 0) AS accounts_24h,
-            COALESCE((TO_JSONB(s)->>'accounts_7d')::bigint, 0)  AS accounts_7d,
-            COALESCE((TO_JSONB(s)->>'umas_tracked')::bigint, 0) AS umas_tracked
-        FROM stats_counts s
-        LIMIT 1
+            (SELECT COUNT(*)::bigint
+             FROM trainer
+             WHERE last_updated >= NOW() - INTERVAL '24 hours') AS accounts_24h,
+            (SELECT COUNT(*)::bigint
+             FROM trainer
+             WHERE last_updated >= NOW() - INTERVAL '7 days') AS accounts_7d
         "#,
     )
     .fetch_one(&state.db)
@@ -85,16 +86,41 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsRespon
     .fetch_one(&state.db)
     .await?;
 
+    let umas_tracked = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT GREATEST(
+            COALESCE((
+                SELECT n_live_tup::bigint
+                FROM pg_stat_all_tables
+                WHERE schemaname = 'public'
+                  AND relname = 'team_stadium'
+            ), 0),
+            COALESCE((
+                SELECT reltuples::bigint
+                FROM pg_class
+                WHERE oid = 'public.team_stadium'::regclass
+            ), 0),
+            COALESCE((
+                SELECT (TO_JSONB(s)->>'umas_tracked')::bigint
+                FROM stats_counts s
+                LIMIT 1
+            ), 0)
+        )
+        "#,
+    )
+    .fetch_one(&state.db)
+    .await?;
+
     let response = StatsResponse {
         today: TodayActivity { tasks_24h },
         freshness: DataFreshness {
             accounts_24h: row.get::<i64, _>("accounts_24h"),
             accounts_7d: row.get::<i64, _>("accounts_7d"),
-            umas_tracked: row.get::<i64, _>("umas_tracked"),
+            umas_tracked,
         },
     };
 
-    let _ = crate::cache::set(cache_key, &response, std::time::Duration::from_secs(300));
+    let _ = crate::cache::set(cache_key, &response, std::time::Duration::from_secs(60));
 
     Ok(Json(response))
 }
