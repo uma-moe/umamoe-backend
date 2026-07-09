@@ -233,11 +233,11 @@ fn display_yesterday_rank_expr_sql(alias: &str, live_yesterday_rank_expr: &str) 
 
 fn display_live_points_sql(alias: &str) -> String {
     format!(
-        "CASE WHEN {} OR ({} AND {}) OR NOT COALESCE(({}), false) THEN NULL ELSE {}.live_points END",
+        "CASE WHEN {} OR ({} AND {}) OR {}.live_points <= 0 THEN NULL ELSE {}.live_points END",
         post_tally_display_sql(),
         tallying_sql(),
         archived_sql(alias),
-        valid_live_sql(alias),
+        alias,
         alias,
     )
 }
@@ -1273,5 +1273,13 @@ mod tests {
         assert_eq!(compute_club_rank(Some(0), Some(0)), 1);
         assert_eq!(compute_club_rank(Some(0), Some(1)), 2);
         assert_eq!(historical_tier_gap_rank(Some(0), Some(484)), Some(484));
+    }
+
+    #[test]
+    fn displayed_live_points_do_not_require_raw_live_rank() {
+        let sql = display_live_points_sql("c");
+
+        assert!(sql.contains("c.live_points <= 0"));
+        assert!(!sql.contains("c.live_rank"));
     }
 }
