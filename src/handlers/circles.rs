@@ -105,6 +105,10 @@ fn valid_live_sql(alias: &str) -> String {
     format!("{}.live_rank > 0 AND {}.live_points > 0", alias, alias)
 }
 
+fn has_live_points_sql(alias: &str) -> String {
+    format!("{}.live_points > 0", alias)
+}
+
 fn positive_rank_sql(expr: &str) -> String {
     format!("CASE WHEN {expr} > 0 THEN {expr} ELSE NULL END")
 }
@@ -131,7 +135,7 @@ fn effective_points_sql(alias: &str) -> String {
         archived_sql(alias),
         alias,
         tallying_sql(),
-        valid_live_sql(alias),
+        has_live_points_sql(alias),
         alias,
         tallying_sql(),
         alias,
@@ -141,7 +145,7 @@ fn effective_points_sql(alias: &str) -> String {
         alias,
         post_tally_display_sql(),
         alias,
-        valid_live_sql(alias),
+        has_live_points_sql(alias),
         alias,
         alias,
         alias,
@@ -274,13 +278,13 @@ fn effective_circle_points(circle: &Circle) -> i64 {
     let display_end_jst = month_start_jst + Duration::days(2);
     let game_month_start_utc = game_month_start_jst - Duration::hours(9);
     let now_jst_naive = now_jst.naive_local();
-    let valid_live = circle.live_rank.unwrap_or(0) > 0 && circle.live_points.unwrap_or(0) > 0;
+    let has_live_points = circle.live_points.unwrap_or(0) > 0;
     let archived = circle.archived.unwrap_or(false);
 
     if now_jst_naive >= tally_start_jst && now_jst_naive < game_month_start_jst {
         if archived {
             circle.monthly_point.unwrap_or(0)
-        } else if valid_live {
+        } else if has_live_points {
             circle.live_points.unwrap_or(0)
         } else {
             circle.monthly_point.unwrap_or(0)
@@ -298,7 +302,7 @@ fn effective_circle_points(circle: &Circle) -> i64 {
         } else {
             circle.monthly_point.unwrap_or(0)
         }
-    } else if valid_live {
+    } else if has_live_points {
         circle
             .live_points
             .unwrap_or(0)
@@ -1281,5 +1285,13 @@ mod tests {
 
         assert!(sql.contains("c.live_points <= 0"));
         assert!(!sql.contains("c.live_rank"));
+    }
+
+    #[test]
+    fn effective_points_use_live_points_without_raw_live_rank() {
+        let sql = effective_points_sql("c");
+
+        assert!(sql.contains("c.live_points > 0"));
+        assert!(!sql.contains("c.live_rank > 0 AND c.live_points > 0"));
     }
 }

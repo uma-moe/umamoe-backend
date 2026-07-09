@@ -12,7 +12,7 @@ pub(crate) fn monthly_club_rank_joins(ranking_alias: &str) -> String {
 
 pub(crate) fn monthly_club_rank_selects(ranking_alias: &str) -> (String, String) {
     let rank_expr = "COALESCE(NULLIF(cra.rank, 0), NULLIF(lr.live_rank::int, 0), NULLIF(c.live_rank, 0), NULLIF(c.monthly_rank, 0))";
-    let points_expr = "COALESCE(cra.total_points, c.monthly_point, c.live_points, 0)";
+    let points_expr = "COALESCE(cra.total_points, NULLIF(c.live_points, 0), c.monthly_point, 0)";
     let club_rank_expr = club_rank_index_sql(rank_expr, points_expr);
     let nullable_club_rank_expr = format!(
         "CASE WHEN {alias}.circle_id IS NULL THEN NULL ELSE {club_rank_expr} END",
