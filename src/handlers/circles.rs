@@ -45,6 +45,10 @@ pub struct CircleListParams {
     pub sort_dir: Option<String>,
     /// General search query (circle ID/name, leader ID/name, member ID/name)
     pub query: Option<String>,
+    /// Historical ranking year; must be supplied together with month
+    pub year: Option<i32>,
+    /// Historical ranking month; must be supplied together with year
+    pub month: Option<i32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -440,12 +444,40 @@ pub async fn get_circle(
 /// - max_rank: Maximum monthly rank (lower is better, e.g., rank 1 is best)
 /// - sort_by: Field to sort by (name, member_count, monthly_rank, monthly_point)
 /// - sort_dir: Sort direction (asc, desc)
+/// - year/month: Optional completed month; returns the same response shape from the archive
 ///
 /// Returns paginated list of circles
 pub async fn list_circles(
     Query(params): Query<CircleListParams>,
     State(state): State<AppState>,
 ) -> Result<Json<CircleListResponse>, AppError> {
+    match (params.year, params.month) {
+        (Some(year), Some(month)) => {
+            let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
+            let current_month = Utc::now()
+                .with_timezone(&jst)
+                .date_naive()
+                .with_day(1)
+                .expect("first day exists");
+            let target_month = NaiveDate::from_ymd_opt(year, month as u32, 1)
+                .ok_or_else(|| AppError::BadRequest("invalid historical year/month".into()))?;
+            if target_month > current_month {
+                return Err(AppError::BadRequest(
+                    "historical ranking month cannot be in the future".into(),
+                ));
+            }
+            if target_month < current_month {
+                return list_historical_circles(&state.db, &params, year, month).await;
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(AppError::BadRequest(
+                "year and month must be supplied together".into(),
+            ));
+        }
+    }
+
     let page = params.page.unwrap_or(0).max(0);
     let limit = params.limit.unwrap_or(100).clamp(1, 100);
     let offset = page * limit;
@@ -689,6 +721,124 @@ pub async fn list_circles(
 
     Ok(Json(CircleListResponse {
         circles: circles_with_rank,
+        total,
+        page,
+        limit,
+        total_pages,
+    }))
+}
+
+async fn list_historical_circles(
+    pool: &PgPool,
+    params: &CircleListParams,
+    year: i32,
+    month: i32,
+) -> Result<Json<CircleListResponse>, AppError> {
+    let page = params.page.unwrap_or(0).max(0);
+    let limit = params.limit.unwrap_or(100).clamp(1, 100);
+    let offset = page * limit;
+    let name_pattern = params
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{value}%"));
+    let query = params.query.as_deref().map(str::trim).unwrap_or("");
+    let query_id = query.parse::<i64>().ok();
+    let query_pattern = if query.len() >= 2 && query_id.is_none() {
+        Some(format!("%{query}%"))
+    } else {
+        None
+    };
+    let sort_column = match params.sort_by.as_deref() {
+        Some("name") => "COALESCE(a.circle_name, c.name)",
+        Some("member_count" | "members") => "a.member_count",
+        Some("monthly_point" | "fans" | "daily") => "a.total_points",
+        _ => "a.rank",
+    };
+    let sort_direction = if params.sort_dir.as_deref() == Some("desc") {
+        "DESC"
+    } else {
+        "ASC"
+    };
+    let where_sql = r#"
+        a.year = $1 AND a.month = $2
+        AND ($3::text IS NULL OR COALESCE(a.circle_name, c.name) ILIKE $3)
+        AND ($4::bigint IS NULL OR a.circle_id = $4)
+        AND ($5::text IS NULL OR COALESCE(a.circle_name, c.name) ILIKE $5)
+        AND ($6::int IS NULL OR a.member_count >= $6)
+        AND ($7::int IS NULL OR a.rank <= $7)
+    "#;
+
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM circle_ranks_monthly_archive a \
+         LEFT JOIN circles c ON c.circle_id = a.circle_id WHERE {where_sql}"
+    );
+    let total = sqlx::query_scalar::<_, i64>(&count_sql)
+        .bind(year)
+        .bind(month)
+        .bind(name_pattern.as_deref())
+        .bind(query_id)
+        .bind(query_pattern.as_deref())
+        .bind(params.min_members)
+        .bind(params.max_rank)
+        .fetch_one(pool)
+        .await?;
+
+    let select_sql = format!(
+        r#"
+        SELECT
+            a.circle_id,
+            COALESCE(a.circle_name, c.name, a.circle_id::text) AS name,
+            c.comment,
+            c.leader_viewer_id,
+            t.name AS leader_name,
+            a.member_count,
+            c.join_style,
+            c.policy,
+            c.created_at,
+            c.last_updated,
+            a.rank AS monthly_rank,
+            a.total_points AS monthly_point,
+            NULL::int AS last_month_rank,
+            NULL::bigint AS last_month_point,
+            c.archived,
+            NULL::timestamp AS yesterday_updated,
+            NULL::bigint AS yesterday_points,
+            NULL::int AS yesterday_rank,
+            NULL::bigint AS live_points,
+            NULL::int AS live_rank,
+            NULL::timestamp AS last_live_update
+        FROM circle_ranks_monthly_archive a
+        LEFT JOIN circles c ON c.circle_id = a.circle_id
+        LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id
+        WHERE {where_sql}
+        ORDER BY {sort_column} {sort_direction} NULLS LAST, a.circle_id ASC
+        LIMIT $8 OFFSET $9
+        "#
+    );
+    let circles = sqlx::query_as::<_, Circle>(&select_sql)
+        .bind(year)
+        .bind(month)
+        .bind(name_pattern.as_deref())
+        .bind(query_id)
+        .bind(query_pattern.as_deref())
+        .bind(params.min_members)
+        .bind(params.max_rank)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|circle| CircleWithRank {
+            club_rank: Some(compute_club_rank(circle.monthly_rank, circle.monthly_point)),
+            circle,
+        })
+        .collect();
+    let total_pages = (total + limit - 1) / limit;
+
+    Ok(Json(CircleListResponse {
+        circles,
         total,
         page,
         limit,
@@ -1277,6 +1427,40 @@ mod tests {
         assert_eq!(compute_club_rank(Some(0), Some(0)), 1);
         assert_eq!(compute_club_rank(Some(0), Some(1)), 2);
         assert_eq!(historical_tier_gap_rank(Some(0), Some(484)), Some(484));
+    }
+
+    #[test]
+    fn historical_rankings_use_the_same_tiers_as_live_circles() {
+        let cases = [
+            (Some(1), Some(1), 11),
+            (Some(100), Some(1), 9),
+            (Some(5_001), Some(1), 4),
+            (Some(10_001), Some(1), 2),
+            (None, Some(0), 1),
+        ];
+
+        for (rank, points, expected_rank) in cases {
+            let actual_rank = compute_club_rank(rank, points);
+            assert_eq!(actual_rank, expected_rank);
+        }
+    }
+
+    #[test]
+    fn ranking_migration_uses_monthly_summaries_instead_of_raw_arrays() {
+        let migration =
+            include_str!("../../migrations/20260711000000_optimize_fan_and_circle_rankings.sql");
+        let alltime_definition = migration
+            .split("CREATE MATERIALIZED VIEW user_fan_rankings_alltime AS")
+            .nth(1)
+            .expect("all-time ranking view definition")
+            .split("CREATE UNIQUE INDEX idx_ufr_alltime_pk")
+            .next()
+            .expect("all-time ranking view body");
+
+        assert!(alltime_definition.contains("FROM user_fan_rankings_monthly r"));
+        assert!(!alltime_definition.contains("unnest"));
+        assert!(migration.contains("SUM(r.monthly_gain)::bigint AS total_points"));
+        assert!(!migration.contains("daily_fans[array_length"));
     }
 
     #[test]

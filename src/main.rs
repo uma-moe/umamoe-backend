@@ -1166,10 +1166,19 @@ async fn refresh_user_rankings_task(pool: PgPool) {
              FROM circle_member_fans_monthly cmf \
              WHERE make_date(cmf.year, cmf.month, 1) < date_trunc('month', \
                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date) \
-             AND NOT EXISTS ( \
-                 SELECT 1 FROM circle_ranks_monthly_archive a \
-                 WHERE a.year = cmf.year AND a.month = cmf.month \
-                 LIMIT 1 \
+             AND ( \
+                 NOT EXISTS ( \
+                     SELECT 1 FROM circle_ranks_monthly_archive a \
+                     WHERE a.year = cmf.year AND a.month = cmf.month \
+                     LIMIT 1 \
+                 ) \
+                 OR ( \
+                     make_date(cmf.year, cmf.month, 1) = date_trunc('month', \
+                         (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date)::date \
+                         - interval '1 month' \
+                     AND extract(day from \
+                         (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date) <= 3 \
+                 ) \
              )",
         )
         .fetch_all(&pool)
@@ -1180,31 +1189,17 @@ async fn refresh_user_rankings_task(pool: PgPool) {
                     let year: i32 = row.get("year");
                     let month: i32 = row.get("month");
                     info!("📦 Archiving circle ranks for {}-{:02}", year, month);
-                    match sqlx::query(
-                        "INSERT INTO circle_ranks_monthly_archive \
-                             (circle_id, year, month, rank, total_points, member_count, circle_name) \
-                         SELECT circle_id, $1, $2, \
-                                RANK() OVER (ORDER BY total_points DESC)::INT, \
-                                total_points, member_count, circle_name \
-                         FROM ( \
-                             SELECT cmf.circle_id, \
-                                    SUM(cmf.daily_fans[array_length(cmf.daily_fans, 1)]) AS total_points, \
-                                    COUNT(DISTINCT cmf.viewer_id)::INT AS member_count, \
-                                    MAX(c.name) AS circle_name \
-                             FROM circle_member_fans_monthly cmf \
-                             LEFT JOIN circles c ON c.circle_id = cmf.circle_id \
-                             WHERE cmf.year = $1 AND cmf.month = $2 \
-                             GROUP BY cmf.circle_id \
-                         ) sub \
-                         ON CONFLICT DO NOTHING"
-                    )
-                    .bind(year)
-                    .bind(month)
-                    .execute(&pool)
-                    .await
+                    match sqlx::query("SELECT archive_circle_rankings_month($1, $2)")
+                        .bind(year)
+                        .bind(month)
+                        .fetch_optional(&pool)
+                        .await
                     {
                         Ok(_) => info!("✅ Archived circle ranks for {}-{:02}", year, month),
-                        Err(e) => warn!("⚠️ Failed to archive circle ranks {}-{:02}: {}", year, month, e),
+                        Err(e) => warn!(
+                            "⚠️ Failed to archive circle ranks {}-{:02}: {}",
+                            year, month, e
+                        ),
                     }
                 }
             }

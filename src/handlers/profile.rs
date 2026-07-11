@@ -131,17 +131,32 @@ async fn get_profile(
         r#"
         SELECT DISTINCT ON (cmf.year, cmf.month)
                cmf.year, cmf.month, cmf.circle_id,
-               c.name AS circle_name,
-               cra.rank AS circle_rank,
-               cra.total_points AS circle_points
+               COALESCE(cra.circle_name, c.name) AS circle_name,
+               COALESCE(
+                   NULLIF(cra.rank, 0),
+                   CASE
+                       WHEN cmf.year = EXTRACT(YEAR FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int
+                        AND cmf.month = EXTRACT(MONTH FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int
+                       THEN NULLIF(lr.live_rank::int, 0)
+                   END
+               ) AS circle_rank,
+               COALESCE(
+                   cra.total_points,
+                   CASE
+                       WHEN cmf.year = EXTRACT(YEAR FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int
+                        AND cmf.month = EXTRACT(MONTH FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int
+                       THEN lr.live_points
+                   END
+               ) AS circle_points
         FROM circle_member_fans_monthly cmf
         LEFT JOIN circles c ON c.circle_id = cmf.circle_id
+        LEFT JOIN circle_live_ranks lr ON lr.circle_id = cmf.circle_id
         LEFT JOIN circle_ranks_monthly_archive cra
             ON cra.circle_id = cmf.circle_id
             AND cra.year = cmf.year
             AND cra.month = cmf.month
         WHERE cmf.viewer_id = $1
-        ORDER BY cmf.year DESC, cmf.month DESC
+        ORDER BY cmf.year DESC, cmf.month DESC, cmf.last_updated DESC, cmf.circle_id DESC
         "#,
     )
     .bind(viewer_id)
