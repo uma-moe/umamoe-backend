@@ -1145,11 +1145,11 @@ async fn get_hall_of_shame(
     // Cold-start fallback: no snapshot yet (first ~90s after process
     // start, before the initial rebuild). Use the legacy SQL path so the
     // endpoint still works.
-    crate::cheat_analysis::ensure_rate_diagnostic_columns(&state.db)
+    crate::cheat_analysis::verify_rate_diagnostic_columns(&state.db)
         .await
         .map_err(|e| {
             AppError::DatabaseError(format!(
-                "failed to ensure suspicious-activity rate columns: {e}"
+                "failed to verify suspicious-activity rate columns: {e}"
             ))
         })?;
 
@@ -1510,11 +1510,11 @@ async fn get_viewer_report(
     }
 
     // Cold-start fallback: legacy SQL path.
-    crate::cheat_analysis::ensure_rate_diagnostic_columns(&state.db)
+    crate::cheat_analysis::verify_rate_diagnostic_columns(&state.db)
         .await
         .map_err(|e| {
             AppError::DatabaseError(format!(
-                "failed to ensure suspicious-activity rate columns: {e}"
+                "failed to verify suspicious-activity rate columns: {e}"
             ))
         })?;
 
@@ -1734,7 +1734,7 @@ async fn ensure_snapshot(pool: &PgPool) -> Option<Arc<ShameSnapshot>> {
 pub async fn rebuild_snapshot(pool: &PgPool) -> anyhow::Result<()> {
     let start = Instant::now();
 
-    crate::cheat_analysis::ensure_rate_diagnostic_columns(pool).await?;
+    crate::cheat_analysis::verify_rate_diagnostic_columns(pool).await?;
 
     // These feeds are independent. Fetch them concurrently so the
     // overall rebuild time is bounded by the slowest query (the scores

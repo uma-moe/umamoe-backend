@@ -250,26 +250,31 @@ pub struct RebuildStats {
     pub duration_ms: i64,
 }
 
-pub async fn ensure_rate_diagnostic_columns(pool: &PgPool) -> anyhow::Result<()> {
-    sqlx::query(
-        r#"ALTER TABLE viewer_suspicion_scores
-           ADD COLUMN IF NOT EXISTS career_rate_sample_count INTEGER NOT NULL DEFAULT 0,
-           ADD COLUMN IF NOT EXISTS career_rate_sample_seconds BIGINT NOT NULL DEFAULT 0,
-           ADD COLUMN IF NOT EXISTS avg_careers_per_day DOUBLE PRECISION NOT NULL DEFAULT 0,
-           ADD COLUMN IF NOT EXISTS career_rate_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb,
-           ADD COLUMN IF NOT EXISTS high_fan_rate_windows INTEGER NOT NULL DEFAULT 0,
-           ADD COLUMN IF NOT EXISTS high_fan_rate_total_fan_gain BIGINT NOT NULL DEFAULT 0,
-           ADD COLUMN IF NOT EXISTS high_fan_rate_total_seconds INTEGER NOT NULL DEFAULT 0"#,
-    )
-    .execute(pool)
-    .await?;
+const VERIFY_RATE_DIAGNOSTIC_COLUMNS_SQL: &str = r#"SELECT COUNT(*)
+   FROM pg_attribute
+   WHERE attrelid = 'viewer_suspicion_scores'::regclass
+     AND attname::text = ANY($1::text[])
+     AND attnum > 0
+     AND NOT attisdropped"#;
 
-    sqlx::query(
-        r#"CREATE INDEX IF NOT EXISTS viewer_suspicion_scores_avg_careers_day_idx
-           ON viewer_suspicion_scores (avg_careers_per_day DESC, suspicion_score DESC)"#,
-    )
-    .execute(pool)
-    .await?;
+pub async fn verify_rate_diagnostic_columns(pool: &PgPool) -> anyhow::Result<()> {
+    const REQUIRED_COLUMNS: &[&str] = &[
+        "career_rate_sample_count",
+        "career_rate_sample_seconds",
+        "avg_careers_per_day",
+        "career_rate_breakdown",
+        "high_fan_rate_windows",
+        "high_fan_rate_total_fan_gain",
+        "high_fan_rate_total_seconds",
+    ];
+    let present: i64 = sqlx::query_scalar(VERIFY_RATE_DIAGNOSTIC_COLUMNS_SQL)
+        .bind(REQUIRED_COLUMNS)
+        .fetch_one(pool)
+        .await?;
+    anyhow::ensure!(
+        present == REQUIRED_COLUMNS.len() as i64,
+        "viewer_suspicion_scores is missing rate diagnostic columns; run database migrations"
+    );
 
     Ok(())
 }
@@ -278,7 +283,7 @@ pub async fn ensure_rate_diagnostic_columns(pool: &PgPool) -> anyhow::Result<()>
 pub async fn run_full_rebuild(pool: &PgPool) -> anyhow::Result<RebuildStats> {
     let start = Instant::now();
 
-    ensure_rate_diagnostic_columns(pool).await?;
+    verify_rate_diagnostic_columns(pool).await?;
 
     let max_snapshot_id: Option<i64> =
         sqlx::query_scalar("SELECT MAX(id) FROM circle_member_fan_snapshots")
@@ -4013,6 +4018,15 @@ mod tests {
         } else {
             part as f64 * 100.0 / total as f64
         }
+    }
+
+    #[test]
+    fn rate_diagnostic_schema_verification_is_read_only() {
+        let query = VERIFY_RATE_DIAGNOSTIC_COLUMNS_SQL.to_ascii_uppercase();
+
+        assert!(query.trim_start().starts_with("SELECT"));
+        assert!(!query.contains("ALTER TABLE"));
+        assert!(!query.contains("CREATE INDEX"));
     }
 
     #[test]
