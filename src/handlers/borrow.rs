@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
+use tokio::sync::Semaphore;
 
 use crate::borrow_key;
 use crate::errors::AppError;
@@ -17,6 +18,19 @@ use crate::middleware::turnstile::require_turnstile_browser_proof;
 use crate::AppState;
 
 const MAX_BORROW_VIEW_BATCH_SIZE: usize = 100;
+const BORROW_VIEW_DB_CONCURRENCY: usize = 2;
+static BORROW_VIEW_DB_SLOTS: Semaphore = Semaphore::const_new(BORROW_VIEW_DB_CONCURRENCY);
+
+fn shed_borrow_view_batch(submitted_count: usize) -> Json<serde_json::Value> {
+    Json(json!({
+        "success": true,
+        "submitted_count": submitted_count,
+        "received_count": submitted_count,
+        "accepted_count": 0,
+        "duplicate_count": 0,
+        "load_shed": true
+    }))
+}
 
 async fn fix_task_sequence(pool: &PgPool) {
     let _ = sqlx::query(
@@ -196,6 +210,14 @@ async fn track_borrow_view_batch(
         AppError::DatabaseError("Failed to track borrow views".to_string())
     })?;
     let actor = require_borrow_browser_actor(&state, &headers).await?;
+    let Ok(_view_slot) = BORROW_VIEW_DB_SLOTS.try_acquire() else {
+        tracing::debug!(submitted_count, "Load-shedding borrow view batch");
+        return Ok(shed_borrow_view_batch(submitted_count));
+    };
+    let Some(mut conn) = state.db.try_acquire() else {
+        tracing::debug!(submitted_count, "DB pool busy; dropping borrow view batch");
+        return Ok(shed_borrow_view_batch(submitted_count));
+    };
 
     let (received_count, accepted_count, duplicate_count) = sqlx::query_as::<_, (i64, i64, i64)>(
         r#"
@@ -309,7 +331,7 @@ async fn track_borrow_view_batch(
     .bind(rows_json)
     .bind(&actor.hash)
     .bind(actor.bucket_start)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *conn)
     .await
     .map_err(|error| {
         tracing::error!("Failed to track borrow view batch: {}", error);
@@ -371,6 +393,31 @@ async fn track_borrow(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let trainer_id = validate_trainer_id(trainer_id)?;
     let actor = require_borrow_browser_actor(state, headers).await?;
+    let _view_slot = if action == BorrowInteraction::View {
+        match BORROW_VIEW_DB_SLOTS.try_acquire() {
+            Ok(permit) if state.db.num_idle() > 0 => Some(permit),
+            _ => {
+                tracing::debug!(trainer_id, "Load-shedding borrow view interaction");
+                return Ok(Json(json!({
+                    "success": true,
+                    "accepted": false,
+                    "trainer_id": trainer_id,
+                    "borrow_key": &context.borrow_key,
+                    "inheritance_id": context.inheritance_id,
+                    "support_card_id": context.support_card_id,
+                    "action": action.as_str(),
+                    "total_count": 0,
+                    "view_count": 0,
+                    "copy_count": 0,
+                    "theoretical_copy_count": 0,
+                    "task_created": false,
+                    "load_shed": true
+                })));
+            }
+        }
+    } else {
+        None
+    };
 
     let inserted_bucket = sqlx::query_scalar::<_, i32>(
         r#"

@@ -657,11 +657,33 @@ async fn baseline_migrations_from_env(
     .execute(pool)
     .await?;
 
+    // BASELINE_MIGRATIONS is a one-time adoption mechanism. Once a database
+    // already has migration history, never let that broad flag silently mark
+    // newly shipped migrations as applied without executing them.
+    let existing_baseline_max = if baseline_all {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT MAX(version) FROM _sqlx_migrations WHERE success = true",
+        )
+        .fetch_one(pool)
+        .await?
+    } else {
+        None
+    };
+    if let Some(version) = existing_baseline_max {
+        warn!(
+            "BASELINE_MIGRATIONS is already initialized through {}; newer migrations will execute normally",
+            version
+        );
+    }
+
     let selected: Vec<_> = migrator
         .migrations
         .iter()
         .filter(|migration| {
-            baseline_all
+            (baseline_all
+                && existing_baseline_max
+                    .map(|version| migration.version <= version)
+                    .unwrap_or(true))
                 || baseline_before.is_some_and(|version| migration.version < version)
                 || baseline_up_to.is_some_and(|version| migration.version <= version)
         })
