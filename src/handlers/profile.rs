@@ -145,7 +145,7 @@ async fn get_profile(
                    CASE
                        WHEN cmf.year = EXTRACT(YEAR FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int
                         AND cmf.month = EXTRACT(MONTH FROM CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::int
-                       THEN lr.live_points
+                       THEN c.live_points
                    END
                ) AS circle_points
         FROM circle_member_fans_monthly cmf
