@@ -78,6 +78,16 @@ pub struct CircleListResponse {
     pub total_pages: i64,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct HistoricalCircleMonth {
+    circle_name: Option<String>,
+    monthly_rank: Option<i32>,
+    monthly_point: Option<i64>,
+    member_count: Option<i32>,
+    last_month_rank: Option<i32>,
+    last_month_point: Option<i64>,
+}
+
 /// Create the circles router
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -316,6 +326,92 @@ fn effective_circle_points(circle: &Circle) -> i64 {
     }
 }
 
+fn resolve_circle_month(
+    year: Option<i32>,
+    month: Option<i32>,
+) -> Result<Option<(i32, i32, bool)>, AppError> {
+    if year.is_none() && month.is_none() {
+        return Ok(None);
+    }
+
+    let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
+    let current_month = Utc::now()
+        .with_timezone(&jst)
+        .date_naive()
+        .with_day(1)
+        .expect("first day exists");
+    let target_year = year.unwrap_or(current_month.year());
+    let target_month = month.unwrap_or(current_month.month() as i32);
+    let target_date = NaiveDate::from_ymd_opt(target_year, target_month as u32, 1)
+        .ok_or_else(|| AppError::BadRequest("invalid historical year/month".into()))?;
+    if target_date > current_month {
+        return Err(AppError::BadRequest(
+            "circle month cannot be in the future".into(),
+        ));
+    }
+
+    Ok(Some((
+        target_year,
+        target_month,
+        target_date < current_month,
+    )))
+}
+
+async fn apply_historical_circle_month(
+    pool: &PgPool,
+    circle: &mut Circle,
+    year: i32,
+    month: i32,
+) -> Result<(), AppError> {
+    let target_date = NaiveDate::from_ymd_opt(year, month as u32, 1)
+        .ok_or_else(|| AppError::BadRequest("invalid historical year/month".into()))?;
+    let previous_date = target_date - chrono::Months::new(1);
+    let historical = sqlx::query_as::<_, HistoricalCircleMonth>(
+        r#"
+        SELECT
+            selected.circle_name,
+            selected.rank AS monthly_rank,
+            selected.total_points AS monthly_point,
+            selected.member_count,
+            previous.rank AS last_month_rank,
+            previous.total_points AS last_month_point
+        FROM (SELECT 1) request
+        LEFT JOIN circle_ranks_monthly_archive selected
+          ON selected.circle_id = $1
+         AND selected.year = $2
+         AND selected.month = $3
+        LEFT JOIN circle_ranks_monthly_archive previous
+          ON previous.circle_id = $1
+         AND previous.year = $4
+         AND previous.month = $5
+        "#,
+    )
+    .bind(circle.circle_id)
+    .bind(year)
+    .bind(month)
+    .bind(previous_date.year())
+    .bind(previous_date.month() as i32)
+    .fetch_one(pool)
+    .await?;
+
+    if let Some(name) = historical.circle_name {
+        circle.name = name;
+    }
+    circle.member_count = historical.member_count;
+    circle.monthly_rank = historical.monthly_rank;
+    circle.monthly_point = historical.monthly_point;
+    circle.last_month_rank = historical.last_month_rank;
+    circle.last_month_point = historical.last_month_point;
+    circle.yesterday_updated = None;
+    circle.yesterday_points = None;
+    circle.yesterday_rank = None;
+    circle.live_points = None;
+    circle.live_rank = None;
+    circle.last_live_update = None;
+
+    Ok(())
+}
+
 /// GET /api/circles - Get circle information and member fan counts
 ///
 /// Parameters:
@@ -334,7 +430,10 @@ pub async fn get_circle(
         ));
     }
 
-    let circle = if let Some(viewer_id) = params.viewer_id {
+    let requested_month = resolve_circle_month(params.year, params.month)?;
+    let historical_month = requested_month.filter(|(_, _, historical)| *historical);
+
+    let mut circle = if let Some(viewer_id) = params.viewer_id {
         // Query by viewer_id - first check if viewer exists in circle_member_fans_monthly
         let member_record = sqlx::query_scalar::<_, i64>(
             r#"
@@ -370,16 +469,28 @@ pub async fn get_circle(
         unreachable!("Already validated at least one param exists");
     };
 
+    if let Some((year, month, _)) = historical_month {
+        apply_historical_circle_month(&state.db, &mut circle, year, month).await?;
+    }
+
     // Get all members and their fan counts for this circle
+    let (member_year, member_month) = requested_month
+        .map(|(year, month, _)| (Some(year), Some(month)))
+        .unwrap_or((None, None));
     let members =
-        fetch_circle_members(&state.db, circle.circle_id, params.year, params.month).await?;
+        fetch_circle_members(&state.db, circle.circle_id, member_year, member_month).await?;
 
     let points = effective_circle_points(&circle);
     let club_rank = Some(compute_club_rank(circle.monthly_rank, Some(points)));
     let rank = circle.monthly_rank;
 
     let fans_to_next_tier = if let Some(boundary) = next_tier_boundary(rank, points) {
-        match fetch_boundary_points(&state.db, boundary).await? {
+        let boundary_points = if let Some((year, month, _)) = historical_month {
+            fetch_historical_boundary_points(&state.db, year, month, boundary, true).await?
+        } else {
+            fetch_boundary_points(&state.db, boundary).await?
+        };
+        match boundary_points {
             Some(bp) => Some((bp - points).max(0)),
             None => Some(0),
         }
@@ -388,7 +499,12 @@ pub async fn get_circle(
     };
 
     let fans_to_lower_tier = if let Some(boundary) = lower_tier_boundary(rank, points) {
-        match fetch_boundary_points(&state.db, boundary).await? {
+        let boundary_points = if let Some((year, month, _)) = historical_month {
+            fetch_historical_boundary_points(&state.db, year, month, boundary, false).await?
+        } else {
+            fetch_boundary_points(&state.db, boundary).await?
+        };
+        match boundary_points {
             Some(bp) => Some((points - bp).max(0)),
             None => Some(0),
         }
@@ -396,15 +512,19 @@ pub async fn get_circle(
         Some(0) // Already at D
     };
 
-    // Yesterday's tier gaps
-    let y_points = circle.yesterday_points.unwrap_or(0);
-    let y_rank = circle.yesterday_rank;
-    // Compare yesterday's points against today's tier, so crossing a tier line
-    // does not make the displayed threshold appear to jump by an entire bracket.
-    let y_tier_gap_rank = historical_tier_gap_rank(rank, y_rank);
+    let (yesterday_fans_to_next_tier, yesterday_fans_to_lower_tier) = if historical_month.is_some()
+    {
+        // We archive monthly circle ranks, not daily rank snapshots. Never
+        // leak current-month "yesterday" gaps into a historical response.
+        (None, None)
+    } else {
+        let y_points = circle.yesterday_points.unwrap_or(0);
+        let y_rank = circle.yesterday_rank;
+        // Compare yesterday's points against today's tier, so crossing a tier line
+        // does not make the displayed threshold appear to jump by an entire bracket.
+        let y_tier_gap_rank = historical_tier_gap_rank(rank, y_rank);
 
-    let yesterday_fans_to_next_tier =
-        if let Some(boundary) = next_tier_boundary(y_tier_gap_rank, y_points) {
+        let next = if let Some(boundary) = next_tier_boundary(y_tier_gap_rank, y_points) {
             match fetch_boundary_points_yesterday(&state.db, boundary).await? {
                 Some(bp) => Some((bp - y_points).max(0)),
                 None => Some(0),
@@ -412,9 +532,7 @@ pub async fn get_circle(
         } else {
             Some(0)
         };
-
-    let yesterday_fans_to_lower_tier =
-        if let Some(boundary) = lower_tier_boundary(y_tier_gap_rank, y_points) {
+        let lower = if let Some(boundary) = lower_tier_boundary(y_tier_gap_rank, y_points) {
             match fetch_boundary_points_yesterday(&state.db, boundary).await? {
                 Some(bp) => Some((y_points - bp).max(0)),
                 None => Some(0),
@@ -422,6 +540,8 @@ pub async fn get_circle(
         } else {
             Some(0)
         };
+        (next, lower)
+    };
 
     Ok(Json(CircleResponse {
         circle,
@@ -1070,6 +1190,43 @@ async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Opti
     .bind(boundary_rank)
     .fetch_optional(pool)
     .await?;
+
+    Ok(result.flatten())
+}
+
+/// Fetch the monthly points at a historical tier boundary. For an upper-tier
+/// boundary we use the last rank still inside that tier; for a lower-tier
+/// boundary we use the first rank in the tier below.
+async fn fetch_historical_boundary_points(
+    pool: &PgPool,
+    year: i32,
+    month: i32,
+    boundary_rank: i32,
+    upper_tier: bool,
+) -> Result<Option<i64>, AppError> {
+    let (rank_filter, rank_order, points_order) = if upper_tier {
+        ("rank <= $3", "rank DESC", "total_points ASC")
+    } else {
+        ("rank >= $3", "rank ASC", "total_points DESC")
+    };
+    let sql = format!(
+        r#"
+        SELECT total_points
+        FROM circle_ranks_monthly_archive
+        WHERE year = $1
+          AND month = $2
+          AND {rank_filter}
+          AND total_points IS NOT NULL
+        ORDER BY {rank_order}, {points_order}
+        LIMIT 1
+        "#
+    );
+    let result = sqlx::query_scalar::<_, Option<i64>>(&sql)
+        .bind(year)
+        .bind(month)
+        .bind(boundary_rank)
+        .fetch_optional(pool)
+        .await?;
 
     Ok(result.flatten())
 }
