@@ -5,14 +5,18 @@ use axum::{
     Router,
 };
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{PgPool, Row};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use crate::errors::AppError;
 use crate::models::{
     DailyVisitRequest, DataFreshness, FriendlistReportResponse, StatsResponse, TodayActivity,
 };
 use crate::AppState;
+
+const STATS_CACHE_KEY: &str = "stats:main:v2";
+const STATS_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub fn public_router() -> Router<AppState> {
     Router::new()
@@ -56,11 +60,17 @@ pub async fn track_daily_visit(
 }
 
 pub async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, AppError> {
-    let cache_key = "stats:main";
-    if let Some(cached) = crate::cache::get::<StatsResponse>(cache_key) {
+    if let Some(cached) = crate::cache::get::<StatsResponse>(STATS_CACHE_KEY) {
         return Ok(Json(cached));
     }
 
+    let response = load_stats(&state.db).await?;
+    cache_stats(&response);
+
+    Ok(Json(response))
+}
+
+async fn load_stats(pool: &PgPool) -> Result<StatsResponse, AppError> {
     // Read the hourly aggregate instead of scanning trainer/tasks on every
     // cold-cache request. New blue/green containers otherwise cause a cache
     // stampede where many identical full-table counts pin the entire DB pool.
@@ -69,29 +79,38 @@ pub async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsRespon
         SELECT
             COALESCE(tasks_24h, 0)::bigint AS tasks_24h,
             COALESCE(accounts_24h, 0)::bigint AS accounts_24h,
-            COALESCE(accounts_7d, 0)::bigint AS accounts_7d,
+            COALESCE(trainer_count, 0)::bigint AS trainer_ids_tracked,
             COALESCE(umas_tracked, 0)::bigint AS umas_tracked
         FROM stats_counts
         LIMIT 1
         "#,
     )
-    .fetch_one(&state.db)
+    .fetch_one(pool)
     .await?;
 
-    let response = StatsResponse {
+    Ok(StatsResponse {
         today: TodayActivity {
             tasks_24h: row.get::<i64, _>("tasks_24h"),
         },
-        freshness: DataFreshness {
-            accounts_24h: row.get::<i64, _>("accounts_24h"),
-            accounts_7d: row.get::<i64, _>("accounts_7d"),
-            umas_tracked: row.get::<i64, _>("umas_tracked"),
-        },
-    };
+        freshness: DataFreshness::with_totals(
+            row.get::<i64, _>("accounts_24h"),
+            row.get::<i64, _>("trainer_ids_tracked"),
+            row.get::<i64, _>("umas_tracked"),
+        ),
+    })
+}
 
-    let _ = crate::cache::set(cache_key, &response, std::time::Duration::from_secs(60));
+fn cache_stats(response: &StatsResponse) {
+    if let Err(error) = crate::cache::set(STATS_CACHE_KEY, response, STATS_CACHE_TTL) {
+        tracing::warn!("Failed to cache stats response: {}", error);
+    }
+}
 
-    Ok(Json(response))
+/// Rebuild the process-local response cache after the hourly database refresh.
+pub(crate) async fn refresh_cache(pool: &PgPool) -> Result<(), AppError> {
+    let response = load_stats(pool).await?;
+    cache_stats(&response);
+    Ok(())
 }
 
 pub async fn report_friendlist_full(

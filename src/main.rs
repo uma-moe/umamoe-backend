@@ -1073,6 +1073,12 @@ async fn refresh_stats_task(pool: PgPool) {
 
     loop {
         refresh_mat_view(&pool, "stats_counts").await;
+        if let Err(error) = stats::refresh_cache(&pool).await {
+            warn!(
+                "Failed to refresh the hourly stats response cache: {}",
+                error
+            );
+        }
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
     }
 }
