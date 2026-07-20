@@ -152,7 +152,34 @@ struct ProviderUserInfo {
     provider_user_id: String,
     display_name: Option<String>,
     email: Option<String>,
+    email_verified: bool,
     avatar_url: Option<String>,
+}
+
+impl ProviderUserInfo {
+    /// Only provider-verified email addresses may be retained as account data.
+    fn verified_email(&self) -> Option<&str> {
+        if self.email_verified {
+            self.email.as_deref()
+        } else {
+            None
+        }
+    }
+}
+
+fn require_verified_discord_email(
+    provider: &str,
+    userinfo: &ProviderUserInfo,
+) -> Result<(), AppError> {
+    let email_missing = userinfo.email.as_deref().map(str::is_empty).unwrap_or(true);
+
+    if provider == "discord" && (email_missing || !userinfo.email_verified) {
+        return Err(AppError::BadRequest(
+            "Discord sign-in requires a verified email address".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Fetch user profile from the provider's userinfo endpoint.
@@ -182,6 +209,7 @@ async fn fetch_userinfo(
                 provider_user_id: resp["sub"].as_str().unwrap_or_default().to_owned(),
                 display_name: resp["name"].as_str().map(String::from),
                 email: resp["email"].as_str().map(String::from),
+                email_verified: resp["email_verified"].as_bool() == Some(true),
                 avatar_url: resp["picture"].as_str().map(String::from),
             })
         }
@@ -216,6 +244,8 @@ async fn fetch_userinfo(
                     .or(resp["username"].as_str())
                     .map(String::from),
                 email: resp["email"].as_str().map(String::from),
+                // Discord documents "verified" as verification of the email address.
+                email_verified: resp["verified"].as_bool() == Some(true),
                 avatar_url,
             })
         }
@@ -444,6 +474,7 @@ async fn callback(
             "Provider did not return a user ID".into(),
         ));
     }
+    require_verified_discord_email(&provider, &userinfo)?;
 
     // Upsert: look up existing identity or create new user + identity
     let existing_user_id = sqlx::query_scalar::<_, Uuid>(
@@ -467,7 +498,7 @@ async fn callback(
             "#,
         )
         .bind(&userinfo.display_name)
-        .bind(userinfo.email.as_deref().map(crate::auth::hash_email))
+        .bind(userinfo.verified_email().map(crate::auth::hash_email))
         .bind(&userinfo.avatar_url)
         .bind(&provider)
         .bind(&userinfo.provider_user_id)
@@ -492,74 +523,40 @@ async fn callback(
 
         uid
     } else {
-        // Check if a user with the same email already exists (auto-merge by email)
-        let existing_by_email = if let Some(ref email) = userinfo.email {
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE email = $1")
-                .bind(crate::auth::hash_email(email))
-                .fetch_optional(&state.db)
-                .await?
-        } else {
-            None
-        };
+        // Never attach a new provider identity to an existing user by email alone.
+        // Cross-provider linking must go through the authenticated connect flow.
+        let mut tx = state.db.begin().await?;
 
-        if let Some(existing_uid) = existing_by_email {
-            // Link this new SSO identity to the existing user
-            sqlx::query(
-                r#"
-                INSERT INTO user_identities (user_id, provider, provider_user_id, display_name, email, avatar_url)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                "#,
-            )
-            .bind(existing_uid)
-            .bind(&provider)
-            .bind(&userinfo.provider_user_id)
-            .bind(&userinfo.display_name)
-            .bind(userinfo.email.as_deref().map(crate::auth::hash_email))
-            .bind(&userinfo.avatar_url)
-            .execute(&state.db)
-            .await?;
+        let new_user_id = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO users (display_name, email, avatar_url)
+            VALUES ($1, $2, $3)
+            RETURNING id
+            "#,
+        )
+        .bind(&userinfo.display_name)
+        .bind(userinfo.verified_email().map(crate::auth::hash_email))
+        .bind(&userinfo.avatar_url)
+        .fetch_one(&mut *tx)
+        .await?;
 
-            info!(
-                "🔗 Auto-linked {} identity to existing user {} by email",
-                provider, existing_uid
-            );
+        sqlx::query(
+            r#"
+            INSERT INTO user_identities (user_id, provider, provider_user_id, display_name, email, avatar_url)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(new_user_id)
+        .bind(&provider)
+        .bind(&userinfo.provider_user_id)
+        .bind(&userinfo.display_name)
+        .bind(userinfo.verified_email().map(crate::auth::hash_email))
+        .bind(&userinfo.avatar_url)
+        .execute(&mut *tx)
+        .await?;
 
-            existing_uid
-        } else {
-            // Create new user + identity in a transaction
-            let mut tx = state.db.begin().await?;
-
-            let new_user_id = sqlx::query_scalar::<_, Uuid>(
-                r#"
-                INSERT INTO users (display_name, email, avatar_url)
-                VALUES ($1, $2, $3)
-                RETURNING id
-                "#,
-            )
-            .bind(&userinfo.display_name)
-            .bind(userinfo.email.as_deref().map(crate::auth::hash_email))
-            .bind(&userinfo.avatar_url)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            sqlx::query(
-                r#"
-                INSERT INTO user_identities (user_id, provider, provider_user_id, display_name, email, avatar_url)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                "#,
-            )
-            .bind(new_user_id)
-            .bind(&provider)
-            .bind(&userinfo.provider_user_id)
-            .bind(&userinfo.display_name)
-            .bind(userinfo.email.as_deref().map(crate::auth::hash_email))
-            .bind(&userinfo.avatar_url)
-            .execute(&mut *tx)
-            .await?;
-
-            tx.commit().await?;
-            new_user_id
-        }
+        tx.commit().await?;
+        new_user_id
     };
 
     // Issue JWT
@@ -1055,6 +1052,7 @@ async fn connect_callback(
             "Provider did not return a user ID".into(),
         ));
     }
+    require_verified_discord_email(&provider, &userinfo)?;
 
     // Check if this SSO identity is already linked to another user
     let existing_owner = sqlx::query_scalar::<_, Uuid>(
@@ -1088,7 +1086,7 @@ async fn connect_callback(
         .bind(&provider)
         .bind(&userinfo.provider_user_id)
         .bind(&userinfo.display_name)
-        .bind(&userinfo.email)
+        .bind(userinfo.verified_email().map(crate::auth::hash_email))
         .bind(&userinfo.avatar_url)
         .execute(&state.db)
         .await?;
@@ -1730,4 +1728,45 @@ async fn bulk_remove_bookmarks(
         "status": "removed",
         "removed_count": result.rows_affected(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider_userinfo(email: Option<&str>, email_verified: bool) -> ProviderUserInfo {
+        ProviderUserInfo {
+            provider_user_id: "provider-user-id".into(),
+            display_name: None,
+            email: email.map(String::from),
+            email_verified,
+            avatar_url: None,
+        }
+    }
+
+    #[test]
+    fn discord_requires_a_verified_email() {
+        assert!(require_verified_discord_email(
+            "discord",
+            &provider_userinfo(Some("victim@example.com"), false),
+        )
+        .is_err());
+        assert!(
+            require_verified_discord_email("discord", &provider_userinfo(None, false)).is_err()
+        );
+        assert!(require_verified_discord_email(
+            "discord",
+            &provider_userinfo(Some("owner@example.com"), true),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unverified_provider_email_is_never_trusted() {
+        let unverified = provider_userinfo(Some("victim@example.com"), false);
+        let verified = provider_userinfo(Some("owner@example.com"), true);
+
+        assert_eq!(unverified.verified_email(), None);
+        assert_eq!(verified.verified_email(), Some("owner@example.com"));
+    }
 }
