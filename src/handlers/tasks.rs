@@ -22,6 +22,79 @@ async fn fix_task_sequence(pool: &PgPool) {
     .await;
 }
 
+fn is_task_sequence_collision(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.constraint())
+        == Some("tasks_pkey")
+}
+
+/// Insert a task, or return the already-active equivalent task. The workers'
+/// partial unique index deliberately makes active task creation idempotent;
+/// surfacing that conflict as HTTP 500 causes callers to retry work which is
+/// already queued and amplifies load during controller recovery.
+async fn insert_or_get_active_task(
+    pool: &PgPool,
+    task_type: &str,
+    task_data: &serde_json::Value,
+    priority: i32,
+    account_id: Option<&str>,
+) -> Result<(crate::models::Task, bool), sqlx::Error> {
+    let mut sequence_fixed = false;
+    for _ in 0..3 {
+        let inserted = sqlx::query_as::<_, crate::models::Task>(
+            r#"
+            INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
+            VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
+            ON CONFLICT (task_type, task_data)
+                WHERE status IN ('pending', 'processing')
+            DO NOTHING
+            RETURNING id, task_type, task_data, priority, status, created_at, updated_at,
+                      worker_id, error_message, account_id
+            "#,
+        )
+        .bind(task_type)
+        .bind(task_data)
+        .bind(priority)
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await;
+
+        match inserted {
+            Ok(Some(task)) => return Ok((task, true)),
+            Ok(None) => {
+                if let Some(task) = sqlx::query_as::<_, crate::models::Task>(
+                    r#"
+                    SELECT id, task_type, task_data, priority, status, created_at, updated_at,
+                           worker_id, error_message, account_id
+                    FROM tasks
+                    WHERE task_type = $1
+                      AND task_data = $2
+                      AND status IN ('pending', 'processing')
+                    ORDER BY id ASC
+                    LIMIT 1
+                    "#,
+                )
+                .bind(task_type)
+                .bind(task_data)
+                .fetch_optional(pool)
+                .await?
+                {
+                    return Ok((task, false));
+                }
+                // The conflicting row may have completed between INSERT and
+                // SELECT. Retry so the request still leaves active work behind.
+            }
+            Err(error) if !sequence_fixed && is_task_sequence_collision(&error) => {
+                fix_task_sequence(pool).await;
+                sequence_fixed = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(sqlx::Error::RowNotFound)
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/submit", post(submit_trainer_id))
@@ -54,31 +127,12 @@ async fn submit_trainer_id(
         "action": "search"
     });
 
-    let task = {
-        let q = || {
-            sqlx::query_as::<_, crate::models::Task>(
-                r#"
-                INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
-                VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
-                RETURNING id, task_type, task_data, priority, status, created_at, updated_at, worker_id, error_message, account_id
-                "#,
-            )
-            .bind("friend/search")
-            .bind(&task_data)
-            .bind(1i32)
-            .bind(None::<String>)
-        };
-        match q().fetch_one(&state.db).await {
-            Ok(t) => t,
-            Err(_) => {
-                fix_task_sequence(&state.db).await;
-                q().fetch_one(&state.db).await.map_err(|e| {
-                    tracing::error!("Failed to insert task: {}", e);
-                    AppError::DatabaseError("Failed to create task".to_string())
-                })?
-            }
-        }
-    };
+    let (task, _) = insert_or_get_active_task(&state.db, "friend/search", &task_data, 1, None)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to insert or find active task: {}", e);
+            AppError::DatabaseError("Failed to create task".to_string())
+        })?;
 
     Ok(Json(TaskResponse {
         id: task.id,
@@ -103,31 +157,18 @@ async fn create_task(
 
     let priority = payload.priority.unwrap_or(0);
 
-    let task = {
-        let q = || {
-            sqlx::query_as::<_, crate::models::Task>(
-                r#"
-                INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
-                VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
-                RETURNING id, task_type, task_data, priority, status, created_at, updated_at, worker_id, error_message, account_id
-                "#,
-            )
-            .bind(&payload.task_type)
-            .bind(&payload.task_data)
-            .bind(priority)
-            .bind(&payload.account_id)
-        };
-        match q().fetch_one(&state.db).await {
-            Ok(t) => t,
-            Err(_) => {
-                fix_task_sequence(&state.db).await;
-                q().fetch_one(&state.db).await.map_err(|e| {
-                    tracing::error!("Failed to insert task: {}", e);
-                    AppError::DatabaseError("Failed to create task".to_string())
-                })?
-            }
-        }
-    };
+    let (task, _) = insert_or_get_active_task(
+        &state.db,
+        &payload.task_type,
+        &payload.task_data,
+        priority,
+        payload.account_id.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to insert or find active task: {}", e);
+        AppError::DatabaseError("Failed to create task".to_string())
+    })?;
 
     Ok(Json(TaskResponse {
         id: task.id,
@@ -161,32 +202,44 @@ async fn report_trainer_unavailable(
         "id": trainer_id
     });
 
-    let q = || {
-        sqlx::query(
-            r#"
-            INSERT INTO tasks (task_type, task_data, priority, status, created_at, account_id)
-            VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP, $4)
-            "#,
-        )
-        .bind("friend/search")
-        .bind(&task_data)
-        .bind(0i32)
-        .bind(None::<String>)
-    };
-    match q().execute(&state.db).await {
-        Ok(_) => {}
-        Err(_) => {
-            fix_task_sequence(&state.db).await;
-            q().execute(&state.db).await.map_err(|e| {
-                tracing::error!("Failed to create task: {}", e);
+    let (_, task_created) =
+        insert_or_get_active_task(&state.db, "friend/search", &task_data, 0, None)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to insert or find active task: {}", e);
                 AppError::DatabaseError("Failed to create task".to_string())
             })?;
-        }
-    }
 
     Ok(Json(json!({
         "success": true,
-        "task_created": true,
+        "task_created": task_created,
         "message": "Trainer scheduled for immediate update"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_public_task_creation_path_uses_active_task_idempotency() {
+        let source = include_str!("tasks.rs");
+        let helper = source
+            .split("async fn insert_or_get_active_task")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn router").next())
+            .expect("task insertion helper should be defined before the router");
+
+        assert!(helper.contains("ON CONFLICT (task_type, task_data)"));
+        assert!(helper.contains("WHERE status IN ('pending', 'processing')"));
+        assert!(helper.contains("DO NOTHING"));
+        assert!(helper.contains("is_task_sequence_collision(&error)"));
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production handler source should precede its tests");
+        assert_eq!(
+            production.matches("insert_or_get_active_task(").count(),
+            4,
+            "the helper plus all three task creation endpoints must use the idempotent path"
+        );
+    }
 }
