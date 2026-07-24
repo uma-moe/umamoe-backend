@@ -33,7 +33,7 @@ fn is_task_sequence_collision(error: &sqlx::Error) -> bool {
 /// partial unique index deliberately makes active task creation idempotent;
 /// surfacing that conflict as HTTP 500 causes callers to retry work which is
 /// already queued and amplifies load during controller recovery.
-async fn insert_or_get_active_task(
+pub(crate) async fn insert_or_get_active_task(
     pool: &PgPool,
     task_type: &str,
     task_data: &serde_json::Value,

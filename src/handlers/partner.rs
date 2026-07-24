@@ -35,6 +35,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use validator::Validate;
 
 use crate::errors::AppError;
+use crate::handlers::tasks::insert_or_get_active_task;
 use crate::middleware::auth::{AuthenticatedUser, OptionalUser};
 use crate::models::{
     AnonMigrateEntry, Inheritance, PartnerDirectResult, PartnerInheritance, PartnerLookupRequest,
@@ -52,15 +53,6 @@ pub fn router() -> Router<AppState> {
         .route("/saved/id/:saved_id", delete(delete_saved_by_id))
         .route("/saved/:account_id", delete(delete_saved_by_account))
         .route("/saved/migrate", post(migrate_anon))
-}
-
-/// Reset the tasks id sequence after a manual-insert collision.
-async fn fix_task_sequence(pool: &sqlx::PgPool) {
-    let _ = sqlx::query(
-        "SELECT setval(pg_get_serial_sequence('tasks','id'), COALESCE((SELECT MAX(id) FROM tasks),0)+1, false)"
-    )
-    .execute(pool)
-    .await;
 }
 
 fn direct_result_from_completed_task(task_data: &serde_json::Value) -> Option<PartnerDirectResult> {
@@ -213,34 +205,16 @@ async fn create_lookup(
         "label": payload.label,
     });
 
-    // Insert task with one retry on sequence collision (consistent with other
-    // task endpoints).
-    let q = || {
-        sqlx::query_as::<_, (i32, String)>(
-            r#"
-            INSERT INTO tasks (task_type, task_data, priority, status, created_at)
-            VALUES ($1, $2, $3, 'pending', CURRENT_TIMESTAMP)
-            RETURNING id, status
-            "#,
-        )
-        .bind(TASK_TYPE)
-        .bind(&task_data)
-        .bind(0i32) // user-instructed priority
-    };
-    let (task_id, status) = match q().fetch_one(&state.db).await {
-        Ok(t) => t,
-        Err(_) => {
-            fix_task_sequence(&state.db).await;
-            q().fetch_one(&state.db).await.map_err(|e| {
-                tracing::error!("Failed to insert partner lookup task: {e}");
-                AppError::DatabaseError("Failed to create lookup task".into())
-            })?
-        }
-    };
+    let (task, _) = insert_or_get_active_task(&state.db, TASK_TYPE, &task_data, 0, None)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to insert or find active partner lookup task: {e}");
+            AppError::DatabaseError("Failed to create lookup task".into())
+        })?;
 
     Ok(Json(PartnerLookupResponse {
-        task_id: Some(task_id),
-        status,
+        task_id: Some(task.id),
+        status: task.status,
         will_persist,
         result: None,
     }))
@@ -663,4 +637,21 @@ async fn migrate_anon(
     }
 
     Ok(Json(json!({ "migrated": migrated })))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn partner_lookup_task_creation_is_idempotent() {
+        let source = include_str!("partner.rs");
+        let create_block = source
+            .split("async fn create_lookup(")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn stream_lookup(").next())
+            .expect("partner lookup creation block should exist");
+
+        assert!(create_block.contains("insert_or_get_active_task("));
+        assert!(!create_block.contains("fix_task_sequence"));
+        assert!(!create_block.contains("INSERT INTO tasks"));
+    }
 }
