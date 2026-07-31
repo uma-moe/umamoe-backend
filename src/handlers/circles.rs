@@ -96,11 +96,7 @@ pub fn router() -> Router<AppState> {
         .route("/rank-thresholds", get(get_rank_thresholds))
 }
 
-fn tallying_sql() -> &'static str {
-    "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') >= (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '19 hours') AND (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') < (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day')"
-}
-
-fn post_tally_display_sql() -> &'static str {
+fn rollover_display_sql() -> &'static str {
     "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') >= (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day') AND (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') < (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')"
 }
 
@@ -109,10 +105,6 @@ fn row_has_new_last_month_sql(alias: &str) -> String {
         "{}.last_updated >= ((date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day') AT TIME ZONE 'Asia/Tokyo')::timestamp AND NOT COALESCE({}.archived, false)",
         alias, alias
     )
-}
-
-fn archived_sql(alias: &str) -> String {
-    format!("COALESCE({}.archived, false)", alias)
 }
 
 fn valid_live_sql(alias: &str) -> String {
@@ -137,27 +129,16 @@ fn disbanded_name_sql(alias: &str) -> String {
 fn effective_points_sql(alias: &str) -> String {
     format!(
         "CASE \
-            WHEN {} AND {} THEN {}.monthly_point \
-            WHEN {} AND {} THEN {}.live_points \
-            WHEN {} THEN {}.monthly_point \
             WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.monthly_point) \
             WHEN {} THEN {}.monthly_point \
             WHEN {} THEN COALESCE(GREATEST({}.live_points, {}.monthly_point), {}.live_points, {}.monthly_point) \
             ELSE {}.monthly_point \
         END",
-        tallying_sql(),
-        archived_sql(alias),
-        alias,
-        tallying_sql(),
-        has_live_points_sql(alias),
-        alias,
-        tallying_sql(),
-        alias,
-        post_tally_display_sql(),
+        rollover_display_sql(),
         row_has_new_last_month_sql(alias),
         alias,
         alias,
-        post_tally_display_sql(),
+        rollover_display_sql(),
         alias,
         has_live_points_sql(alias),
         alias,
@@ -177,25 +158,14 @@ fn rank_fallback_sql(alias: &str) -> String {
     format!(
         "CASE \
             WHEN {} AND {} THEN {} \
-            WHEN {} AND {} THEN {} \
-            WHEN {} THEN {} \
-            WHEN {} AND {} THEN {} \
             WHEN {} THEN {} \
             WHEN {} THEN {} \
             ELSE {} \
         END",
-        tallying_sql(),
-        archived_sql(alias),
-        monthly_rank,
-        tallying_sql(),
-        valid_live_sql(alias),
-        live_rank,
-        tallying_sql(),
-        monthly_rank,
-        post_tally_display_sql(),
+        rollover_display_sql(),
         row_has_new_last_month_sql(alias),
         display_last_month_rank,
-        post_tally_display_sql(),
+        rollover_display_sql(),
         monthly_rank,
         valid_live_sql(alias),
         live_rank,
@@ -206,7 +176,7 @@ fn rank_fallback_sql(alias: &str) -> String {
 fn display_monthly_point_sql(alias: &str) -> String {
     format!(
         "CASE WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.monthly_point) ELSE {}.monthly_point END",
-        post_tally_display_sql(),
+        rollover_display_sql(),
         row_has_new_last_month_sql(alias),
         alias,
         alias,
@@ -217,7 +187,7 @@ fn display_monthly_point_sql(alias: &str) -> String {
 fn display_yesterday_points_sql(alias: &str) -> String {
     format!(
         "CASE WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.yesterday_points) ELSE {}.yesterday_points END",
-        post_tally_display_sql(),
+        rollover_display_sql(),
         row_has_new_last_month_sql(alias),
         alias,
         alias,
@@ -231,7 +201,7 @@ fn display_yesterday_rank_sql(alias: &str) -> String {
 
     format!(
         "CASE WHEN {} AND {} THEN COALESCE({}, {}) ELSE {} END",
-        post_tally_display_sql(),
+        rollover_display_sql(),
         row_has_new_last_month_sql(alias),
         last_month_rank,
         yesterday_rank,
@@ -251,31 +221,25 @@ fn display_yesterday_rank_expr_sql(alias: &str, live_yesterday_rank_expr: &str) 
 
 fn display_live_points_sql(alias: &str) -> String {
     format!(
-        "CASE WHEN {} OR ({} AND {}) OR {}.live_points <= 0 THEN NULL ELSE {}.live_points END",
-        post_tally_display_sql(),
-        tallying_sql(),
-        archived_sql(alias),
+        "CASE WHEN {} OR {}.live_points <= 0 THEN NULL ELSE {}.live_points END",
+        rollover_display_sql(),
         alias,
         alias,
     )
 }
 
-fn display_live_rank_expr_sql(alias: &str, live_rank_expr: &str) -> String {
+fn display_live_rank_expr_sql(live_rank_expr: &str) -> String {
     format!(
-        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {} END",
-        post_tally_display_sql(),
-        tallying_sql(),
-        archived_sql(alias),
+        "CASE WHEN {} THEN NULL ELSE {} END",
+        rollover_display_sql(),
         live_rank_expr,
     )
 }
 
 fn display_last_live_update_sql(alias: &str) -> String {
     format!(
-        "CASE WHEN {} OR ({} AND {}) THEN NULL ELSE {}.last_live_update END",
-        post_tally_display_sql(),
-        tallying_sql(),
-        archived_sql(alias),
+        "CASE WHEN {} THEN NULL ELSE {}.last_live_update END",
+        rollover_display_sql(),
         alias,
     )
 }
@@ -287,7 +251,6 @@ fn effective_circle_points(circle: &Circle) -> i64 {
         .unwrap()
         .and_hms_opt(0, 0, 0)
         .unwrap();
-    let tally_start_jst = month_start_jst + Duration::hours(19);
     let game_month_start_jst = month_start_jst + Duration::days(1);
     let display_end_jst = month_start_jst + Duration::days(2);
     let game_month_start_utc = game_month_start_jst - Duration::hours(9);
@@ -295,15 +258,7 @@ fn effective_circle_points(circle: &Circle) -> i64 {
     let has_live_points = circle.live_points.unwrap_or(0) > 0;
     let archived = circle.archived.unwrap_or(false);
 
-    if now_jst_naive >= tally_start_jst && now_jst_naive < game_month_start_jst {
-        if archived {
-            circle.monthly_point.unwrap_or(0)
-        } else if has_live_points {
-            circle.live_points.unwrap_or(0)
-        } else {
-            circle.monthly_point.unwrap_or(0)
-        }
-    } else if now_jst_naive >= game_month_start_jst && now_jst_naive < display_end_jst {
+    if now_jst_naive >= game_month_start_jst && now_jst_naive < display_end_jst {
         if !archived
             && circle
                 .last_updated
@@ -701,7 +656,7 @@ pub async fn list_circles(
         positive_rank_sql("lr.live_rank::int"),
         positive_rank_sql("c.live_rank")
     );
-    let live_rank_column = display_live_rank_expr_sql("c", &live_rank_expr);
+    let live_rank_column = display_live_rank_expr_sql(&live_rank_expr);
     let last_live_update_column = display_last_live_update_sql("c");
     // Build dynamic query
     let mut count_query = format!(
@@ -1298,7 +1253,7 @@ async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, App
         positive_rank_sql("lr.live_rank::int"),
         positive_rank_sql("c.live_rank")
     );
-    let live_rank_column = display_live_rank_expr_sql("c", &live_rank_expr);
+    let live_rank_column = display_live_rank_expr_sql(&live_rank_expr);
     let last_live_update_column = display_last_live_update_sql("c");
 
     let circle = sqlx::query_as::<_, Circle>(&format!(
@@ -1634,5 +1589,21 @@ mod tests {
 
         assert!(sql.contains("c.live_points > 0"));
         assert!(!sql.contains("c.live_rank > 0 AND c.live_points > 0"));
+    }
+
+    #[test]
+    fn circle_rollover_is_limited_to_second_through_third_jst() {
+        let sql = rollover_display_sql();
+
+        assert!(sql.contains("+ interval '1 day'"));
+        assert!(sql.contains("+ interval '2 days'"));
+        assert!(!sql.contains("19 hours"));
+
+        let migration =
+            include_str!("../../migrations/20260731000000_limit_circle_rollover_to_second_jst.sql");
+        assert!(migration.contains("rollover_start_jst"));
+        assert!(migration.contains("rollover_end_jst"));
+        assert!(!migration.contains("tally_start_jst"));
+        assert!(!migration.contains("19 hours"));
     }
 }
