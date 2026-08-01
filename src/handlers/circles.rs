@@ -320,6 +320,14 @@ fn effective_circle_points(circle: &Circle) -> i64 {
     }
 }
 
+fn current_game_month_start(now: DateTime<Utc>) -> NaiveDate {
+    let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
+    (now.with_timezone(&jst) - Duration::days(1))
+        .date_naive()
+        .with_day(1)
+        .expect("first day exists")
+}
+
 fn resolve_circle_month(
     year: Option<i32>,
     month: Option<i32>,
@@ -328,12 +336,7 @@ fn resolve_circle_month(
         return Ok(None);
     }
 
-    let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
-    let current_month = Utc::now()
-        .with_timezone(&jst)
-        .date_naive()
-        .with_day(1)
-        .expect("first day exists");
+    let current_month = current_game_month_start(Utc::now());
     let target_year = year.unwrap_or(current_month.year());
     let target_month = month.unwrap_or(current_month.month() as i32);
     let target_date = NaiveDate::from_ymd_opt(target_year, target_month as u32, 1)
@@ -567,12 +570,7 @@ pub async fn list_circles(
 ) -> Result<Json<CircleListResponse>, AppError> {
     match (params.year, params.month) {
         (Some(year), Some(month)) => {
-            let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
-            let current_month = Utc::now()
-                .with_timezone(&jst)
-                .date_naive()
-                .with_day(1)
-                .expect("first day exists");
+            let current_month = current_game_month_start(Utc::now());
             let target_month = NaiveDate::from_ymd_opt(year, month as u32, 1)
                 .ok_or_else(|| AppError::BadRequest("invalid historical year/month".into()))?;
             if target_month > current_month {
@@ -1637,6 +1635,14 @@ mod tests {
         assert!(!is_rollover_display_window(august_1));
         assert!(is_rollover_display_window(august_2_start));
         assert!(!is_rollover_display_window(august_3_start));
+        assert_eq!(
+            current_game_month_start(august_1),
+            NaiveDate::from_ymd_opt(2026, 7, 1).expect("valid date")
+        );
+        assert_eq!(
+            current_game_month_start(august_2_start),
+            NaiveDate::from_ymd_opt(2026, 8, 1).expect("valid date")
+        );
         assert_eq!(
             rollover_start_utc(august_2_start),
             august_2_start.naive_utc()

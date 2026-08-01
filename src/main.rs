@@ -1193,7 +1193,7 @@ async fn refresh_user_rankings_task(pool: PgPool) {
             "SELECT DISTINCT cmf.year, cmf.month \
              FROM circle_member_fans_monthly cmf \
              WHERE make_date(cmf.year, cmf.month, 1) < date_trunc('month', \
-                   (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date) \
+                   (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date - interval '1 day') \
              AND ( \
                  NOT EXISTS ( \
                      SELECT 1 FROM circle_ranks_monthly_archive a \
@@ -1202,7 +1202,7 @@ async fn refresh_user_rankings_task(pool: PgPool) {
                  ) \
                  OR ( \
                      make_date(cmf.year, cmf.month, 1) = date_trunc('month', \
-                         (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date)::date \
+                         (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date - interval '1 day')::date \
                          - interval '1 month' \
                      AND extract(day from \
                          (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date) <= 3 \
