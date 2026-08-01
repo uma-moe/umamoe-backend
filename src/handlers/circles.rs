@@ -3,7 +3,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use chrono::{Datelike, Duration, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -96,14 +96,37 @@ pub fn router() -> Router<AppState> {
         .route("/rank-thresholds", get(get_rank_thresholds))
 }
 
+fn is_rollover_display_window(now: DateTime<Utc>) -> bool {
+    let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
+    now.with_timezone(&jst).day() == 2
+}
+
 fn rollover_display_sql() -> &'static str {
-    "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') >= (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day') AND (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') < (date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')"
+    if is_rollover_display_window(Utc::now()) {
+        "TRUE"
+    } else {
+        "FALSE"
+    }
+}
+
+fn rollover_start_utc(now: DateTime<Utc>) -> chrono::NaiveDateTime {
+    let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
+    let now_jst = now.with_timezone(&jst);
+    let rollover_start_jst = NaiveDate::from_ymd_opt(now_jst.year(), now_jst.month(), 1)
+        .expect("first day exists")
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight exists")
+        + Duration::days(1);
+
+    rollover_start_jst - Duration::hours(9)
 }
 
 fn row_has_new_last_month_sql(alias: &str) -> String {
+    let rollover_start_utc = rollover_start_utc(Utc::now()).format("%Y-%m-%d %H:%M:%S");
+
     format!(
-        "{}.last_updated >= ((date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '1 day') AT TIME ZONE 'Asia/Tokyo')::timestamp AND NOT COALESCE({}.archived, false)",
-        alias, alias
+        "{}.last_updated >= TIMESTAMP '{}' AND NOT COALESCE({}.archived, false)",
+        alias, rollover_start_utc, alias
     )
 }
 
@@ -173,6 +196,19 @@ fn rank_fallback_sql(alias: &str) -> String {
     )
 }
 
+fn rank_column_sql(alias: &str, live_rank_expr: &str) -> String {
+    let rank_fallback = rank_fallback_sql(alias);
+    let live_rank = positive_rank_sql(&format!("{live_rank_expr}::int"));
+
+    format!(
+        "CASE WHEN {} THEN {} ELSE COALESCE({}, {}) END",
+        rollover_display_sql(),
+        rank_fallback,
+        live_rank,
+        rank_fallback,
+    )
+}
+
 fn display_monthly_point_sql(alias: &str) -> String {
     format!(
         "CASE WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.monthly_point) ELSE {}.monthly_point END",
@@ -211,11 +247,14 @@ fn display_yesterday_rank_sql(alias: &str) -> String {
 
 fn display_yesterday_rank_expr_sql(alias: &str, live_yesterday_rank_expr: &str) -> String {
     let live_yesterday_rank = positive_rank_sql(&format!("{}::int", live_yesterday_rank_expr));
+    let fallback_rank = display_yesterday_rank_sql(alias);
 
     format!(
-        "COALESCE({}, {})",
+        "CASE WHEN {} THEN {} ELSE COALESCE({}, {}) END",
+        rollover_display_sql(),
+        fallback_rank,
         live_yesterday_rank,
-        display_yesterday_rank_sql(alias)
+        fallback_rank,
     )
 }
 
@@ -640,12 +679,7 @@ pub async fn list_circles(
     };
 
     let points_column = effective_points_sql("c");
-    let rank_fallback_column = rank_fallback_sql("c");
-    let rank_column = format!(
-        "COALESCE({}, {})",
-        positive_rank_sql("lr.live_rank::int"),
-        rank_fallback_column
-    );
+    let rank_column = rank_column_sql("c", "lr.live_rank");
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
@@ -1129,18 +1163,19 @@ fn historical_tier_gap_rank(
 /// Fetch the effective current points of the circle at the given boundary rank
 async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
     let points_column = effective_points_sql("c");
+    let rank_column = rank_column_sql("c", "lr.live_rank");
 
     let result: Option<Option<i64>> = sqlx::query_scalar(&format!(
         r#"
         SELECT {}
         FROM circles c
         JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id
-        WHERE lr.live_rank <= $1
+        WHERE ({}) <= $1
           AND ({}) IS NOT NULL
-        ORDER BY lr.live_rank DESC
+        ORDER BY ({}) DESC
         LIMIT 1
         "#,
-        points_column, points_column
+        points_column, rank_column, points_column, rank_column
     ))
     .bind(boundary_rank)
     .fetch_optional(pool)
@@ -1192,18 +1227,19 @@ async fn fetch_boundary_points_yesterday(
     boundary_rank: i32,
 ) -> Result<Option<i64>, AppError> {
     let points_column = display_yesterday_points_sql("c");
+    let rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
 
     let result: Option<Option<i64>> = sqlx::query_scalar(&format!(
         r#"
         SELECT {}
         FROM circles c
         JOIN circle_live_ranks lr ON c.circle_id = lr.circle_id
-        WHERE lr.live_yesterday_rank <= $1
+        WHERE ({}) <= $1
           AND ({}) IS NOT NULL
-        ORDER BY lr.live_yesterday_rank DESC
+        ORDER BY ({}) DESC
         LIMIT 1
         "#,
-        points_column, points_column
+        points_column, rank_column, points_column, rank_column
     ))
     .bind(boundary_rank)
     .fetch_optional(pool)
@@ -1237,12 +1273,7 @@ async fn fetch_boundary_points_last_month(
 
 /// Fetch circle by ID
 async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, AppError> {
-    let rank_fallback_column = rank_fallback_sql("c");
-    let rank_column = format!(
-        "COALESCE({}, {})",
-        positive_rank_sql("lr.live_rank::int"),
-        rank_fallback_column
-    );
+    let rank_column = rank_column_sql("c", "lr.live_rank");
     let name_column = disbanded_name_sql("c");
     let monthly_point_column = display_monthly_point_sql("c");
     let yesterday_points_column = display_yesterday_points_sql("c");
@@ -1593,17 +1624,28 @@ mod tests {
 
     #[test]
     fn circle_rollover_is_limited_to_second_through_third_jst() {
-        let sql = rollover_display_sql();
+        let august_1 = DateTime::parse_from_rfc3339("2026-08-01T14:59:59Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        let august_2_start = DateTime::parse_from_rfc3339("2026-08-01T15:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
+        let august_3_start = DateTime::parse_from_rfc3339("2026-08-02T15:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&Utc);
 
-        assert!(sql.contains("+ interval '1 day'"));
-        assert!(sql.contains("+ interval '2 days'"));
-        assert!(!sql.contains("19 hours"));
+        assert!(!is_rollover_display_window(august_1));
+        assert!(is_rollover_display_window(august_2_start));
+        assert!(!is_rollover_display_window(august_3_start));
+        assert_eq!(
+            rollover_start_utc(august_2_start),
+            august_2_start.naive_utc()
+        );
 
         let migration =
-            include_str!("../../migrations/20260731000000_limit_circle_rollover_to_second_jst.sql");
-        assert!(migration.contains("rollover_start_jst"));
-        assert!(migration.contains("rollover_end_jst"));
-        assert!(!migration.contains("tally_start_jst"));
-        assert!(!migration.contains("19 hours"));
+            include_str!("../../migrations/20260801000000_use_api_clock_for_circle_rollover.sql");
+        assert!(!migration.contains("rollover_start_jst"));
+        assert!(!migration.contains("last_month_rank"));
+        assert!(!migration.contains("last_month_point"));
     }
 }
