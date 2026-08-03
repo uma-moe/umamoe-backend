@@ -18,6 +18,29 @@ Snapshots need either explicitly rolling-window scoring or persisted
 incremental state before retention can be enabled safely. Monthly daily-fan
 rows and published cheat-analysis aggregates are also not deleted.
 
+## Ranking archive maintenance
+
+Ranking archive discovery runs hourly, but only one backend may run it at a
+time. It generates the bounded month range and probes `(year, month)` indexes;
+it does not scan the full monthly history. The session also uses
+`RANKING_ARCHIVE_STATEMENT_TIMEOUT_SECONDS` (300 seconds by default), so an
+unexpectedly expensive plan or backfill is canceled and retried on the next
+cycle instead of consuming a database connection indefinitely.
+
+If an old deployment left archive scans running, cancel only those statements
+after the replacement backend is healthy:
+
+```sql
+SELECT pg_cancel_backend(pid)
+FROM pg_stat_activity
+WHERE application_name = 'honsemoe-backend'
+  AND state = 'active'
+  AND (
+    query ILIKE 'SELECT DISTINCT cm.year, cm.month%'
+    OR query ILIKE 'SELECT DISTINCT cmf.year, cmf.month%'
+  );
+```
+
 ## Rollout
 
 1. Deploy the backend migration and retention task.

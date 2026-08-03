@@ -1179,6 +1179,20 @@ async fn refresh_user_rankings_task(pool: PgPool) {
         if let Some(mut archive_lock) =
             acquire_maintenance_connection(&pool, RANKING_ARCHIVE_LOCK).await
         {
+            // Keep a bad plan or an unexpectedly large backfill from holding a
+            // backend forever. Restore the pool connection's original settings
+            // before returning it to the pool.
+            let previous_archive_timeouts = current_timeout_settings(&mut archive_lock).await.ok();
+            if let Err(error) = set_maintenance_timeouts(
+                &mut archive_lock,
+                env_u64("RANKING_ARCHIVE_STATEMENT_TIMEOUT_SECONDS", 300).clamp(30, 600),
+                3,
+            )
+            .await
+            {
+                warn!("Failed to set ranking archive DB timeouts: {}", error);
+            }
+
             // Step 1: Archive any completed months not yet in the archive table.
             // Generate the small calendar range and probe each month through the
             // (year, month) index instead of DISTINCT-scanning the full history.
@@ -1228,7 +1242,7 @@ async fn refresh_user_rankings_task(pool: PgPool) {
                         match sqlx::query("SELECT archive_fan_rankings_month($1, $2)")
                             .bind(year)
                             .bind(month)
-                            .fetch_optional(&pool)
+                            .fetch_optional(&mut *archive_lock)
                             .await
                         {
                             Ok(_) => info!("✅ Archived fan rankings for {}-{:02}", year, month),
@@ -1296,7 +1310,7 @@ async fn refresh_user_rankings_task(pool: PgPool) {
                         match sqlx::query("SELECT archive_circle_rankings_month($1, $2)")
                             .bind(year)
                             .bind(month)
-                            .fetch_optional(&pool)
+                            .fetch_optional(&mut *archive_lock)
                             .await
                         {
                             Ok(_) => info!("✅ Archived circle ranks for {}-{:02}", year, month),
@@ -1310,6 +1324,10 @@ async fn refresh_user_rankings_task(pool: PgPool) {
                 Err(e) => warn!("⚠️ Failed to check circle rank archive status: {}", e),
             }
 
+            if let Some((statement_timeout, lock_timeout)) = previous_archive_timeouts {
+                restore_timeout_settings(&mut archive_lock, &statement_timeout, &lock_timeout)
+                    .await;
+            }
             release_maintenance_lock(&mut archive_lock, RANKING_ARCHIVE_LOCK).await;
         }
 
