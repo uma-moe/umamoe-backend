@@ -110,25 +110,40 @@ fn circle_search_sources_sql(query: &str) -> Option<String> {
     }
 
     let search_pattern = format!("%{}%", query.replace("'", "''"));
+    let circle_visibility = current_circle_visibility_sql("circle");
     Some(format!(
         r#"
-        SELECT circle_id
-        FROM circles
-        WHERE name ILIKE '{search_pattern}'
+        SELECT circle.circle_id
+        FROM circles circle
+        WHERE circle.name ILIKE '{search_pattern}'
+          AND {circle_visibility}
         UNION
         SELECT circle.circle_id
         FROM circles circle
         JOIN trainer leader ON leader.account_id = circle.leader_viewer_id::text
         WHERE leader.name ILIKE '{search_pattern}'
+          AND {circle_visibility}
         UNION
-        SELECT circle_id
-        FROM user_fan_rankings_monthly_current
-        WHERE year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
-          AND month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
-          AND trainer_name ILIKE '{search_pattern}'
-          AND circle_id IS NOT NULL
+        SELECT rankings.circle_id
+        FROM (
+            SELECT DISTINCT circle_id
+            FROM user_fan_rankings_monthly_current
+            WHERE year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+              AND month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+              AND trainer_name ILIKE '{search_pattern}'
+              AND circle_id IS NOT NULL
+        ) rankings
+        JOIN circles circle ON circle.circle_id = rankings.circle_id
+        WHERE {circle_visibility}
         "#
     ))
+}
+
+fn current_circle_visibility_sql(alias: &str) -> String {
+    format!(
+        "{alias}.last_updated >= date_trunc('month', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days') \
+         AND ({alias}.archived IS DISTINCT FROM true OR (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::timestamp < date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')"
+    )
 }
 
 fn sql_cache_key(prefix: &str, sql: &str) -> String {
@@ -769,8 +784,7 @@ pub async fn list_circles(
 
     // Only show circles updated this month to ensure points are current
     // Use JST minus 2 days so the month flips at midnight JST on the 3rd (giving time for data collection)
-    conditions.push("c.last_updated >= date_trunc('month', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')".to_string());
-    conditions.push("(c.archived IS DISTINCT FROM true OR (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::timestamp < date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')".to_string());
+    conditions.push(current_circle_visibility_sql("c"));
 
     // Name filter
     if let Some(name) = &params.name {
