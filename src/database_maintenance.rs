@@ -1,8 +1,6 @@
 use sqlx::{pool::PoolConnection, PgPool, Postgres};
 use tracing::{info, warn};
 
-const RETENTION_LOCK_NAME: &str = "database_high_churn_retention";
-
 #[derive(Clone, Copy, Debug)]
 struct RetentionConfig {
     completed_task_hours: u64,
@@ -10,6 +8,7 @@ struct RetentionConfig {
     task_attempt_hours: u64,
     batch_size: i64,
     max_batches_per_table: u64,
+    batch_delay_ms: u64,
     interval_seconds: u64,
     start_delay_seconds: u64,
     statement_timeout_seconds: u64,
@@ -26,9 +25,12 @@ impl RetentionConfig {
             // Raw attempts are diagnostic telemetry. Aggregated health tables are the
             // durable representation; two days is enough for incident investigation.
             task_attempt_hours: env_u64("TASK_ATTEMPT_RETENTION_HOURS", 48).clamp(24, 24 * 30),
-            batch_size: env_u64("DATABASE_RETENTION_BATCH_SIZE", 25_000).clamp(1_000, 100_000)
-                as i64,
-            max_batches_per_table: env_u64("DATABASE_RETENTION_MAX_BATCHES", 20).clamp(1, 500),
+            // Hard caps keep an old server env file from restoring the original
+            // aggressive 25k x 20 catch-up loop after this safety fix deploys.
+            batch_size: env_u64("DATABASE_RETENTION_BATCH_SIZE", 5_000).clamp(1_000, 5_000) as i64,
+            max_batches_per_table: env_u64("DATABASE_RETENTION_MAX_BATCHES", 2).clamp(1, 2),
+            batch_delay_ms: env_u64("DATABASE_RETENTION_BATCH_DELAY_MILLISECONDS", 2_000)
+                .clamp(250, 30_000),
             interval_seconds: env_u64("DATABASE_RETENTION_INTERVAL_SECONDS", 15 * 60)
                 .clamp(60, 24 * 60 * 60),
             start_delay_seconds: env_u64("DATABASE_RETENTION_START_DELAY_SECONDS", 5 * 60)
@@ -64,12 +66,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
 pub(crate) async fn run_retention_task(pool: PgPool) {
     let config = RetentionConfig::from_env();
     info!(
-        "Starting database retention (completed_tasks={}h, failed_tasks={}d, task_attempts={}h, batch={}, max_batches={}, interval={}s)",
+        "Starting database retention (completed_tasks={}h, failed_tasks={}d, task_attempts={}h, batch={}, max_batches={}, batch_delay={}ms, interval={}s)",
         config.completed_task_hours,
         config.failed_task_days,
         config.task_attempt_hours,
         config.batch_size,
         config.max_batches_per_table,
+        config.batch_delay_ms,
         config.interval_seconds,
     );
 
@@ -96,8 +99,8 @@ async fn run_retention_cycle(
     pool: &PgPool,
     config: RetentionConfig,
 ) -> Result<RetentionStats, sqlx::Error> {
-    let Some(mut conn) = super::acquire_maintenance_connection(pool, RETENTION_LOCK_NAME).await
-    else {
+    let lock_name = super::HEAVY_DATABASE_MAINTENANCE_LOCK;
+    let Some(mut conn) = super::acquire_maintenance_connection(pool, lock_name).await else {
         return Ok(RetentionStats::default());
     };
 
@@ -121,7 +124,7 @@ async fn run_retention_cycle(
     if let Some((statement_timeout, lock_timeout)) = previous_timeouts {
         super::restore_timeout_settings(&mut conn, &statement_timeout, &lock_timeout).await;
     }
-    super::release_maintenance_lock(&mut conn, RETENTION_LOCK_NAME).await;
+    super::release_maintenance_lock(&mut conn, lock_name).await;
     result
 }
 
@@ -208,7 +211,7 @@ async fn delete_task_attempts(
     // the entire table for every small DELETE batch. The first statement uses
     // idx_task_attempts_created_at; the second uses the primary key.
     let mut total = 0;
-    for _ in 0..config.max_batches_per_table {
+    for batch_index in 0..config.max_batches_per_table {
         let ids: Vec<i64> = sqlx::query_scalar(
             r#"
             SELECT id
@@ -239,7 +242,9 @@ async fn delete_task_attempts(
         if selected < config.batch_size as u64 {
             break;
         }
-        tokio::task::yield_now().await;
+        if batch_index + 1 < config.max_batches_per_table {
+            tokio::time::sleep(tokio::time::Duration::from_millis(config.batch_delay_ms)).await;
+        }
     }
     Ok(total)
 }
@@ -258,13 +263,15 @@ where
     >,
 {
     let mut total = 0;
-    for _ in 0..config.max_batches_per_table {
+    for batch_index in 0..config.max_batches_per_table {
         let deleted = delete_batch(conn, config.batch_size).await?;
         total += deleted;
         if deleted < config.batch_size as u64 {
             break;
         }
-        tokio::task::yield_now().await;
+        if batch_index + 1 < config.max_batches_per_table {
+            tokio::time::sleep(tokio::time::Duration::from_millis(config.batch_delay_ms)).await;
+        }
     }
     Ok(total)
 }
@@ -279,8 +286,9 @@ mod tests {
             completed_task_hours: 36,
             failed_task_days: 14,
             task_attempt_hours: 48,
-            batch_size: 25_000,
-            max_batches_per_table: 20,
+            batch_size: 5_000,
+            max_batches_per_table: 2,
+            batch_delay_ms: 2_000,
             interval_seconds: 15 * 60,
             start_delay_seconds: 5 * 60,
             statement_timeout_seconds: 30,
@@ -288,6 +296,7 @@ mod tests {
         };
 
         assert!(config.completed_task_hours >= 24);
-        assert!(config.batch_size <= 100_000);
+        assert!(config.batch_size <= 5_000);
+        assert!(config.max_batches_per_table <= 2);
     }
 }

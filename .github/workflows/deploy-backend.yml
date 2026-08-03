@@ -217,7 +217,7 @@ jobs:
           ROUTER_IMAGE: ${{ env.ROUTER_IMAGE }}
           USER_WRITES_DISABLED: 'false'
           DISABLE_DB_BACKGROUND_JOBS: 'true'
-          DATABASE_MAX_CONNECTIONS: '4'
+          DATABASE_MAX_CONNECTIONS: '2'
           DATABASE_MIN_CONNECTIONS: '1'
           DATABASE_ACQUIRE_TIMEOUT_SECONDS: '5'
         run: |
@@ -544,7 +544,7 @@ jobs:
           ROUTER_IMAGE: ${{ env.ROUTER_IMAGE }}
           USER_WRITES_DISABLED: 'false'
           DISABLE_DB_BACKGROUND_JOBS: 'false'
-          DATABASE_MAX_CONNECTIONS: '30'
+          DATABASE_MAX_CONNECTIONS: '15'
           DATABASE_MIN_CONNECTIONS: '1'
           DATABASE_ACQUIRE_TIMEOUT_SECONDS: '5'
         run: |

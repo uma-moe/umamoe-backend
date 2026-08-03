@@ -6,6 +6,10 @@ use axum::{
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
 use tokio::sync::Semaphore;
 
 use crate::{
@@ -83,13 +87,6 @@ pub struct CircleListResponse {
     pub total_pages: i64,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct CircleListRow {
-    #[sqlx(flatten)]
-    circle: Circle,
-    total_count: i64,
-}
-
 fn circle_search_sources_sql(query: &str) -> Option<String> {
     let query = query.trim();
     if query.is_empty() {
@@ -114,9 +111,30 @@ fn circle_search_sources_sql(query: &str) -> Option<String> {
 
     let search_pattern = format!("%{}%", query.replace("'", "''"));
     Some(format!(
-        "SELECT circle_id FROM circle_search_documents WHERE search_text ILIKE '{}'",
-        search_pattern
+        r#"
+        SELECT circle_id
+        FROM circles
+        WHERE name ILIKE '{search_pattern}'
+        UNION
+        SELECT circle.circle_id
+        FROM circles circle
+        JOIN trainer leader ON leader.account_id = circle.leader_viewer_id::text
+        WHERE leader.name ILIKE '{search_pattern}'
+        UNION
+        SELECT circle_id
+        FROM user_fan_rankings_monthly_current
+        WHERE year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+          AND month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+          AND trainer_name ILIKE '{search_pattern}'
+          AND circle_id IS NOT NULL
+        "#
     ))
+}
+
+fn sql_cache_key(prefix: &str, sql: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    sql.hash(&mut hasher);
+    format!("{prefix}:{:016x}", hasher.finish())
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -694,9 +712,14 @@ pub async fn list_circles(
     let live_rank_column = display_live_rank_expr_sql(&live_rank_expr);
     let last_live_update_column = display_last_live_update_sql("c");
     // Build dynamic query
+    let count_rank_join = if params.max_rank.is_some() {
+        "LEFT JOIN circle_live_ranks lr ON lr.circle_id = c.circle_id"
+    } else {
+        ""
+    };
     let mut count_query = format!(
-        "{} SELECT COUNT(*) FROM circles c {} WHERE 1=1",
-        with_clause, join_matching_circles
+        "{} SELECT COUNT(*) FROM circles c {} {} WHERE 1=1",
+        with_clause, count_rank_join, join_matching_circles
     );
 
     let mut select_query = format!(
@@ -723,8 +746,7 @@ pub async fn list_circles(
             {} as yesterday_rank,
             {} as live_points,
             {} as live_rank,
-            {} as last_live_update,
-            COUNT(*) OVER() AS total_count
+            {} as last_live_update
         FROM circles c
         LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id
         LEFT JOIN circle_live_ranks lr ON lr.circle_id = c.circle_id
@@ -775,6 +797,20 @@ pub async fn list_circles(
         select_query.push_str(&format!(" AND {}", condition));
     }
 
+    // Counts are identical across pages and change slowly. Keep them separate
+    // from the row query so LIMIT/OFFSET can stop early, and cache the result
+    // to avoid repeating the full count for pagination probes.
+    let count_cache_key = sql_cache_key("circle:list:count", &count_query);
+    let total = if let Some(total) = crate::cache::get::<i64>(&count_cache_key) {
+        total
+    } else {
+        let total = sqlx::query_scalar::<_, i64>(&count_query)
+            .fetch_one(&state.db)
+            .await?;
+        let _ = crate::cache::set(&count_cache_key, &total, std::time::Duration::from_secs(60));
+        total
+    };
+
     // Add sorting
     let sort_by = params.sort_by.as_deref().unwrap_or("rank");
     let sort_dir = match params.sort_dir.as_deref() {
@@ -802,26 +838,13 @@ pub async fn list_circles(
     select_query.push_str(&format!(" LIMIT {} OFFSET {}", limit, offset));
 
     // Execute query
-    let rows = sqlx::query_as::<_, CircleListRow>(&select_query)
+    let circles = sqlx::query_as::<_, Circle>(&select_query)
         .fetch_all(&state.db)
         .await?;
 
-    // The window count avoids rerunning the matching search for the normal
-    // case. Only an out-of-range page needs the standalone count fallback.
-    let total = match rows.first() {
-        Some(row) => row.total_count,
-        None if offset > 0 => {
-            sqlx::query_scalar::<_, i64>(&count_query)
-                .fetch_one(&state.db)
-                .await?
-        }
-        None => 0,
-    };
-
-    let circles_with_rank: Vec<CircleWithRank> = rows
+    let circles_with_rank: Vec<CircleWithRank> = circles
         .into_iter()
-        .map(|row| {
-            let circle = row.circle;
+        .map(|circle| {
             let effective_points = effective_circle_points(&circle);
             let club_rank = Some(compute_club_rank(
                 circle.monthly_rank,
@@ -1171,6 +1194,14 @@ fn historical_tier_gap_rank(
 
 /// Fetch the effective current points of the circle at the given boundary rank
 async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
+    let cache_key = format!(
+        "circle:boundary:current:{}:{boundary_rank}",
+        Utc::now().date_naive()
+    );
+    if let Some(points) = crate::cache::get::<Option<i64>>(&cache_key) {
+        return Ok(points);
+    }
+
     let points_column = effective_points_sql("c");
     let rank_column = rank_column_sql("c", "lr.live_rank");
 
@@ -1190,7 +1221,9 @@ async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Opti
     .fetch_optional(pool)
     .await?;
 
-    Ok(result.flatten())
+    let points = result.flatten();
+    let _ = crate::cache::set(&cache_key, &points, std::time::Duration::from_secs(300));
+    Ok(points)
 }
 
 /// Fetch the monthly points at a historical tier boundary. For an upper-tier
@@ -1235,6 +1268,14 @@ async fn fetch_boundary_points_yesterday(
     pool: &PgPool,
     boundary_rank: i32,
 ) -> Result<Option<i64>, AppError> {
+    let cache_key = format!(
+        "circle:boundary:yesterday:{}:{boundary_rank}",
+        Utc::now().date_naive()
+    );
+    if let Some(points) = crate::cache::get::<Option<i64>>(&cache_key) {
+        return Ok(points);
+    }
+
     let points_column = display_yesterday_points_sql("c");
     let rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
 
@@ -1254,7 +1295,9 @@ async fn fetch_boundary_points_yesterday(
     .fetch_optional(pool)
     .await?;
 
-    Ok(result.flatten())
+    let points = result.flatten();
+    let _ = crate::cache::set(&cache_key, &points, std::time::Duration::from_secs(300));
+    Ok(points)
 }
 
 /// Fetch the last_month_point of the circle at the given boundary rank.
@@ -1262,6 +1305,14 @@ async fn fetch_boundary_points_last_month(
     pool: &PgPool,
     boundary_rank: i32,
 ) -> Result<Option<i64>, AppError> {
+    let cache_key = format!(
+        "circle:boundary:last-month:{}:{boundary_rank}",
+        Utc::now().date_naive()
+    );
+    if let Some(points) = crate::cache::get::<Option<i64>>(&cache_key) {
+        return Ok(points);
+    }
+
     let result: Option<Option<i64>> = sqlx::query_scalar(
         r#"
         SELECT c.last_month_point
@@ -1277,7 +1328,9 @@ async fn fetch_boundary_points_last_month(
     .fetch_optional(pool)
     .await?;
 
-    Ok(result.flatten())
+    let points = result.flatten();
+    let _ = crate::cache::set(&cache_key, &points, std::time::Duration::from_secs(300));
+    Ok(points)
 }
 
 /// Fetch circle by ID
@@ -1553,13 +1606,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_search_uses_compact_circle_documents() {
+    fn text_search_reuses_existing_indexed_rankings() {
         let sql = circle_search_sources_sql("Sta").expect("search SQL");
 
-        assert!(sql.contains("FROM circle_search_documents"));
+        assert!(sql.contains("FROM user_fan_rankings_monthly_current"));
         assert!(sql.contains("ILIKE '%Sta%'"));
         assert!(!sql.contains("circle_member_fans_monthly"));
-        assert!(!sql.contains("JOIN trainer"));
+        assert!(!sql.contains("circle_search_documents"));
     }
 
     #[test]
@@ -1569,17 +1622,7 @@ mod tests {
         assert!(sql.contains("circle_id = 123"));
         assert!(sql.contains("leader_viewer_id = 123"));
         assert!(sql.contains("viewer_id = 123"));
-        assert!(!sql.contains("circle_search_documents"));
-    }
-
-    #[test]
-    fn circle_search_document_is_trigram_indexed_and_refreshable() {
-        let migration =
-            include_str!("../../migrations/20260804000000_add_circle_search_documents.sql");
-
-        assert!(migration.contains("CREATE MATERIALIZED VIEW circle_search_documents"));
-        assert!(migration.contains("CREATE UNIQUE INDEX circle_search_documents_circle_id_idx"));
-        assert!(migration.contains("search_text gin_trgm_ops"));
+        assert!(!sql.contains("user_fan_rankings_monthly_current"));
     }
 
     #[test]

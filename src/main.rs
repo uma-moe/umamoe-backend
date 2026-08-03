@@ -42,6 +42,8 @@ pub struct AppState {
     pub user_writes_disabled: bool,
 }
 
+pub(crate) const HEAVY_DATABASE_MAINTENANCE_LOCK: &str = "database_heavy_maintenance";
+
 async fn log_database_write_state(pool: &PgPool, require_writable: bool) -> anyhow::Result<()> {
     let (in_recovery, transaction_read_only, current_user, current_database) =
         sqlx::query_as::<_, (bool, String, String, String)>(
@@ -1021,7 +1023,6 @@ fn safe_materialized_view_name(view_name: &str) -> Option<&'static str> {
     match view_name {
         "stats_counts" => Some("stats_counts"),
         "circle_live_ranks" => Some("circle_live_ranks"),
-        "circle_search_documents" => Some("circle_search_documents"),
         "user_fan_rankings_monthly_current" => Some("user_fan_rankings_monthly_current"),
         "user_fan_rankings_alltime" => Some("user_fan_rankings_alltime"),
         "user_fan_rankings_gains" => Some("user_fan_rankings_gains"),
@@ -1107,6 +1108,14 @@ async fn refresh_cheat_analysis_task(pool: PgPool) {
     tokio::time::sleep(tokio::time::Duration::from_secs(90)).await;
 
     loop {
+        let Some(mut maintenance_lock) =
+            acquire_maintenance_connection(&pool, HEAVY_DATABASE_MAINTENANCE_LOCK).await
+        else {
+            warn!("Skipping suspicious-activity rebuild because heavy database maintenance is already running");
+            tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+            continue;
+        };
+
         let start = std::time::Instant::now();
         info!("▶ suspicious-activity analysis rebuild starting");
         match cheat_analysis::run_full_rebuild(&pool).await {
@@ -1122,6 +1131,7 @@ async fn refresh_cheat_analysis_task(pool: PgPool) {
             }
             Err(e) => warn!("⚠️ Failed to refresh suspicious-activity analysis: {}", e),
         }
+        release_maintenance_lock(&mut maintenance_lock, HEAVY_DATABASE_MAINTENANCE_LOCK).await;
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
     }
@@ -1142,7 +1152,7 @@ async fn refresh_circle_ranks_task(pool: PgPool) {
 
 // Background task to refresh user fan ranking materialized views
 // Architecture: archive table for past months + current mat view for last 2 months
-// - Hourly: archive completed months, refresh circle search + current + alltime
+// - Hourly: archive completed months, refresh current + alltime
 // - Daily: refresh gains (expensive, reads raw data)
 async fn refresh_user_rankings_task(pool: PgPool) {
     use sqlx::Row;
@@ -1150,10 +1160,15 @@ async fn refresh_user_rankings_task(pool: PgPool) {
     // Wait for startup
     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 
-    let mut gains_tick: u32 = 23; // Start at 23 so gains refresh triggers on first iteration
+    // Avoid rebuilding the expensive daily gains view during every deployment.
+    let mut gains_tick: u32 = if env_flag("REFRESH_GAINS_ON_STARTUP") {
+        23
+    } else {
+        0
+    };
 
     info!("🔄 Starting user fan rankings refresh task (current+alltime: hourly, gains: daily)");
-    info!("🔄 Forcing initial recalculation of all ranking materialized views");
+    info!("🔄 Recalculating current and all-time ranking materialized views");
 
     loop {
         gains_tick += 1;
@@ -1239,8 +1254,7 @@ async fn refresh_user_rankings_task(pool: PgPool) {
             Err(e) => warn!("⚠️ Failed to check circle rank archive status: {}", e),
         }
 
-        // Step 2: Refresh compact current-member search documents, then rankings.
-        refresh_mat_view(&pool, "circle_search_documents").await;
+        // Step 2: Refresh current-month rankings.
         refresh_mat_view(&pool, "user_fan_rankings_monthly_current").await;
 
         // Step 3: Refresh alltime (reads from pre-aggregated monthly data — fast)
@@ -1267,7 +1281,7 @@ async fn refresh_mat_view(pool: &PgPool, view_name: &str) {
         return;
     };
 
-    let lock_name = format!("matview_refresh:{}", view_name);
+    let lock_name = HEAVY_DATABASE_MAINTENANCE_LOCK.to_string();
     let Some(mut conn) = acquire_maintenance_connection(pool, &lock_name).await else {
         return;
     };

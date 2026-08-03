@@ -22,8 +22,8 @@ rows and published cheat-analysis aggregates are also not deleted.
 
 1. Deploy the backend migration and retention task.
 2. Watch for `Database retention deleted ...` messages. At the defaults, each
-   15-minute cycle deletes at most 500,000 rows from each retained table, in 25,000-row
-   transactions. A large existing backlog is intentionally drained over
+   15-minute cycle deletes at most 10,000 rows from each retained table, in paced
+   5,000-row transactions. A large existing backlog is intentionally drained over
    several cycles.
 3. Run the read-only production report:
 
