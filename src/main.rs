@@ -1021,6 +1021,7 @@ fn safe_materialized_view_name(view_name: &str) -> Option<&'static str> {
     match view_name {
         "stats_counts" => Some("stats_counts"),
         "circle_live_ranks" => Some("circle_live_ranks"),
+        "circle_search_documents" => Some("circle_search_documents"),
         "user_fan_rankings_monthly_current" => Some("user_fan_rankings_monthly_current"),
         "user_fan_rankings_alltime" => Some("user_fan_rankings_alltime"),
         "user_fan_rankings_gains" => Some("user_fan_rankings_gains"),
@@ -1141,7 +1142,7 @@ async fn refresh_circle_ranks_task(pool: PgPool) {
 
 // Background task to refresh user fan ranking materialized views
 // Architecture: archive table for past months + current mat view for last 2 months
-// - Hourly: archive completed months, refresh current + alltime (fast, seconds)
+// - Hourly: archive completed months, refresh circle search + current + alltime
 // - Daily: refresh gains (expensive, reads raw data)
 async fn refresh_user_rankings_task(pool: PgPool) {
     use sqlx::Row;
@@ -1238,7 +1239,8 @@ async fn refresh_user_rankings_task(pool: PgPool) {
             Err(e) => warn!("⚠️ Failed to check circle rank archive status: {}", e),
         }
 
-        // Step 2: Refresh current-month mat view (fast — only last 2 months of data)
+        // Step 2: Refresh compact current-member search documents, then rankings.
+        refresh_mat_view(&pool, "circle_search_documents").await;
         refresh_mat_view(&pool, "user_fan_rankings_monthly_current").await;
 
         // Step 3: Refresh alltime (reads from pre-aggregated monthly data — fast)
