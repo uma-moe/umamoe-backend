@@ -6,12 +6,17 @@ use axum::{
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 
 use crate::{
     errors::AppError,
     models::{Circle, CircleMemberFansMonthly},
     AppState,
 };
+
+const CIRCLE_TEXT_SEARCH_DB_CONCURRENCY: usize = 2;
+static CIRCLE_TEXT_SEARCH_DB_SLOTS: Semaphore =
+    Semaphore::const_new(CIRCLE_TEXT_SEARCH_DB_CONCURRENCY);
 
 #[derive(Debug, Deserialize)]
 pub struct CircleQueryParams {
@@ -594,70 +599,90 @@ pub async fn list_circles(
     let limit = params.limit.unwrap_or(100).clamp(1, 100);
     let offset = page * limit;
 
+    let normalized_query = params.query.as_deref().map(str::trim).unwrap_or("");
+    let is_text_search = !normalized_query.is_empty() && normalized_query.parse::<i64>().is_err();
+    if is_text_search && normalized_query.chars().count() < 3 {
+        return Err(AppError::BadRequest(
+            "text search queries must contain at least 3 characters".to_string(),
+        ));
+    }
+    let _text_search_slot = if is_text_search {
+        Some(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                CIRCLE_TEXT_SEARCH_DB_SLOTS.acquire(),
+            )
+            .await
+            .map_err(|_| {
+                AppError::ServiceUnavailable(
+                    "Circle search is busy; please retry shortly.".to_string(),
+                )
+            })?
+            .map_err(|_| {
+                AppError::ServiceUnavailable("Circle search is unavailable.".to_string())
+            })?,
+        )
+    } else {
+        None
+    };
+
     let mut with_parts = Vec::new();
 
     // If search query is present, add MatchingCircles CTE to optimize search
     let mut join_matching_circles = String::new();
 
     if let Some(query) = &params.query {
-        // Skip very short queries that would match too many results
         let query_trimmed = query.trim();
-        if query_trimmed.len() >= 2 {
+        if !query_trimmed.is_empty() {
             let search_pattern = format!("%{}%", query_trimmed.replace("'", "''"));
-            let search_exact = query_trimmed.replace("'", "''");
-            let is_number = query_trimmed.parse::<i64>().is_ok();
+            let query_id = query_trimmed.parse::<i64>().ok();
 
             let mut union_parts = Vec::new();
 
-            // 1. Search by Circle Name
-            union_parts.push(format!(
-                "SELECT circle_id FROM circles WHERE name ILIKE '{}'",
-                search_pattern
-            ));
-
-            // 2. Search by Leader Name
-            union_parts.push(format!(
-            "SELECT c.circle_id FROM circles c JOIN trainer t ON c.leader_viewer_id::text = t.account_id WHERE t.name ILIKE '{}'", 
-            search_pattern
-        ));
-
-            // 3. Search by Member Name
-            union_parts.push(format!(
-            r#"
-            SELECT cm.circle_id 
-            FROM circle_member_fans_monthly cm 
-            JOIN trainer tm ON cm.viewer_id::text = tm.account_id 
-            WHERE cm.year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int 
-              AND cm.month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int 
-              AND tm.name ILIKE '{}'
-            "#,
-            search_pattern
-        ));
-
-            if is_number {
-                // 4. Search by Circle ID
+            if query_id.is_none() {
+                // Trigram indexes become effective at three characters. Short
+                // non-numeric searches are rejected above instead of scanning
+                // the full trainer and current-member tables.
                 union_parts.push(format!(
-                    "SELECT circle_id FROM circles WHERE circle_id = {}",
-                    search_exact
+                    "SELECT circle_id FROM circles WHERE name ILIKE '{}'",
+                    search_pattern
                 ));
 
-                // 5. Search by Leader ID
                 union_parts.push(format!(
-                    "SELECT circle_id FROM circles WHERE leader_viewer_id = {}",
-                    search_exact
+                    "SELECT c.circle_id FROM circles c JOIN trainer t ON c.leader_viewer_id::text = t.account_id WHERE t.name ILIKE '{}'",
+                    search_pattern
                 ));
 
-                // 6. Search by Member ID
                 union_parts.push(format!(
-                r#"
-                SELECT circle_id 
-                FROM circle_member_fans_monthly 
-                WHERE viewer_id = {} 
-                  AND year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int 
-                  AND month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
-                "#,
-                search_exact
-            ));
+                    r#"
+                    SELECT cm.circle_id
+                    FROM trainer tm
+                    JOIN circle_member_fans_monthly cm
+                      ON cm.viewer_id::text = tm.account_id
+                     AND cm.year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+                     AND cm.month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+                    WHERE tm.name ILIKE '{}'
+                    "#,
+                    search_pattern
+                ));
+            }
+
+            if let Some(query_id) = query_id {
+                union_parts.push(format!(
+                    "SELECT circle_id FROM circles WHERE circle_id = {query_id}"
+                ));
+                union_parts.push(format!(
+                    "SELECT circle_id FROM circles WHERE leader_viewer_id = {query_id}"
+                ));
+                union_parts.push(format!(
+                    r#"
+                    SELECT circle_id
+                    FROM circle_member_fans_monthly
+                    WHERE viewer_id = {query_id}
+                      AND year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+                      AND month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
+                    "#
+                ));
             }
 
             with_parts.push(format!(
@@ -667,7 +692,7 @@ pub async fn list_circles(
 
             join_matching_circles =
                 "INNER JOIN MatchingCircles mc ON c.circle_id = mc.circle_id".to_string();
-        } // end of query_trimmed.len() >= 2 check
+        }
     }
 
     let with_clause = if with_parts.is_empty() {
@@ -692,9 +717,8 @@ pub async fn list_circles(
     let last_live_update_column = display_last_live_update_sql("c");
     // Build dynamic query
     let mut count_query = format!(
-        "{} SELECT COUNT(*) FROM circles c LEFT JOIN trainer t ON c.leader_viewer_id::text = t.account_id LEFT JOIN circle_live_ranks lr ON lr.circle_id = c.circle_id {} WHERE 1=1",
-        with_clause,
-        join_matching_circles
+        "{} SELECT COUNT(*) FROM circles c {} WHERE 1=1",
+        with_clause, join_matching_circles
     );
 
     let mut select_query = format!(

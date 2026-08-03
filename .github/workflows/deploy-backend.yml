@@ -215,7 +215,11 @@ jobs:
           SEARCH_SERVICE_URL: http://umamoe-search-beta:${{ env.SEARCH_INTERNAL_PORT }}
           ENV_FILE: ${{ env.BETA_ENV_FILE }}
           ROUTER_IMAGE: ${{ env.ROUTER_IMAGE }}
-          USER_WRITES_DISABLED: 'true'
+          USER_WRITES_DISABLED: 'false'
+          DISABLE_DB_BACKGROUND_JOBS: 'true'
+          DATABASE_MAX_CONNECTIONS: '2'
+          DATABASE_MIN_CONNECTIONS: '1'
+          DATABASE_ACQUIRE_TIMEOUT_SECONDS: '5'
         run: |
           set -euo pipefail
 
@@ -227,7 +231,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" "$ROUTER_IMAGE" "$USER_WRITES_DISABLED" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" "$ROUTER_IMAGE" "$USER_WRITES_DISABLED" "$DISABLE_DB_BACKGROUND_JOBS" "$DATABASE_MAX_CONNECTIONS" "$DATABASE_MIN_CONNECTIONS" "$DATABASE_ACQUIRE_TIMEOUT_SECONDS" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -242,6 +246,10 @@ jobs:
           search_service_url="${10}"
           router_image="${11}"
           user_writes_disabled="${12}"
+          disable_db_background_jobs="${13}"
+          database_max_connections="${14}"
+          database_min_connections="${15}"
+          database_acquire_timeout_seconds="${16}"
           router_name="${container_name}-router"
           router_config="$(dirname "$compose_file")/${container_name}.nginx.conf"
 
@@ -307,11 +315,13 @@ jobs:
             -e REDIS_URL=redis://redis:6379/0
             -e REDIS_KEY_PREFIX=umamoe
             -e DEBUG_MODE=false
+            -e USER_WRITES_DISABLED="$user_writes_disabled"
+            -e BETA_READ_ONLY=false
+            -e DISABLE_DB_BACKGROUND_JOBS="$disable_db_background_jobs"
+            -e DATABASE_MAX_CONNECTIONS="$database_max_connections"
+            -e DATABASE_MIN_CONNECTIONS="$database_min_connections"
+            -e DATABASE_ACQUIRE_TIMEOUT_SECONDS="$database_acquire_timeout_seconds"
           )
-
-          if [ "$user_writes_disabled" = "true" ]; then
-            docker_args+=(-e USER_WRITES_DISABLED=true)
-          fi
 
           docker run "${docker_args[@]}" "$image_tag"
 
@@ -533,6 +543,10 @@ jobs:
           ENV_FILE: ${{ env.PROD_ENV_FILE }}
           ROUTER_IMAGE: ${{ env.ROUTER_IMAGE }}
           USER_WRITES_DISABLED: 'false'
+          DISABLE_DB_BACKGROUND_JOBS: 'false'
+          DATABASE_MAX_CONNECTIONS: '15'
+          DATABASE_MIN_CONNECTIONS: '1'
+          DATABASE_ACQUIRE_TIMEOUT_SECONDS: '5'
         run: |
           set -euo pipefail
 
@@ -544,7 +558,7 @@ jobs:
           rsync -az -e "ssh -o LogLevel=ERROR -p $DEPLOY_PORT" "deploy/backend.compose.yml" "$DEPLOY_USER@$DEPLOY_HOST:$REMOTE_COMPOSE_FILE"
 
           ssh -o LogLevel=ERROR -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" 'bash -s' -- \
-            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" "$ROUTER_IMAGE" "$USER_WRITES_DISABLED" <<'REMOTE_SCRIPT'
+            "$remote_archive" "$IMAGE_TAG" "$CONTAINER_NAME" "$APP_PORT" "$INTERNAL_APP_PORT" "$HOST_PORT" "$ENV_FILE" "$REMOTE_COMPOSE_FILE" "$APP_NETWORK_NAME" "$SEARCH_SERVICE_URL" "$ROUTER_IMAGE" "$USER_WRITES_DISABLED" "$DISABLE_DB_BACKGROUND_JOBS" "$DATABASE_MAX_CONNECTIONS" "$DATABASE_MIN_CONNECTIONS" "$DATABASE_ACQUIRE_TIMEOUT_SECONDS" <<'REMOTE_SCRIPT'
           set -euo pipefail
 
           archive="$1"
@@ -559,6 +573,10 @@ jobs:
           search_service_url="${10}"
           router_image="${11}"
           user_writes_disabled="${12}"
+          disable_db_background_jobs="${13}"
+          database_max_connections="${14}"
+          database_min_connections="${15}"
+          database_acquire_timeout_seconds="${16}"
           router_name="${container_name}-router"
           router_config="$(dirname "$compose_file")/${container_name}.nginx.conf"
 
@@ -624,11 +642,13 @@ jobs:
             -e REDIS_URL=redis://redis:6379/0
             -e REDIS_KEY_PREFIX=umamoe
             -e DEBUG_MODE=false
+            -e USER_WRITES_DISABLED="$user_writes_disabled"
+            -e BETA_READ_ONLY=false
+            -e DISABLE_DB_BACKGROUND_JOBS="$disable_db_background_jobs"
+            -e DATABASE_MAX_CONNECTIONS="$database_max_connections"
+            -e DATABASE_MIN_CONNECTIONS="$database_min_connections"
+            -e DATABASE_ACQUIRE_TIMEOUT_SECONDS="$database_acquire_timeout_seconds"
           )
-
-          if [ "$user_writes_disabled" = "true" ]; then
-            docker_args+=(-e USER_WRITES_DISABLED=true)
-          fi
 
           docker run "${docker_args[@]}" "$image_tag"
 

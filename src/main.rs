@@ -17,6 +17,7 @@ mod cache;
 mod cheat_analysis;
 mod club_rank;
 mod database;
+mod database_maintenance;
 mod errors;
 mod handlers;
 mod middleware;
@@ -372,6 +373,9 @@ async fn main() -> anyhow::Result<()> {
 
         // Start background task to clear stale live_points/live_rank every hour
         tokio::spawn(clear_stale_live_task(pool.clone()));
+
+        // Keep high-volume operational history and processed fan snapshots bounded.
+        tokio::spawn(database_maintenance::run_retention_task(pool.clone()));
     }
 
     // Start background task to clean up expired cache entries every 10 minutes

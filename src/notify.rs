@@ -9,10 +9,11 @@
 //! where `status` is `completed` or `failed`.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::{PgListener, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
@@ -88,9 +89,11 @@ pub fn spawn_listener(database_url: String, notifier: TaskNotifier) {
 async fn run_listener(database_url: &str, notifier: &TaskNotifier) -> sqlx::Result<()> {
     // Use a small dedicated pool — PgListener takes ownership of one connection
     // and never returns it.
+    let connect_options =
+        PgConnectOptions::from_str(database_url)?.application_name("honsemoe-backend-listener");
     let pool: PgPool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(database_url)
+        .connect_with(connect_options)
         .await?;
 
     let mut listener = PgListener::connect_with(&pool).await?;

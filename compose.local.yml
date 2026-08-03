@@ -23,6 +23,8 @@ services:
     environment:
       ALLOWED_ORIGINS: ${LOCAL_ALLOWED_ORIGINS:-http://localhost:4200,http://127.0.0.1:4200,http://localhost:3001,http://127.0.0.1:3001,http://localhost:3002,http://127.0.0.1:3002,http://localhost:3004,http://127.0.0.1:3004,http://localhost:3008,http://127.0.0.1:3008}
       API_PROTECTION_BYPASS: ${LOCAL_API_PROTECTION_BYPASS:-true}
+      DEBUG_MODE: ${DEBUG_MODE:-true}
+      JP_MASTER_PATH: /data/jp-master.mdb
       REDIS_URL: redis://redis:6379/0
       REDIS_KEY_PREFIX: ${REDIS_KEY_PREFIX:-umamoe}
       RESOURCES_INTERNAL_HOST: 0.0.0.0
@@ -34,6 +36,7 @@ services:
       - "127.0.0.1:${LOCAL_RESOURCES_PORT:-3004}:3000"
     volumes:
       - ../umamoe-resources/master.mdb:/data/master.mdb:ro
+      - ../umamoe-resources/jp-master.mdb:/data/jp-master.mdb:ro
       - ../umamoe-resources/generated-data:/data/generated-data
     depends_on:
       redis:
