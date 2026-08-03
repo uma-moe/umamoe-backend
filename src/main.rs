@@ -43,6 +43,7 @@ pub struct AppState {
 }
 
 pub(crate) const HEAVY_DATABASE_MAINTENANCE_LOCK: &str = "database_heavy_maintenance";
+const RANKING_ARCHIVE_LOCK: &str = "database_ranking_archive";
 
 async fn log_database_write_state(pool: &PgPool, require_writable: bool) -> anyhow::Result<()> {
     let (in_recovery, transaction_read_only, current_user, current_database) =
@@ -1173,85 +1174,143 @@ async fn refresh_user_rankings_task(pool: PgPool) {
     loop {
         gains_tick += 1;
 
-        // Step 1: Archive any completed months not yet in the archive table
-        match sqlx::query(
-            "SELECT DISTINCT cm.year, cm.month \
-             FROM circle_member_fans_monthly cm \
-             WHERE make_date(cm.year, cm.month, 1) < date_trunc('month', \
-                   (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date \
-                   - interval '1 month') \
-             AND NOT EXISTS ( \
-                 SELECT 1 FROM user_fan_rankings_monthly_archive a \
-                 WHERE a.year = cm.year AND a.month = cm.month \
-                 LIMIT 1 \
-             )",
-        )
-        .fetch_all(&pool)
-        .await
+        // Every backend checks archive status hourly. Serialize this work across
+        // replicas so the same expensive scan cannot run concurrently.
+        if let Some(mut archive_lock) =
+            acquire_maintenance_connection(&pool, RANKING_ARCHIVE_LOCK).await
         {
-            Ok(rows) => {
-                for row in &rows {
-                    let year: i32 = row.get("year");
-                    let month: i32 = row.get("month");
-                    info!("📦 Archiving fan rankings for {}-{:02}", year, month);
-                    match sqlx::query("SELECT archive_fan_rankings_month($1, $2)")
-                        .bind(year)
-                        .bind(month)
-                        .fetch_optional(&pool)
-                        .await
-                    {
-                        Ok(_) => info!("✅ Archived fan rankings for {}-{:02}", year, month),
-                        Err(e) => warn!("⚠️ Failed to archive {}-{:02}: {}", year, month, e),
-                    }
-                }
-            }
-            Err(e) => warn!("⚠️ Failed to check archive status: {}", e),
-        }
-
-        // Step 1b: Archive circle ranks for completed months
-        match sqlx::query(
-            "SELECT DISTINCT cmf.year, cmf.month \
-             FROM circle_member_fans_monthly cmf \
-             WHERE make_date(cmf.year, cmf.month, 1) < date_trunc('month', \
-                   (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date - interval '1 day') \
-             AND ( \
-                 NOT EXISTS ( \
-                     SELECT 1 FROM circle_ranks_monthly_archive a \
-                     WHERE a.year = cmf.year AND a.month = cmf.month \
+            // Step 1: Archive any completed months not yet in the archive table.
+            // Generate the small calendar range and probe each month through the
+            // (year, month) index instead of DISTINCT-scanning the full history.
+            match sqlx::query(
+                "WITH cutoff AS ( \
+                     SELECT date_trunc('month', \
+                                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date \
+                                - interval '1 month')::date AS month_start \
+                 ), source_start AS ( \
+                     SELECT make_date(year, month, 1) AS month_start \
+                     FROM circle_member_fans_monthly \
+                     ORDER BY year, month \
                      LIMIT 1 \
+                 ), candidate_months AS ( \
+                     SELECT extract(year FROM months.month_start)::int AS year, \
+                            extract(month FROM months.month_start)::int AS month \
+                     FROM source_start \
+                     CROSS JOIN cutoff \
+                     CROSS JOIN LATERAL generate_series( \
+                         source_start.month_start, \
+                         cutoff.month_start - interval '1 month', \
+                         interval '1 month' \
+                     ) AS months(month_start) \
                  ) \
-                 OR ( \
-                     make_date(cmf.year, cmf.month, 1) = date_trunc('month', \
-                         (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date - interval '1 day')::date \
-                         - interval '1 month' \
-                     AND extract(day from \
-                         (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date) <= 3 \
+                 SELECT candidate_months.year, candidate_months.month \
+                 FROM candidate_months \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM user_fan_rankings_monthly_archive a \
+                     WHERE a.year = candidate_months.year \
+                       AND a.month = candidate_months.month \
                  ) \
-             )",
-        )
-        .fetch_all(&pool)
-        .await
-        {
-            Ok(rows) => {
-                for row in &rows {
-                    let year: i32 = row.get("year");
-                    let month: i32 = row.get("month");
-                    info!("📦 Archiving circle ranks for {}-{:02}", year, month);
-                    match sqlx::query("SELECT archive_circle_rankings_month($1, $2)")
-                        .bind(year)
-                        .bind(month)
-                        .fetch_optional(&pool)
-                        .await
-                    {
-                        Ok(_) => info!("✅ Archived circle ranks for {}-{:02}", year, month),
-                        Err(e) => warn!(
-                            "⚠️ Failed to archive circle ranks {}-{:02}: {}",
-                            year, month, e
-                        ),
+                   AND EXISTS ( \
+                       SELECT 1 FROM circle_member_fans_monthly cm \
+                       WHERE cm.year = candidate_months.year \
+                         AND cm.month = candidate_months.month \
+                   ) \
+                 ORDER BY candidate_months.year, candidate_months.month",
+            )
+            .fetch_all(&mut *archive_lock)
+            .await
+            {
+                Ok(rows) => {
+                    for row in &rows {
+                        let year: i32 = row.get("year");
+                        let month: i32 = row.get("month");
+                        info!("📦 Archiving fan rankings for {}-{:02}", year, month);
+                        match sqlx::query("SELECT archive_fan_rankings_month($1, $2)")
+                            .bind(year)
+                            .bind(month)
+                            .fetch_optional(&pool)
+                            .await
+                        {
+                            Ok(_) => info!("✅ Archived fan rankings for {}-{:02}", year, month),
+                            Err(e) => warn!("⚠️ Failed to archive {}-{:02}: {}", year, month, e),
+                        }
                     }
                 }
+                Err(e) => warn!("⚠️ Failed to check archive status: {}", e),
             }
-            Err(e) => warn!("⚠️ Failed to check circle rank archive status: {}", e),
+
+            // Step 1b: Archive circle ranks for completed months. This uses the same
+            // bounded calendar/index-probe strategy as the fan archive check.
+            match sqlx::query(
+                "WITH cutoff AS ( \
+                     SELECT date_trunc('month', \
+                                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date \
+                                - interval '1 day')::date AS month_start, \
+                            (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::date AS today \
+                 ), source_start AS ( \
+                     SELECT make_date(year, month, 1) AS month_start \
+                     FROM circle_member_fans_monthly \
+                     ORDER BY year, month \
+                     LIMIT 1 \
+                 ), candidate_months AS ( \
+                     SELECT extract(year FROM months.month_start)::int AS year, \
+                            extract(month FROM months.month_start)::int AS month \
+                     FROM source_start \
+                     CROSS JOIN cutoff \
+                     CROSS JOIN LATERAL generate_series( \
+                         source_start.month_start, \
+                         cutoff.month_start - interval '1 month', \
+                         interval '1 month' \
+                     ) AS months(month_start) \
+                 ) \
+                 SELECT candidate_months.year, candidate_months.month \
+                 FROM candidate_months \
+                 CROSS JOIN cutoff \
+                 WHERE ( \
+                     NOT EXISTS ( \
+                         SELECT 1 FROM circle_ranks_monthly_archive a \
+                         WHERE a.year = candidate_months.year \
+                           AND a.month = candidate_months.month \
+                     ) \
+                     OR ( \
+                         candidate_months.year = extract(year FROM cutoff.month_start - interval '1 month')::int \
+                         AND candidate_months.month = extract(month FROM cutoff.month_start - interval '1 month')::int \
+                         AND extract(day FROM cutoff.today) <= 3 \
+                     ) \
+                 ) \
+                   AND EXISTS ( \
+                       SELECT 1 FROM circle_member_fans_monthly cmf \
+                       WHERE cmf.year = candidate_months.year \
+                         AND cmf.month = candidate_months.month \
+                   ) \
+                 ORDER BY candidate_months.year, candidate_months.month",
+            )
+            .fetch_all(&mut *archive_lock)
+            .await
+            {
+                Ok(rows) => {
+                    for row in &rows {
+                        let year: i32 = row.get("year");
+                        let month: i32 = row.get("month");
+                        info!("📦 Archiving circle ranks for {}-{:02}", year, month);
+                        match sqlx::query("SELECT archive_circle_rankings_month($1, $2)")
+                            .bind(year)
+                            .bind(month)
+                            .fetch_optional(&pool)
+                            .await
+                        {
+                            Ok(_) => info!("✅ Archived circle ranks for {}-{:02}", year, month),
+                            Err(e) => warn!(
+                                "⚠️ Failed to archive circle ranks {}-{:02}: {}",
+                                year, month, e
+                            ),
+                        }
+                    }
+                }
+                Err(e) => warn!("⚠️ Failed to check circle rank archive status: {}", e),
+            }
+
+            release_maintenance_lock(&mut archive_lock, RANKING_ARCHIVE_LOCK).await;
         }
 
         // Step 2: Refresh current-month rankings.
