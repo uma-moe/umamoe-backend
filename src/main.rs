@@ -26,8 +26,8 @@ mod notify;
 mod redis_store;
 
 use handlers::{
-    affinity, auth as auth_handlers, borrow, circles, docs, partner, profile, rankings, search,
-    shame, sharing, stats, tasks, version,
+    affinity, auth as auth_handlers, borrow, carat_planner, circles, docs, partner, profile,
+    rankings, search, shame, sharing, stats, tasks, version,
 };
 use notify::TaskNotifier;
 
@@ -598,6 +598,7 @@ fn public_read_api_routes() -> Router<AppState> {
         .nest("/api/v4/rankings", rankings::router())
         .nest("/api/v4/user/profile", profile::router())
         .nest("/api/v4/shame", shame::router())
+        .nest("/api/carat-planner", carat_planner::public_router())
 }
 
 fn open_api_routes() -> Router<AppState> {
@@ -617,6 +618,7 @@ fn protected_api_routes() -> Router<AppState> {
         .nest("/api/v4/affinity", affinity::router())
         .nest("/api/auth", auth_handlers::public_router())
         .nest("/api/auth", auth_handlers::authenticated_router())
+        .nest("/api/carat-planner", carat_planner::authenticated_router())
         .nest("/", sharing::router())
 }
 
