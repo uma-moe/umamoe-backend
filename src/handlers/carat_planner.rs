@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
@@ -296,15 +296,16 @@ fn validate_json_size(value: &Value, max_bytes: usize, label: &str) -> Result<()
 }
 
 fn random_share_id() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(10)
-        .map(char::from)
-        .collect()
+    let mut bytes = [0_u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 fn valid_share_id(value: &str) -> bool {
-    (8..=12).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    let legacy_id =
+        (8..=12).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    let hex_id = value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    legacy_id || hex_id
 }
 
 #[cfg(test)]
@@ -325,8 +326,10 @@ mod tests {
     #[test]
     fn share_ids_are_short_and_url_safe() {
         let share_id = random_share_id();
-        assert_eq!(share_id.len(), 10);
+        assert_eq!(share_id.len(), 16);
+        assert!(share_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(valid_share_id(&share_id));
+        assert!(valid_share_id("A1b2C3d4E5"));
         assert!(!valid_share_id("../../secret"));
     }
 }
