@@ -12,7 +12,7 @@ use axum::{
     Json, Router,
 };
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
 impl Simulator {
@@ -128,13 +128,15 @@ impl Simulator {
         Ok(granted)
     }
 
-    async fn forward(&self, path: &str, contentType: Option<HeaderValue>, body: Bytes) -> Response {
+    async fn forward(&self, path: &str, headers: &HeaderMap, body: Bytes) -> Response {
         let mut url = self.baseUrl.clone();
         url.set_path(path);
-        // Only forward the content type; user credentials stay in the backend.
+        // Only forward representation headers; user credentials stay in the backend.
         let mut request = self.client.post(url).body(body);
-        if let Some(contentType) = contentType {
-            request = request.header(header::CONTENT_TYPE, contentType);
+        for name in [header::CONTENT_TYPE, header::ACCEPT] {
+            for value in headers.get_all(&name) {
+                request = request.header(&name, value);
+            }
         }
 
         let response = match request.send().await {
@@ -161,6 +163,7 @@ impl Simulator {
             header::CONTENT_TYPE,
             header::CONTENT_ENCODING,
             header::RETRY_AFTER,
+            header::HeaderName::from_static("server-timing"),
         ] {
             if let Some(value) = response.headers().get(&name) {
                 headers.insert(name, value.clone());
@@ -168,6 +171,22 @@ impl Simulator {
         }
 
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            })
+        {
+            // Set this here: the internal NGINX hop consumes upstream X-Accel headers.
+            headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+            headers.insert(header::VARY, HeaderValue::from_static("Accept"));
+        }
         let stream = futures::stream::try_unfold(response, |mut response| async {
             Ok::<_, reqwest::Error>(response.chunk().await?.map(|chunk| (chunk, response)))
         });
@@ -189,6 +208,7 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn proxy(State(state): State<AppState>, request: Request) -> Response {
+    let started = Instant::now();
     let Some(simulator) = state.simulator.as_ref() else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -210,22 +230,38 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             );
         }
     };
+    let authMs = started.elapsed().as_secs_f64() * 1000.0;
     let path = request.uri().path().to_owned();
-    let contentType = request.headers().get(header::CONTENT_TYPE).cloned();
+    let requestHeaders = request.headers().clone();
     let body = match Bytes::from_request(request, &state).await {
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
-    if !state.user_writes_disabled {
-        let endpoint = api_key::normalize_endpoint("POST", &path);
-        if let Err(err) = api_key::record_api_key_usage(&state.db, &key, &endpoint).await {
-            tracing::warn!("Simulator usage recording failed: {err}");
+    // Record once alongside the upstream request, keeping both operations awaited.
+    let usage = async {
+        let started = Instant::now();
+        if !state.user_writes_disabled {
+            let endpoint = api_key::normalize_endpoint("POST", &path);
+            if let Err(err) = api_key::record_api_key_usage(&state.db, &key, &endpoint).await {
+                tracing::warn!("Simulator usage recording failed: {err}");
+            }
         }
-    }
 
-    simulator
-        .forward(path.strip_prefix("/api").unwrap(), contentType, body)
-        .await
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+    let forward = async {
+        let started = Instant::now();
+        let response = simulator
+            .forward(path.strip_prefix("/api").unwrap(), &requestHeaders, body)
+            .await;
+        (response, started.elapsed().as_secs_f64() * 1000.0)
+    };
+    let ((mut response, upstreamMs), usageMs) = tokio::join!(forward, usage);
+    let backendMs = started.elapsed().as_secs_f64() * 1000.0;
+    response.headers_mut().append("server-timing", format!(
+        "auth;dur={authMs:.2}, usage;dur={usageMs:.2}, upstream;dur={upstreamMs:.2}, backend;dur={backendMs:.2}"
+    ).parse().expect("numeric timing header"));
+    response
 }
 
 fn simulatorUrl<'a>(configured: &'a str, environment: &str) -> &'a str {
@@ -372,6 +408,10 @@ mod tests {
                         [
                             (header::CONTENT_TYPE, "application/octet-stream"),
                             (header::RETRY_AFTER, "7"),
+                            (
+                                header::HeaderName::from_static("server-timing"),
+                                "queue;dur=12.00, compute;dur=34.00",
+                            ),
                             (header::SET_COOKIE, "must-not-forward=true"),
                         ],
                         body,
@@ -398,12 +438,19 @@ mod tests {
         let response = simulator
             .forward(
                 "/sim/stamina",
-                Some(HeaderValue::from_static("application/json")),
+                &HeaderMap::from_iter([(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                )]),
                 body.clone(),
             )
             .await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[header::RETRY_AFTER], "7");
+        assert_eq!(
+            response.headers()["server-timing"],
+            "queue;dur=12.00, compute;dur=34.00"
+        );
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert!(!response.headers().contains_key(header::SET_COOKIE));
         assert_eq!(
@@ -414,11 +461,111 @@ mod tests {
         );
         assert_eq!(
             simulator
-                .forward("/sim/optimize", None, Bytes::new())
+                .forward("/sim/optimize", &HeaderMap::new(), Bytes::new())
                 .await
                 .status(),
             StatusCode::BAD_GATEWAY
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn forwardingStreamsEventsBeforeCompletionWithoutForwardingCredentials() {
+        use futures::StreamExt;
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let gate = finish.clone();
+        let app = Router::new().route(
+            "/sim/monte-carlo",
+            post(move |headers: HeaderMap| {
+                let gate = gate.clone();
+                async move {
+                    assert!(headers
+                        .get_all(header::ACCEPT)
+                        .iter()
+                        .any(|value| value == "text/event-stream"));
+                    for name in ["x-api-key", "authorization", "cookie", "x-simulator-key"] {
+                        assert!(!headers.contains_key(name));
+                    }
+                    let events = futures::stream::once(async {
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                            b"event: queued\ndata: {\"waited_ms\":0}\n\n",
+                        ))
+                    })
+                    .chain(futures::stream::once(async move {
+                        gate.notified().await;
+                        Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                            b"event: result\ndata: {\"runs\":100}\n\n",
+                        ))
+                    }));
+                    // No X-Accel header upstream: internal NGINX consumes it in production.
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(events),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let simulator = Simulator::new(&format!("http://{address}"), "unused-keys.txt").unwrap();
+        let mut headers = HeaderMap::from_iter([
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (header::ACCEPT, HeaderValue::from_static("application/json")),
+            (
+                header::COOKIE,
+                HeaderValue::from_static("must-not-forward=true"),
+            ),
+            (
+                header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer must-not-forward"),
+            ),
+        ]);
+        headers.append(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("x-api-key", HeaderValue::from_static(API_KEY));
+        headers.insert(
+            "x-simulator-key",
+            HeaderValue::from_static("must-not-forward"),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            simulator.forward("/sim/monte-carlo", &headers, Bytes::from_static(b"{}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, "event: queued\ndata: {\"waited_ms\":0}\n\n");
+        assert!(tokio::time::timeout(Duration::from_millis(20), body.next())
+            .await
+            .is_err());
+        finish.notify_one();
+        let last = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(last, "event: result\ndata: {\"runs\":100}\n\n");
+        assert!(body.next().await.is_none());
         task.abort();
     }
 
