@@ -186,3 +186,36 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## 🐎 About Uma.moe
 
 Uma.moe is a community resource for Uma Musume Pretty Derby players, providing tools and data to help optimize character training and inheritance planning.
+## Private simulator forwarding
+
+The existing `/api/` proxy serves `POST /api/sim/replay`, `/api/sim/monte-carlo`,
+`/api/sim/optimize` and `/api/sim/races/resimulate`. These routes require exactly
+one granted `X-API-Key`; browser proofs, bearer tokens and cookies do not grant
+simulator access. The backend checks revocation and records usage once, then
+forwards to the private simulator. Read-only backends keep skipping usage writes.
+
+Set `SIMULATOR_URL=http://192.168.100.1:3009` in production and port `3109` in
+beta. Set a different random `SIMULATOR_BACKEND_KEY` per environment, matching
+that simulator's `UMAMOE_V3_BACKEND_KEY`. Generate a key with `openssl rand -hex 32`.
+Put whitespace-separated granted user keys in `SIMULATOR_ALLOWED_KEYS`; when
+empty, all user requests are denied. Restart the backend to update the grants.
+Leaving all three settings unset disables forwarding with HTTP 503; partial
+invalid configuration fails startup. See `deploy/backend.env.example`.
+
+The backend sends only its service credential and the request content type.
+Caller-supplied internal credentials are replaced, cookies and user credentials
+are dropped, and redirects are rejected. Bodies are passed through unchanged;
+responses are streamed with `Cache-Control: no-store`. Simulator overload (429)
+and other application statuses are preserved. Connection failures return 502;
+timeouts before response headers return 504. Mid-response failures abort the stream.
+Requests are limited to 256 KiB, or 8 MiB for capture resimulation. The upstream
+timeout is 120 seconds; existing Nginx body and timeout limits must accommodate
+the requests you serve. No additional Nginx route or Cloudflare configuration
+is needed, and the backend internal authentication listener stays unpublished.
+
+Run `cargo test handlers::simulator::tests` for the local forwarding checks.
+The ignored PostgreSQL integration check additionally verifies revocation,
+request-size limits and single usage recording. It requires a disposable empty
+database named `simulator_forwarding_test` on `127.0.0.1`, supplied as
+`SIMULATOR_TEST_DATABASE_URL`, and runs with
+`cargo test authenticatedForwardingRecordsUsageOnce -- --ignored`.

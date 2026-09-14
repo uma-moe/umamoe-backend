@@ -40,6 +40,7 @@ pub struct AppState {
     pub task_notifier: TaskNotifier,
     pub redis_store: Option<redis_store::RedisStore>,
     pub user_writes_disabled: bool,
+    pub simulator: Option<std::sync::Arc<handlers::simulator::Simulator>>,
 }
 
 pub(crate) const HEAVY_DATABASE_MAINTENANCE_LOCK: &str = "database_heavy_maintenance";
@@ -117,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load environment variables
     dotenvy::dotenv().ok();
+    let simulator = handlers::simulator::Simulator::fromEnv()?.map(std::sync::Arc::new);
 
     // Database connection
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -351,6 +353,7 @@ async fn main() -> anyhow::Result<()> {
         task_notifier,
         redis_store,
         user_writes_disabled,
+        simulator,
     };
 
     let db_background_jobs_disabled = skip_migrations
@@ -558,6 +561,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(state.clone());
 
+    // Simulator routes enforce API-key grants and record usage themselves, exactly once.
+    let simulator_routes = handlers::simulator::routes()
+        .layer(cors.clone())
+        .with_state(state.clone());
+
     let version_routes = version_api_routes()
         .layer(
             ServiceBuilder::new()
@@ -568,6 +576,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Merge public and protected routes
     let app = version_routes
+        .merge(simulator_routes)
         .merge(open_routes)
         .merge(public_routes)
         .merge(protected_routes);

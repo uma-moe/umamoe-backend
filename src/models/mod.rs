@@ -8,6 +8,7 @@ pub mod profile;
 mod rankings;
 mod search;
 mod sharing;
+pub mod simulator;
 mod stats;
 mod support_cards;
 mod tasks;
