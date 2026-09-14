@@ -194,12 +194,15 @@ one granted `X-API-Key`; browser proofs, bearer tokens and cookies do not grant
 simulator access. The backend checks revocation and records usage once, then
 forwards to the private simulator. Read-only backends keep skipping usage writes.
 
-Set `SIMULATOR_URL=http://192.168.100.1:3009` in production and port `3109` in
-beta. Set a different random `SIMULATOR_BACKEND_KEY` per environment, matching
+`SIMULATOR_URL` is optional: unset or empty uses `http://192.168.100.1:3009`
+in production and `http://192.168.100.1:3109` when `APP_ENV=beta`. The deployment
+workflow sets `APP_ENV` automatically; outside it, the default is production.
+An explicit `SIMULATOR_URL` takes precedence. Set a different random
+`SIMULATOR_BACKEND_KEY` per environment, matching
 that simulator's `UMAMOE_V3_BACKEND_KEY`. Generate a key with `openssl rand -hex 32`.
 Put whitespace-separated granted user keys in `SIMULATOR_ALLOWED_KEYS`; when
 empty, all user requests are denied. Restart the backend to update the grants.
-Leaving all three settings unset disables forwarding with HTTP 503; partial
+Leaving the URL, service key and grants unset disables forwarding with HTTP 503; partial
 invalid configuration fails startup. See `deploy/backend.env.example`.
 
 The backend sends only its service credential and the request content type.

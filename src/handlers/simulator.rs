@@ -24,7 +24,12 @@ impl Simulator {
             return Ok(None);
         }
 
-        Ok(Some(Self::new(&url, &key, &grants)?))
+        let environment = std::env::var("APP_ENV").unwrap_or_default();
+        Ok(Some(Self::new(
+            simulatorUrl(&url, &environment),
+            &key,
+            &grants,
+        )?))
     }
 
     pub(crate) fn new(url: &str, key: &str, grants: &str) -> anyhow::Result<Self> {
@@ -207,6 +212,14 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         .await
 }
 
+fn simulatorUrl<'a>(configured: &'a str, environment: &str) -> &'a str {
+    match (configured, environment) {
+        ("", "beta") => "http://192.168.100.1:3109",
+        ("", _) => "http://192.168.100.1:3009",
+        _ => configured,
+    }
+}
+
 fn validApiKey(key: &str) -> bool {
     (16..=512).contains(&key.len()) && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
@@ -231,6 +244,21 @@ mod tests {
 
     const BACKEND_KEY: &str = "test-backend-key-123456789012345678901234567890";
     const API_KEY: &str = "test-user-api-key-1234567890";
+
+    #[test]
+    fn urlDefaultsFollowDeploymentAndAllowOverrides() {
+        for (configured, environment, expected) in [
+            ("", "production", "http://192.168.100.1:3009/"),
+            ("", "beta", "http://192.168.100.1:3109/"),
+            ("", "", "http://192.168.100.1:3009/"),
+            ("http://127.0.0.1:9000", "beta", "http://127.0.0.1:9000/"),
+        ] {
+            let simulator =
+                Simulator::new(simulatorUrl(configured, environment), BACKEND_KEY, API_KEY)
+                    .unwrap();
+            assert_eq!(simulator.baseUrl.as_str(), expected);
+        }
+    }
 
     #[test]
     fn grantsAndConfigurationFailClosed() {

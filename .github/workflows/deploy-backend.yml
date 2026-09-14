@@ -320,6 +320,7 @@ jobs:
             -e PORT="$app_port"
             -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0
             -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port"
+            -e APP_ENV=beta
             -e SEARCH_SERVICE_URL="$search_service_url"
             -e REDIS_URL=redis://redis:6379/0
             -e REDIS_KEY_PREFIX=umamoe
@@ -665,6 +666,7 @@ jobs:
             -e PORT="$app_port"
             -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0
             -e BROWSER_PROOF_INTERNAL_PORT="$internal_app_port"
+            -e APP_ENV=production
             -e SEARCH_SERVICE_URL="$search_service_url"
             -e REDIS_URL=redis://redis:6379/0
             -e REDIS_KEY_PREFIX=umamoe
