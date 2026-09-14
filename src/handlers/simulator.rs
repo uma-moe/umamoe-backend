@@ -171,18 +171,7 @@ impl Simulator {
         }
 
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        if headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .unwrap_or_default()
-                    .trim()
-                    .eq_ignore_ascii_case("text/event-stream")
-            })
-        {
+        if isEventStream(&headers) {
             // Set this here: the internal NGINX hop consumes upstream X-Accel headers.
             headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
             headers.insert(header::VARY, HeaderValue::from_static("Accept"));
@@ -237,18 +226,20 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
     };
-    // Record once alongside the upstream request, keeping both operations awaited.
-    let usage = async {
+    // Logging runs once and survives client disconnects; it must not hold SSE headers.
+    let db = state.db.clone();
+    let writesDisabled = state.user_writes_disabled;
+    let endpoint = api_key::normalize_endpoint("POST", &path);
+    let usage = tokio::spawn(async move {
         let started = Instant::now();
-        if !state.user_writes_disabled {
-            let endpoint = api_key::normalize_endpoint("POST", &path);
-            if let Err(err) = api_key::record_api_key_usage(&state.db, &key, &endpoint).await {
+        if !writesDisabled {
+            if let Err(err) = api_key::record_api_key_usage(&db, &key, &endpoint).await {
                 tracing::warn!("Simulator usage recording failed: {err}");
             }
         }
 
         started.elapsed().as_secs_f64() * 1000.0
-    };
+    });
     let forward = async {
         let started = Instant::now();
         let response = simulator
@@ -256,12 +247,47 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             .await;
         (response, started.elapsed().as_secs_f64() * 1000.0)
     };
-    let ((mut response, upstreamMs), usageMs) = tokio::join!(forward, usage);
+    finishProxyResponse(forward, usage, started, authMs).await
+}
+
+async fn finishProxyResponse(
+    forward: impl std::future::Future<Output = (Response, f64)>,
+    usage: tokio::task::JoinHandle<f64>,
+    started: Instant,
+    authMs: f64,
+) -> Response {
+    let (mut response, upstreamMs) = forward.await;
+    // Dropping a JoinHandle keeps logging alive without delaying the stream.
+    let usageTiming = if isEventStream(response.headers()) {
+        String::new()
+    } else {
+        match usage.await {
+            Ok(ms) => format!(", usage;dur={ms:.2}"),
+            Err(err) => {
+                tracing::warn!("Simulator usage task failed: {err}");
+                String::new()
+            }
+        }
+    };
     let backendMs = started.elapsed().as_secs_f64() * 1000.0;
     response.headers_mut().append("server-timing", format!(
-        "auth;dur={authMs:.2}, usage;dur={usageMs:.2}, upstream;dur={upstreamMs:.2}, backend;dur={backendMs:.2}"
+        "auth;dur={authMs:.2}, upstream;dur={upstreamMs:.2}, backend;dur={backendMs:.2}{usageTiming}"
     ).parse().expect("numeric timing header"));
     response
+}
+
+fn isEventStream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
 }
 
 fn simulatorUrl<'a>(configured: &'a str, environment: &str) -> &'a str {
@@ -488,7 +514,7 @@ mod tests {
                     }
                     let events = futures::stream::once(async {
                         Ok::<_, std::convert::Infallible>(Bytes::from_static(
-                            b"event: queued\ndata: {\"waited_ms\":0}\n\n",
+                            b"event: running\ndata: {}\n\n",
                         ))
                     })
                     .chain(futures::stream::once(async move {
@@ -535,9 +561,25 @@ mod tests {
             "x-simulator-key",
             HeaderValue::from_static("must-not-forward"),
         );
+        let releaseUsage = Arc::new(tokio::sync::Notify::new());
+        let usageGate = releaseUsage.clone();
+        let (usageDone, recorded) = tokio::sync::oneshot::channel();
+        let usage = tokio::spawn(async move {
+            usageGate.notified().await;
+            usageDone.send(()).unwrap();
+            500.0
+        });
+        let forward = async {
+            (
+                simulator
+                    .forward("/sim/monte-carlo", &headers, Bytes::from_static(b"{}"))
+                    .await,
+                1.0,
+            )
+        };
         let response = tokio::time::timeout(
             Duration::from_secs(2),
-            simulator.forward("/sim/monte-carlo", &headers, Bytes::from_static(b"{}")),
+            finishProxyResponse(forward, usage, Instant::now(), 1.0),
         )
         .await
         .unwrap();
@@ -547,6 +589,10 @@ mod tests {
             "text/event-stream"
         );
         assert_eq!(response.headers()["x-accel-buffering"], "no");
+        assert!(!response.headers()["server-timing"]
+            .to_str()
+            .unwrap()
+            .contains("usage;"));
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         let mut body = response.into_body().into_data_stream();
         let first = tokio::time::timeout(Duration::from_secs(2), body.next())
@@ -554,7 +600,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(first, "event: queued\ndata: {\"waited_ms\":0}\n\n");
+        assert_eq!(first, "event: running\ndata: {}\n\n");
         assert!(tokio::time::timeout(Duration::from_millis(20), body.next())
             .await
             .is_err());
@@ -566,7 +612,26 @@ mod tests {
             .unwrap();
         assert_eq!(last, "event: result\ndata: {\"runs\":100}\n\n");
         assert!(body.next().await.is_none());
+        drop(body);
+        releaseUsage.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), recorded)
+            .await
+            .unwrap()
+            .unwrap();
         task.abort();
+
+        let usage = tokio::spawn(async { 12.5 });
+        let response = finishProxyResponse(
+            async { (Json(serde_json::json!({"runs": 100})).into_response(), 1.0) },
+            usage,
+            Instant::now(),
+            1.0,
+        )
+        .await;
+        assert!(response.headers()["server-timing"]
+            .to_str()
+            .unwrap()
+            .contains("usage;dur=12.50"));
     }
 
     #[tokio::test]
