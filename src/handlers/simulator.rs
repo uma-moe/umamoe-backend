@@ -13,26 +13,29 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 impl Simulator {
-    /// Unconfigured backends keep serving their existing routes; simulator requests fail closed.
-    pub fn fromEnv() -> anyhow::Result<Option<Self>> {
+    /// Use the private deployment defaults; user grants are checked on every request.
+    pub fn fromEnv() -> anyhow::Result<Self> {
         let url = std::env::var("SIMULATOR_URL").unwrap_or_default();
-        let key = std::env::var("SIMULATOR_BACKEND_KEY").unwrap_or_default();
-        let grants = std::env::var("SIMULATOR_ALLOWED_KEYS").unwrap_or_default();
-        if url.is_empty() && key.is_empty() && grants.is_empty() {
-            return Ok(None);
-        }
+        let file = std::env::var("SIMULATOR_ALLOWED_KEYS_FILE").unwrap_or_default();
 
         let environment = std::env::var("APP_ENV").unwrap_or_default();
-        Ok(Some(Self::new(
+        Self::new(
             simulatorUrl(&url, &environment),
-            &key,
-            &grants,
-        )?))
+            if file.is_empty() {
+                "/config/simulator/allowed-keys.txt"
+            } else {
+                &file
+            },
+        )
     }
 
-    pub(crate) fn new(url: &str, key: &str, grants: &str) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        url: &str,
+        allowedKeysFile: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<Self> {
         let baseUrl = reqwest::Url::parse(url)?;
         anyhow::ensure!(
             matches!(baseUrl.scheme(), "http" | "https")
@@ -44,25 +47,12 @@ impl Simulator {
                 && baseUrl.fragment().is_none(),
             "SIMULATOR_URL must be an http(s) origin without credentials, path, query or fragment"
         );
+        let allowedKeysFile = allowedKeysFile.into();
         anyhow::ensure!(
-            (32..=512).contains(&key.len()) && key.bytes().all(|b| b.is_ascii_graphic()),
-            "SIMULATOR_BACKEND_KEY must contain 32..=512 visible ASCII characters"
+            !allowedKeysFile.as_os_str().is_empty(),
+            "allowed-key file path is empty"
         );
-        anyhow::ensure!(
-            grants.len() <= 1024 * 1024,
-            "SIMULATOR_ALLOWED_KEYS exceeds 1 MiB"
-        );
-        let mut allowedKeys = std::collections::HashSet::new();
-        for grant in grants.split_ascii_whitespace() {
-            anyhow::ensure!(
-                validApiKey(grant),
-                "SIMULATOR_ALLOWED_KEYS contains an invalid API key"
-            );
-            allowedKeys.insert(Sha256::digest(grant.as_bytes()).into());
-        }
 
-        let mut backendKey = HeaderValue::from_str(key)?;
-        backendKey.set_sensitive(true);
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -72,12 +62,11 @@ impl Simulator {
         Ok(Self {
             client,
             baseUrl,
-            backendKey,
-            allowedKeys,
+            allowedKeysFile,
         })
     }
 
-    fn allowedKey<'a>(&self, headers: &'a HeaderMap) -> Result<&'a str, Response> {
+    async fn allowedKey<'a>(&self, headers: &'a HeaderMap) -> Result<&'a str, Response> {
         let mut keys = headers.get_all("x-api-key").iter();
         let key = keys
             .next()
@@ -91,10 +80,17 @@ impl Simulator {
         }
 
         let key = key.unwrap();
-        if !self
-            .allowedKeys
-            .contains(&<[u8; 32]>::from(Sha256::digest(key.as_bytes())))
-        {
+        let granted = match self.keyIsGranted(key).await {
+            Ok(granted) => granted,
+            Err(err) => {
+                tracing::warn!("Simulator allowed-key file unavailable: {err}");
+                return Err(error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "simulator access list unavailable",
+                ));
+            }
+        };
+        if !granted {
             return Err(error(
                 StatusCode::FORBIDDEN,
                 "API key is not granted simulator access",
@@ -104,15 +100,39 @@ impl Simulator {
         Ok(key)
     }
 
+    async fn keyIsGranted(&self, key: &str) -> anyhow::Result<bool> {
+        // ponytail: scan at most 1 MiB per request; cache by file version if lists grow.
+        let file = tokio::fs::File::open(&self.allowedKeysFile).await?;
+        let mut contents = String::new();
+        file.take(1024 * 1024 + 1)
+            .read_to_string(&mut contents)
+            .await?;
+        anyhow::ensure!(
+            contents.len() <= 1024 * 1024,
+            "allowed-key file exceeds 1 MiB"
+        );
+        let requested = Sha256::digest(key.as_bytes());
+        let mut granted = false;
+        for grant in contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            anyhow::ensure!(
+                validApiKey(grant),
+                "allowed-key file contains an invalid API key"
+            );
+            granted |= Sha256::digest(grant.as_bytes()) == requested;
+        }
+
+        Ok(granted)
+    }
+
     async fn forward(&self, path: &str, contentType: Option<HeaderValue>, body: Bytes) -> Response {
         let mut url = self.baseUrl.clone();
         url.set_path(path);
-        // Build fresh headers so callers cannot supply backend credentials or forward cookies.
-        let mut request = self
-            .client
-            .post(url)
-            .header("x-simulator-key", self.backendKey.clone())
-            .body(body);
+        // Only forward the content type; user credentials stay in the backend.
+        let mut request = self.client.post(url).body(body);
         if let Some(contentType) = contentType {
             request = request.header(header::CONTENT_TYPE, contentType);
         }
@@ -132,13 +152,8 @@ impl Simulator {
             }
         };
         let status = response.status();
-        if status.is_redirection()
-            || matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        {
-            return error(
-                StatusCode::BAD_GATEWAY,
-                "simulator rejected backend connection",
-            );
+        if status.is_redirection() {
+            return error(StatusCode::BAD_GATEWAY, "simulator returned a redirect");
         }
 
         let mut headers = HeaderMap::new();
@@ -163,6 +178,7 @@ impl Simulator {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/sim/replay", post(proxy))
+        .route("/api/sim/stamina", post(proxy))
         .route("/api/sim/monte-carlo", post(proxy))
         .route("/api/sim/optimize", post(proxy))
         .route(
@@ -179,7 +195,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             "simulator is not configured",
         );
     };
-    let rawKey = match simulator.allowedKey(request.headers()) {
+    let rawKey = match simulator.allowedKey(request.headers()).await {
         Ok(key) => key,
         Err(response) => return response,
     };
@@ -242,7 +258,6 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    const BACKEND_KEY: &str = "test-backend-key-123456789012345678901234567890";
     const API_KEY: &str = "test-user-api-key-1234567890";
 
     #[test]
@@ -254,19 +269,20 @@ mod tests {
             ("http://127.0.0.1:9000", "beta", "http://127.0.0.1:9000/"),
         ] {
             let simulator =
-                Simulator::new(simulatorUrl(configured, environment), BACKEND_KEY, API_KEY)
-                    .unwrap();
+                Simulator::new(simulatorUrl(configured, environment), "unused-keys.txt").unwrap();
             assert_eq!(simulator.baseUrl.as_str(), expected);
         }
     }
 
-    #[test]
-    fn grantsAndConfigurationFailClosed() {
-        let simulator = Simulator::new("http://127.0.0.1:3009", BACKEND_KEY, API_KEY).unwrap();
+    #[tokio::test]
+    async fn grantsReloadWithoutRestartAndFailClosed() {
+        let root = std::env::temp_dir().join(format!("simulator-keys-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&root).await.unwrap();
+        let file = root.join("allowed-keys.txt");
+        let simulator = Simulator::new("http://127.0.0.1:3009", &file).unwrap();
         let mut headers = HeaderMap::new();
-        headers.insert("x-simulator-key", HeaderValue::from_static(BACKEND_KEY));
         assert_eq!(
-            simulator.allowedKey(&headers).unwrap_err().status(),
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
             StatusCode::UNAUTHORIZED
         );
         headers.insert(
@@ -274,14 +290,55 @@ mod tests {
             HeaderValue::from_static("ungranted-user-key-123456"),
         );
         assert_eq!(
-            simulator.allowedKey(&headers).unwrap_err().status(),
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        tokio::fs::write(&file, format!("# simulator access\r\n\r\n{API_KEY}\r\n"))
+            .await
+            .unwrap();
+        assert_eq!(
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
             StatusCode::FORBIDDEN
         );
         headers.insert("x-api-key", HeaderValue::from_static(API_KEY));
-        assert_eq!(simulator.allowedKey(&headers).unwrap(), API_KEY);
+        assert_eq!(simulator.allowedKey(&headers).await.unwrap(), API_KEY);
+
+        let replacement = root.join("replacement.txt");
+        tokio::fs::write(&replacement, "different-user-api-key-1234567890\n")
+            .await
+            .unwrap();
+        tokio::fs::rename(&replacement, &file).await.unwrap();
+        assert_eq!(
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+        tokio::fs::write(&file, "").await.unwrap();
+        assert_eq!(
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
+            StatusCode::FORBIDDEN
+        );
+        tokio::fs::write(&file, format!("{API_KEY}\nshort\n"))
+            .await
+            .unwrap();
+        assert_eq!(
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        tokio::fs::write(&file, vec![b' '; 1024 * 1024 + 1])
+            .await
+            .unwrap();
+        assert_eq!(
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        tokio::fs::remove_file(&file).await.unwrap();
+        assert_eq!(
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         headers.append("x-api-key", HeaderValue::from_static(API_KEY));
         assert_eq!(
-            simulator.allowedKey(&headers).unwrap_err().status(),
+            simulator.allowedKey(&headers).await.unwrap_err().status(),
             StatusCode::UNAUTHORIZED
         );
         for url in [
@@ -291,26 +348,22 @@ mod tests {
             "http://localhost/?query",
             "http://localhost/#fragment",
         ] {
-            assert!(Simulator::new(url, BACKEND_KEY, API_KEY).is_err());
+            assert!(Simulator::new(url, &file).is_err());
         }
 
-        assert!(Simulator::new("http://localhost", "short", API_KEY).is_err());
-        assert!(Simulator::new("http://localhost", BACKEND_KEY, "short").is_err());
-        assert!(Simulator::new("http://localhost", BACKEND_KEY, "")
-            .unwrap()
-            .allowedKeys
-            .is_empty());
+        assert!(Simulator::new("http://localhost", "").is_err());
+        tokio::fs::remove_dir(&root).await.unwrap();
     }
 
     #[tokio::test]
     async fn forwardingPreservesBodyStatusAndRejectsRedirects() {
         let app = Router::new()
             .route(
-                "/sim/replay",
+                "/sim/stamina",
                 post(|headers: HeaderMap, body: Bytes| async move {
-                    assert_eq!(headers["x-simulator-key"], BACKEND_KEY);
                     assert!(
-                        !headers.contains_key("x-api-key")
+                        !headers.contains_key("x-simulator-key")
+                            && !headers.contains_key("x-api-key")
                             && !headers.contains_key("cookie")
                             && !headers.contains_key("authorization")
                     );
@@ -330,7 +383,7 @@ mod tests {
                 post(|| async {
                     (
                         StatusCode::TEMPORARY_REDIRECT,
-                        [(header::LOCATION, "/sim/replay")],
+                        [(header::LOCATION, "/sim/stamina")],
                     )
                 }),
             );
@@ -339,12 +392,12 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        let simulator = Simulator::new(&format!("http://{address}"), BACKEND_KEY, API_KEY).unwrap();
+        let simulator = Simulator::new(&format!("http://{address}"), "unused-keys.txt").unwrap();
         let body =
             Bytes::from_static(b"{ \"untouched\": [1.000, 1e-20], \"unicode\": \"\\u1234\" }");
         let response = simulator
             .forward(
-                "/sim/replay",
+                "/sim/stamina",
                 Some(HeaderValue::from_static("application/json")),
                 body.clone(),
             )
@@ -400,9 +453,9 @@ mod tests {
                 let observed = observed.clone();
                 async move {
                     observed.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(headers["x-simulator-key"], BACKEND_KEY);
                     assert!(
-                        !headers.contains_key("x-api-key")
+                        !headers.contains_key("x-simulator-key")
+                            && !headers.contains_key("x-api-key")
                             && !headers.contains_key("cookie")
                             && !headers.contains_key("authorization")
                     );
@@ -415,7 +468,10 @@ mod tests {
         let task = tokio::spawn(async move {
             axum::serve(listener, upstream).await.unwrap();
         });
-        let simulator = Simulator::new(&format!("http://{address}"), BACKEND_KEY, API_KEY).unwrap();
+        let file =
+            std::env::temp_dir().join(format!("simulator-keys-{}.txt", uuid::Uuid::new_v4()));
+        tokio::fs::write(&file, API_KEY).await.unwrap();
+        let simulator = Simulator::new(&format!("http://{address}"), &file).unwrap();
         let state = AppState {
             db: db.clone(),
             search_client: reqwest::Client::new(),
@@ -525,5 +581,6 @@ mod tests {
         );
         task.abort();
         db.close().await;
+        tokio::fs::remove_file(&file).await.unwrap();
     }
 }

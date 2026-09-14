@@ -309,6 +309,12 @@ jobs:
 
           docker rm -f "$new_container" >/dev/null 2>&1 || true
 
+          simulator_config_dir="/opt/umamoe-backend/simulator-beta"
+          install -d -m 750 "$simulator_config_dir"
+          if [ ! -e "$simulator_config_dir/allowed-keys.txt" ]; then
+            (umask 027; : > "$simulator_config_dir/allowed-keys.txt")
+          fi
+
           docker_args=(
             -d
             --name "$new_container"
@@ -316,6 +322,8 @@ jobs:
             --add-host host.docker.internal:host-gateway
             --network "$network_name"
             --env-file "$env_file"
+            --group-add "$(id -g)"
+            --mount "type=bind,source=$simulator_config_dir,target=/config/simulator,readonly"
             -e HOST=0.0.0.0
             -e PORT="$app_port"
             -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0
@@ -397,6 +405,7 @@ jobs:
 
           server {
               listen 80;
+              client_max_body_size 8m;
               access_log off;
 
               location / {
@@ -655,6 +664,12 @@ jobs:
 
           docker rm -f "$new_container" >/dev/null 2>&1 || true
 
+          simulator_config_dir="/opt/umamoe-backend/simulator-production"
+          install -d -m 750 "$simulator_config_dir"
+          if [ ! -e "$simulator_config_dir/allowed-keys.txt" ]; then
+            (umask 027; : > "$simulator_config_dir/allowed-keys.txt")
+          fi
+
           docker_args=(
             -d
             --name "$new_container"
@@ -662,6 +677,8 @@ jobs:
             --add-host host.docker.internal:host-gateway
             --network "$network_name"
             --env-file "$env_file"
+            --group-add "$(id -g)"
+            --mount "type=bind,source=$simulator_config_dir,target=/config/simulator,readonly"
             -e HOST=0.0.0.0
             -e PORT="$app_port"
             -e BROWSER_PROOF_INTERNAL_HOST=0.0.0.0
@@ -743,6 +760,7 @@ jobs:
 
           server {
               listen 80;
+              client_max_body_size 8m;
               access_log off;
 
               location / {

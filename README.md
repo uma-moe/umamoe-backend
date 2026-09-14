@@ -189,7 +189,7 @@ Uma.moe is a community resource for Uma Musume Pretty Derby players, providing t
 ## Private simulator forwarding
 
 The existing `/api/` proxy serves `POST /api/sim/replay`, `/api/sim/monte-carlo`,
-`/api/sim/optimize` and `/api/sim/races/resimulate`. These routes require exactly
+`/api/sim/optimize`, `/api/sim/stamina` and `/api/sim/races/resimulate`. These routes require exactly
 one granted `X-API-Key`; browser proofs, bearer tokens and cookies do not grant
 simulator access. The backend checks revocation and records usage once, then
 forwards to the private simulator. Read-only backends keep skipping usage writes.
@@ -197,16 +197,39 @@ forwards to the private simulator. Read-only backends keep skipping usage writes
 `SIMULATOR_URL` is optional: unset or empty uses `http://192.168.100.1:3009`
 in production and `http://192.168.100.1:3109` when `APP_ENV=beta`. The deployment
 workflow sets `APP_ENV` automatically; outside it, the default is production.
-An explicit `SIMULATOR_URL` takes precedence. Set a different random
-`SIMULATOR_BACKEND_KEY` per environment, matching
-that simulator's `UMAMOE_V3_BACKEND_KEY`. Generate a key with `openssl rand -hex 32`.
-Put whitespace-separated granted user keys in `SIMULATOR_ALLOWED_KEYS`; when
-empty, all user requests are denied. Restart the backend to update the grants.
-Leaving the URL, service key and grants unset disables forwarding with HTTP 503; partial
-invalid configuration fails startup. See `deploy/backend.env.example`.
+An explicit `SIMULATOR_URL` takes precedence. No shared service key is required: the
+simulator is reachable only through the private subnet and its firewall allows
+the main server. User authorization stays in this backend.
+Allowed user keys live in a text file, one key per line; blank lines and lines
+starting with `#` are ignored. The backend reads the file on every simulator
+request, so additions, removals and file replacements need no restart. The
+previous `SIMULATOR_ALLOWED_KEYS` environment variable is no longer read.
 
-The backend sends only its service credential and the request content type.
-Caller-supplied internal credentials are replaced, cookies and user credentials
+On the main server, edit:
+
+- Production: `/opt/umamoe-backend/simulator-production/allowed-keys.txt`
+- Beta: `/opt/umamoe-backend/simulator-beta/allowed-keys.txt`
+
+The workflow creates empty files only when absent and mounts each environment's
+directory read-only at `/config/simulator`. It grants the container access through
+the deployment user's group, with directory mode `750` and file mode `640`.
+Mounting the directory lets editors replace the file atomically. Preserve the
+file's owner and permissions when replacing it. Redeploy once to install this
+mount and code; subsequent key edits take effect on the next request. Requests
+already authorized may finish.
+
+The default container path is `/config/simulator/allowed-keys.txt`; override it
+with `SIMULATOR_ALLOWED_KEYS_FILE` for local runs or a different mounted path.
+An empty file denies every key (403); unreadable, invalid or oversized files
+return 503 without forwarding. Reads are bounded to 1 MiB. Keys must still be
+valid and unrevoked in the backend database. Move any previous environment grant
+list into the appropriate file before switching clients over.
+
+Leaving the URL and file override unset uses the deployment defaults. A missing
+allowed-key file returns HTTP 503 without forwarding; invalid URL configuration
+fails startup. See `deploy/backend.env.example`.
+
+The backend forwards the request content type; cookies and user credentials
 are dropped, and redirects are rejected. Bodies are passed through unchanged;
 responses are streamed with `Cache-Control: no-store`. Simulator overload (429)
 and other application statuses are preserved. Connection failures return 502;

@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load environment variables
     dotenvy::dotenv().ok();
-    let simulator = handlers::simulator::Simulator::fromEnv()?.map(std::sync::Arc::new);
+    let simulator = Some(std::sync::Arc::new(handlers::simulator::Simulator::fromEnv()?));
 
     // Database connection
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
