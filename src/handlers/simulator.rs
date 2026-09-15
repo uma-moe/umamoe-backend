@@ -257,8 +257,8 @@ async fn finishProxyResponse(
     authMs: f64,
 ) -> Response {
     let (mut response, upstreamMs) = forward.await;
-    // Dropping a JoinHandle keeps logging alive without delaying the stream.
-    let usageTiming = if isEventStream(response.headers()) {
+    // Usage keeps running after either JSON or SSE headers are sent.
+    let usageTiming = if !usage.is_finished() {
         String::new()
     } else {
         match usage.await {
@@ -620,7 +620,12 @@ mod tests {
             .unwrap();
         task.abort();
 
-        let usage = tokio::spawn(async { 12.5 });
+        let (usageReady, ready) = tokio::sync::oneshot::channel();
+        let usage = tokio::spawn(async move {
+            usageReady.send(()).unwrap();
+            12.5
+        });
+        ready.await.unwrap();
         let response = finishProxyResponse(
             async { (Json(serde_json::json!({"runs": 100})).into_response(), 1.0) },
             usage,
@@ -632,6 +637,44 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("usage;dur=12.50"));
+    }
+
+    #[tokio::test]
+    async fn jsonResponseDoesNotWaitForUsageAndLoggingStillCompletes() {
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let (finished, recorded) = tokio::sync::oneshot::channel();
+        let usage = tokio::spawn(async move {
+            gate.await.unwrap();
+            finished.send(()).unwrap();
+            500.0
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            finishProxyResponse(
+                async { (Json(serde_json::json!({"runs": 10})).into_response(), 1.0) },
+                usage,
+                Instant::now(),
+                1.0,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers()["server-timing"]
+            .to_str()
+            .unwrap()
+            .contains("usage;"));
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            "{\"runs\":10}"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), recorded)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -713,6 +756,7 @@ mod tests {
                 .unwrap(),
             "{ \"exact\": 1.00 }"
         );
+        waitForUsage(&db, 1).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT total_requests FROM api_keys WHERE id = $1")
                 .bind(keyId)
@@ -783,6 +827,7 @@ mod tests {
             2,
             "rejected requests must not reach the simulator"
         );
+        waitForUsage(&db, 2).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT total_requests FROM api_keys WHERE id = $1")
                 .bind(keyId)
@@ -794,5 +839,25 @@ mod tests {
         task.abort();
         db.close().await;
         tokio::fs::remove_file(&file).await.unwrap();
+    }
+
+    async fn waitForUsage(db: &sqlx::PgPool, expected: i64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let recorded: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(SUM(requests), 0)::bigint FROM api_key_usage",
+                )
+                .fetch_one(db)
+                .await
+                .unwrap();
+                if recorded >= expected {
+                    break;
+                }
+
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }
