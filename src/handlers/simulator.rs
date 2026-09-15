@@ -188,6 +188,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sim/replay", post(proxy))
         .route("/api/sim/stamina", post(proxy))
         .route("/api/sim/monte-carlo", post(proxy))
+        .route(
+            "/api/sim/batch",
+            post(proxy).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/api/sim/optimize", post(proxy))
         .route(
             "/api/sim/races/resimulate",
@@ -678,6 +682,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matchupBatchRequiresAnApiKeyBeforeTouchingTheDatabase() {
+        let db = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .unwrap();
+        let state = AppState {
+            db,
+            search_client: reqwest::Client::new(),
+            search_url: String::new(),
+            oauth_redirect_base: String::new(),
+            task_notifier: crate::notify::TaskNotifier::new(),
+            redis_store: None,
+            user_writes_disabled: false,
+            simulator: Some(Arc::new(
+                Simulator::new("http://127.0.0.1:1", "unused-keys.txt").unwrap(),
+            )),
+        };
+        let response = routes()
+            .with_state(state)
+            .oneshot(
+                Request::post("/api/sim/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{\"races\":[]}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     #[ignore = "requires an isolated PostgreSQL database named simulator_forwarding_test via SIMULATOR_TEST_DATABASE_URL"]
     async fn authenticatedForwardingRecordsUsageOnce() {
         let url = std::env::var("SIMULATOR_TEST_DATABASE_URL").unwrap();
@@ -782,6 +816,12 @@ mod tests {
                 StatusCode::PAYLOAD_TOO_LARGE,
             ),
             ("/api/sim/races/resimulate", 300_000, StatusCode::OK),
+            ("/api/sim/batch", 300_000, StatusCode::OK),
+            (
+                "/api/sim/batch",
+                8 * 1024 * 1024 + 1,
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
             (
                 "/api/sim/races/resimulate",
                 8 * 1024 * 1024 + 1,
@@ -824,17 +864,17 @@ mod tests {
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
+            3,
             "rejected requests must not reach the simulator"
         );
-        waitForUsage(&db, 2).await;
+        waitForUsage(&db, 3).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT total_requests FROM api_keys WHERE id = $1")
                 .bind(keyId)
                 .fetch_one(&db)
                 .await
                 .unwrap(),
-            2
+            3
         );
         task.abort();
         db.close().await;
