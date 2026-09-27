@@ -166,13 +166,65 @@ affinity/search service, resource files, embeds, simulator, OAuth providers, and
 game-data workers require their separate services or credentials. Queued demo
 tasks remain pending until a worker is added.
 
-The previous multi-repository setup is preserved in `compose.services.yml` for
-developers who have those sibling checkouts, resource files, and an existing
-database configured in `.env`:
+### Collaborate across repositories
+
+Check out the repositories beside each other under any parent directory (the
+names below matter; the parent does not have to be called `git`):
+
+```text
+git/
+  umamoe-backend/
+  umamoe-frontend/
+  umamoe-resources/
+    master.mdb
+  umamoe_db/
+  umamoe-embeds/
+```
+
+Some repositories are private; each developer needs access to clone them. The
+scripts use existing local checkouts and never clone or pull repositories.
+Place the game's global `master.mdb` in `umamoe-resources/`; it is not included
+in Git. JP planner data uses the resources repo's bundled catalogue, so a
+separate `jp-master.mdb` is not required.
+
+From `umamoe-backend`, run either:
+
+```powershell
+.\setup.cmd services
+```
+
+```sh
+sh ./setup.sh services
+```
+
+These commands check the sibling paths, build all services, and wait for a
+healthy stack: PostgreSQL, Redis, seeded backend, resources, search, frontend,
+and embeds. No host database, `.env`, or embeds `local.env` is required. The
+collaboration database and generated resources use their own Docker volumes;
+rerunning setup preserves database edits. The scripts also work when invoked
+by their full path from another directory.
+
+Open the frontend at [localhost:4200](http://localhost:4200). Its development
+server proxies `/api`, `/search`, `/resources`, and `/__embeds` to the containers
+and reloads edits under the frontend's `src/`. Rerun setup after changing Rust,
+frontend dependencies, or frontend build configuration. Direct service ports
+are backend `3001`, search `3002`, resources `3004`, and embeds `3008`.
+
+The equivalent Compose commands are:
 
 ```bash
-docker compose -f compose.services.yml up --build -d
+docker compose -f compose.services.yml up --build -d --wait --wait-timeout 600
+docker compose -f compose.services.yml logs --tail=100
+docker compose -f compose.services.yml run --rm --no-deps demo-db --token
+docker compose -f compose.services.yml down
 ```
+
+Stop the standalone stack before switching to services mode because their
+default ports overlap. Both modes use `DEMO_BACKEND_PORT` and
+`DEMO_DATABASE_PORT`; services mode additionally supports `LOCAL_FRONTEND_PORT`,
+`LOCAL_SEARCH_PORT`, `LOCAL_RESOURCES_PORT`, and `LOCAL_EMBEDS_PORT` in your shell.
+The database URL and local credentials remain fixed to this disposable stack.
+OAuth, ingest workers, and the private simulator still need separate setup.
 
 ## 🗄️ Database Schema
 

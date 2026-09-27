@@ -67,6 +67,13 @@ async fn main() -> anyhow::Result<()> {
     )
     .fetch_one(&mut *tx)
     .await?;
+    // Search uses this legacy column, which is absent from the backend migrations.
+    // Apply to existing demos too, without reseeding developer edits.
+    sqlx::query(
+        "ALTER TABLE inheritance ADD COLUMN IF NOT EXISTS scenario_id integer NOT NULL DEFAULT 0",
+    )
+    .execute(&mut *tx)
+    .await?;
     if !seeded {
         sqlx::raw_sql(include_str!("../../deploy/demo/seed.sql"))
             .execute(&mut *tx)

@@ -25,7 +25,8 @@ BEGIN
     END LOOP;
     IF (SELECT count(*) FROM trainer JOIN inheritance USING (account_id)
         JOIN support_card USING (account_id) JOIN linked_accounts USING (account_id)
-        JOIN users ON users.id = linked_accounts.user_id) <> 100 THEN
+        JOIN users ON users.id = linked_accounts.user_id
+        WHERE inheritance.scenario_id IS NOT NULL) <> 100 THEN
         RAISE EXCEPTION 'Demo trainers, borrow records, and user accounts must be linked';
     END IF;
     IF (SELECT count(*) FROM circle_search_documents) <> 100

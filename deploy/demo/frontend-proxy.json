@@ -1,0 +1,6 @@
+{
+  "/api": { "target": "http://backend:3001", "changeOrigin": true },
+  "/search": { "target": "http://search:3002", "changeOrigin": true },
+  "/resources": { "target": "http://resources:3000", "changeOrigin": true },
+  "/__embeds": { "target": "http://embeds:8080", "changeOrigin": true }
+}

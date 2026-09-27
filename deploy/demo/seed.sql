@@ -28,12 +28,12 @@ INSERT INTO inheritance (account_id, main_parent_id, parent_left_id, parent_righ
     main_white_factors, main_white_count, left_blue_factors, left_pink_factors,
     right_blue_factors, right_pink_factors, main_win_saddles, left_win_saddles,
     right_win_saddles, blue_stars_sum, pink_stars_sum, green_stars_sum, white_stars_sum,
-    base_affinity, race_affinity, affinity_scores)
+    base_affinity, race_affinity, affinity_scores, scenario_id)
 SELECT account_id, 100101+(n%10)*100, 100201, 100301, 5+n%5, 3+n%3,
     ARRAY[10103,10203,10303], ARRAY[20103], ARRAY[10010103], ARRAY[20010101,20020102],
     20+n%20, 12, 10103, 20103, 10010103, ARRAY[20010101,20020102], 2,
     10203, 20203, 10303, 20303, ARRAY[101,102], ARRAY[101], ARRAY[102],
-    9, 3, 3, 3, 60+n%50, 20, array_fill(80+n%20, ARRAY[200]) FROM demo_rows;
+    9, 3, 3, 3, 60+n%50, 20, array_fill(80+n%20, ARRAY[200]), 1+n%3 FROM demo_rows;
 
 INSERT INTO support_card (account_id, support_card_id, limit_break_count, experience)
 SELECT account_id, 30001+n%10, n%5, 10000+n*250 FROM demo_rows;
