@@ -6,10 +6,11 @@ set "composeFile=compose.local.yml"
 set "waitTimeout=180"
 if not "%~2"=="" goto usage
 if "%~1"=="" goto dockerCheck
+if "%~1"=="bootstrap" goto bootstrap
 if not "%~1"=="services" goto usage
 set "composeFile=compose.services.yml"
 set "waitTimeout=600"
-for %%F in (umamoe-resources/Dockerfile umamoe_db/Dockerfile umamoe-embeds/Dockerfile umamoe-frontend/package-lock.json umamoe-frontend/angular.json) do (
+for %%F in (umamoe-resources/Dockerfile umamoe_db/Dockerfile umamoe-embeds/Dockerfile umamoe-frontend/package-lock.json) do (
     if not exist "../%%F" (
         echo Missing ../%%F. Check out the required repo beside umamoe-backend; private repos require access. >&2
         goto failed
@@ -56,8 +57,22 @@ echo Stop: docker compose -f %composeFile% down
 popd
 exit /b 0
 
+:bootstrap
+rem Git for Windows supplies the POSIX shell used by the shared bootstrap logic.
+set "gitShell="
+for /f "delims=" %%G in ('git --exec-path 2^>nul') do set "gitShell=%%G/../../../usr/bin/sh.exe"
+if not exist "%gitShell%" (
+    echo Install Git for Windows with its bundled shell, then run bootstrap again. >&2
+    goto failed
+)
+for %%S in ("%gitShell%") do set "PATH=%%~dpS;%PATH%"
+"%gitShell%" "%~dp0setup.sh" bootstrap
+if errorlevel 1 goto failed
+popd
+exit /b 0
+
 :usage
-echo Usage: setup.cmd [services] >&2
+echo Usage: setup.cmd [services^|bootstrap] >&2
 goto failed
 
 :missingMaster

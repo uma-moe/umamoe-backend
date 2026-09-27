@@ -81,19 +81,22 @@ services:
   frontend:
     build:
       context: ../umamoe-frontend
-      # The frontend's production Dockerfile exports static files, not a server.
-      dockerfile_inline: |
-        FROM node:20-bookworm-slim
-        WORKDIR /app
-        COPY package*.json ./
-        RUN npm ci --include=dev
-        COPY angular.json tsconfig*.json ./
-    command: ["npm", "start", "--", "--host", "0.0.0.0", "--proxy-config", "/config/proxy.json", "--poll", "1000"]
+      dockerfile: ../umamoe-backend/deploy/demo/frontend.Dockerfile
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        if [ -f angular.json ]; then
+          exec npm start -- --host 0.0.0.0 --proxy-config /config/proxy.json --poll 1000
+        fi
+        exec npm start -- --config /app/vite.docker.config.mjs --host 0.0.0.0 --port 4200
     environment:
       NG_CLI_ANALYTICS: "false"
     volumes:
       - ../umamoe-frontend/src:/app/src:ro
+      - ../umamoe-frontend/src/assets:/app/public/assets:ro
       - ./deploy/demo/frontend-proxy.json:/config/proxy.json:ro
+      - ./deploy/demo/vite.docker.config.mjs:/app/vite.docker.config.mjs:ro
     ports:
       - "127.0.0.1:${LOCAL_FRONTEND_PORT:-4200}:4200"
     healthcheck:

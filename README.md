@@ -59,8 +59,8 @@ migrations, seed the demo database, and wait for the backend to become healthy.
 They print the local URL and login instructions. They also work when invoked by
 path from another directory, and rerunning them preserves your database edits.
 
-Only this repository is required. The scripts use public Docker images and build
-the backend locally; they never clone private repositories or pull private images.
+Only this repository is required. Standalone mode uses public Docker images and
+builds the backend locally; it does not clone repositories or pull private images.
 Internet access is needed on the first run for images and Rust dependencies. See
 [optional services](#optional-services) for features that need separate access.
 
@@ -168,6 +168,40 @@ tasks remain pending until a worker is added.
 
 ### Collaborate across repositories
 
+To download and start as much as your account can access, install Git and Docker,
+then run from this backend checkout:
+
+```powershell
+.\setup.cmd bootstrap
+```
+
+```sh
+sh ./setup.sh bootstrap
+```
+
+On Windows, bootstrap uses the shell bundled with **Git for Windows**. It clones
+missing sibling repos from `github.com/uma-moe`; the `umamoe-search` repository is
+checked out as `umamoe_db` to match the Compose paths. Existing clean checkouts
+are pulled from their current upstream using fast-forward only. Local edits,
+local commits that would require a merge, detached checkouts, and branches
+without an upstream are preserved. It never switches branches or stashes work.
+
+Bootstrap uses saved Git credentials without interactive login prompts. Sign in
+to Git beforehand for private repository access. Clone/pull failures are reported
+and setup continues with the checkouts already available. Docker downloads the
+public base images and installs Rust/Node dependencies inside containers.
+
+The seeded backend starts first, then resources, search, frontend, and embeds
+are attempted individually. Missing repositories or optional build failures do
+not stop the other services. Without `master.mdb`, resources and search are
+skipped; the frontend can still use the backend APIs, while pages needing those
+services remain unavailable. Embeds needs a working frontend. The final output
+lists services started by this run; partial setup returns success if the backend
+is healthy. Rerun bootstrap after resolving a skipped service's prerequisites.
+
+For an existing complete set of checkouts, use `services` mode below to build
+everything without cloning or pulling. It requires all services to become healthy.
+
 Check out the repositories beside each other under any parent directory (the
 names below matter; the parent does not have to be called `git`):
 
@@ -181,8 +215,8 @@ git/
   umamoe-embeds/
 ```
 
-Some repositories are private; each developer needs access to clone them. The
-scripts use existing local checkouts and never clone or pull repositories.
+Some repositories are private; each developer needs access to clone them.
+The `services` mode uses existing local checkouts without cloning or pulling.
 Place the game's global `master.mdb` in `umamoe-resources/`; it is not included
 in Git. JP planner data uses the resources repo's bundled catalogue, so a
 separate `jp-master.mdb` is not required.
@@ -206,8 +240,9 @@ by their full path from another directory.
 
 Open the frontend at [localhost:4200](http://localhost:4200). Its development
 server proxies `/api`, `/search`, `/resources`, and `/__embeds` to the containers
-and reloads edits under the frontend's `src/`. Rerun setup after changing Rust,
-frontend dependencies, or frontend build configuration. Direct service ports
+and reloads edits under the frontend's `src/`. Both the current Svelte frontend
+and older Angular checkouts are supported. Rerun setup after changing Rust,
+frontend dependencies, artwork, or frontend build configuration. Direct service ports
 are backend `3001`, search `3002`, resources `3004`, and embeds `3008`.
 
 The equivalent Compose commands are:
