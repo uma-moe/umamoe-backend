@@ -11,11 +11,11 @@ use crate::{errors::Result, AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/tree", get(affinity_tree))
-        .route("/data", get(affinity_data))
+        .route("/tree", get(affinityTree))
+        .route("/data", get(affinityData))
 }
 
-async fn affinity_tree(
+async fn affinityTree(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>> {
@@ -42,7 +42,7 @@ async fn affinity_tree(
     Ok(Json(resp))
 }
 
-async fn affinity_data(State(state): State<AppState>) -> Result<impl IntoResponse> {
+async fn affinityData(State(state): State<AppState>) -> Result<impl IntoResponse> {
     let url = format!("{}/affinity/data", state.search_url);
 
     let resp = state

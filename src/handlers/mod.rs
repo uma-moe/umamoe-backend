@@ -10,6 +10,7 @@ pub mod rankings;
 pub mod search;
 pub mod shame;
 pub mod sharing;
+pub mod simulator;
 pub mod stats;
 pub mod tasks;
 pub mod version;

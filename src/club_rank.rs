@@ -1,4 +1,4 @@
-pub(crate) fn monthly_club_rank_joins(ranking_alias: &str) -> String {
+pub(crate) fn monthlyClubRankJoins(ranking_alias: &str) -> String {
     format!(
         "LEFT JOIN circle_ranks_monthly_archive cra \
             ON cra.circle_id = {alias}.circle_id \
@@ -10,20 +10,20 @@ pub(crate) fn monthly_club_rank_joins(ranking_alias: &str) -> String {
     )
 }
 
-pub(crate) fn monthly_club_rank_selects(ranking_alias: &str) -> (String, String) {
+pub(crate) fn monthlyClubRankSelects(ranking_alias: &str) -> (String, String) {
     let rank_expr = "COALESCE(NULLIF(cra.rank, 0), NULLIF(lr.live_rank::int, 0), NULLIF(c.live_rank, 0), NULLIF(c.monthly_rank, 0))";
     let points_expr = "COALESCE(cra.total_points, NULLIF(c.live_points, 0), c.monthly_point, 0)";
-    let club_rank_expr = club_rank_index_sql(rank_expr, points_expr);
+    let club_rank_expr = clubRankIndexSql(rank_expr, points_expr);
     let nullable_club_rank_expr = format!(
         "CASE WHEN {alias}.circle_id IS NULL THEN NULL ELSE {club_rank_expr} END",
         alias = ranking_alias
     );
-    let club_rank_name_expr = club_rank_name_sql(&nullable_club_rank_expr);
+    let club_rank_name_expr = clubRankNameSql(&nullable_club_rank_expr);
 
     (nullable_club_rank_expr, club_rank_name_expr)
 }
 
-fn club_rank_index_sql(rank_expr: &str, points_expr: &str) -> String {
+fn clubRankIndexSql(rank_expr: &str, points_expr: &str) -> String {
     format!(
         "CASE \
             WHEN {rank_expr} IS NULL THEN \
@@ -42,7 +42,7 @@ fn club_rank_index_sql(rank_expr: &str, points_expr: &str) -> String {
     )
 }
 
-fn club_rank_name_sql(club_rank_expr: &str) -> String {
+fn clubRankNameSql(club_rank_expr: &str) -> String {
     format!(
         "CASE {club_rank_expr} \
             WHEN 11 THEN 'SS' \

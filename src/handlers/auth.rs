@@ -17,23 +17,19 @@ use uuid::Uuid;
 use crate::borrow_key;
 use crate::errors::AppError;
 use crate::middleware::auth::AuthenticatedUser;
-use crate::models::auth::{
+pub use crate::types::auth::{
     ApiKeyResponse, BookmarkEntry, CreateApiKeyRequest, CreateApiKeyResponse, IdentityResponse,
     LinkAccountRequest, LinkResponse, LinkedAccountResponse, UserResponse, VerifyAccountRequest,
     VerifyResponse,
 };
-use crate::models::{Inheritance, SupportCard, UnifiedAccountRecord, INHERITANCE_SELECT_COLUMNS};
+pub use crate::types::{
+    Inheritance, SupportCard, UnifiedAccountRecord, INHERITANCE_SELECT_COLUMNS,
+};
 use crate::AppState;
 
 // ── Types ───────────────────────────────────────────────────────
 
-/// OAuth client with auth URL and token URL configured (type-state).
-type OAuthClient =
-    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
-
-/// Simple error type for the OAuth HTTP client adapter.
-#[derive(Debug)]
-struct OAuthHttpError(String);
+include!("../types/handlers/auth.rs");
 
 impl std::fmt::Display for OAuthHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -45,47 +41,40 @@ impl std::error::Error for OAuthHttpError {}
 
 // ── Router ──────────────────────────────────────────────────────
 
-pub fn public_router() -> Router<AppState> {
+pub fn publicRouter() -> Router<AppState> {
     Router::new()
         .route(
             "/browser-proof",
-            post(crate::middleware::turnstile::exchange_browser_proof),
+            post(crate::middleware::turnstile::exchangeBrowserProof),
         )
         .route("/login/:provider", get(login))
         .route("/callback/:provider", get(callback))
 }
 
-pub fn authenticated_router() -> Router<AppState> {
+pub fn authenticatedRouter() -> Router<AppState> {
     Router::new()
-        .route("/me", get(get_me))
-        .route("/identities", get(list_identities))
-        .route("/connect/:provider", get(connect_provider))
-        .route("/connect/callback/:provider", get(connect_callback))
-        .route("/disconnect/:provider", delete(disconnect_provider))
-        .route("/accounts", get(list_accounts))
-        .route("/link", post(link_account))
-        .route("/verify", post(verify_account))
-        .route("/link/:account_id", delete(unlink_account))
-        .route("/api-keys", get(list_api_keys).post(create_api_key))
-        .route("/api-keys/:key_id", delete(revoke_api_key))
-        .route("/bookmarks", get(list_bookmarks))
-        .route("/bookmarks/bulk-delete", post(bulk_remove_bookmarks))
+        .route("/me", get(getMe))
+        .route("/identities", get(listIdentities))
+        .route("/connect/:provider", get(connectProvider))
+        .route("/connect/callback/:provider", get(connectCallback))
+        .route("/disconnect/:provider", delete(disconnectProvider))
+        .route("/accounts", get(listAccounts))
+        .route("/link", post(linkAccount))
+        .route("/verify", post(verifyAccount))
+        .route("/link/:account_id", delete(unlinkAccount))
+        .route("/api-keys", get(listApiKeys).post(createApiKey))
+        .route("/api-keys/:key_id", delete(revokeApiKey))
+        .route("/bookmarks", get(listBookmarks))
+        .route("/bookmarks/bulk-delete", post(bulkRemoveBookmarks))
         .route(
             "/bookmarks/:account_id",
-            post(add_bookmark).delete(remove_bookmark),
+            post(addBookmark).delete(removeBookmark),
         )
 }
 
 // ── OAuth helpers ───────────────────────────────────────────────
 
-struct ProviderConfig {
-    auth_url: &'static str,
-    token_url: &'static str,
-    scopes: Vec<&'static str>,
-    userinfo_url: &'static str,
-}
-
-fn provider_config(provider: &str) -> Result<ProviderConfig, AppError> {
+fn providerConfig(provider: &str) -> Result<ProviderConfig, AppError> {
     match provider {
         "google" => Ok(ProviderConfig {
             auth_url: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -112,7 +101,7 @@ fn provider_config(provider: &str) -> Result<ProviderConfig, AppError> {
     }
 }
 
-fn build_oauth_client(
+fn buildOauthClient(
     provider: &str,
     config: &ProviderConfig,
     state: &AppState,
@@ -147,18 +136,9 @@ fn build_oauth_client(
     Ok(client)
 }
 
-/// Parsed userinfo from any provider.
-struct ProviderUserInfo {
-    provider_user_id: String,
-    display_name: Option<String>,
-    email: Option<String>,
-    email_verified: bool,
-    avatar_url: Option<String>,
-}
-
 impl ProviderUserInfo {
     /// Only provider-verified email addresses may be retained as account data.
-    fn verified_email(&self) -> Option<&str> {
+    fn verifiedEmail(&self) -> Option<&str> {
         if self.email_verified {
             self.email.as_deref()
         } else {
@@ -167,7 +147,7 @@ impl ProviderUserInfo {
     }
 }
 
-fn require_verified_discord_email(
+fn requireVerifiedDiscordEmail(
     provider: &str,
     userinfo: &ProviderUserInfo,
 ) -> Result<(), AppError> {
@@ -183,7 +163,7 @@ fn require_verified_discord_email(
 }
 
 /// Fetch user profile from the provider's userinfo endpoint.
-async fn fetch_userinfo(
+async fn fetchUserinfo(
     provider: &str,
     access_token: &str,
     http_client: &reqwest::Client,
@@ -264,7 +244,7 @@ async fn fetch_userinfo(
 /// Generate a 60-character random verification token.
 /// Tokens are checked against the game's profanity filter to ensure
 /// users can actually save them in their profile description.
-fn generate_verification_token() -> String {
+fn generateVerificationToken() -> String {
     const CHARSET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid confusion
     let mut rng = rand::thread_rng();
 
@@ -273,7 +253,7 @@ fn generate_verification_token() -> String {
             .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
             .collect();
 
-        if !token_hits_profanity_filter(&token) {
+        if !tokenHitsProfanityFilter(&token) {
             return token;
         }
     }
@@ -284,7 +264,7 @@ fn generate_verification_token() -> String {
 /// matching. "High" words flag anywhere; "low" words flag only when
 /// adjacent to a space — since the token is surrounded by spaces in a
 /// profile description, we check start/end for those.
-fn token_hits_profanity_filter(token: &str) -> bool {
+fn tokenHitsProfanityFilter(token: &str) -> bool {
     const BLOCKED_ANYWHERE: &[&str] = &[
         "cuck", "puta", "ubre", "naga", "69", "terf", "hate", "anal", "buta", "anus", "twat",
         "tata", "tard", "smut", "suck", "phuq", "muff", "cbt", "gay", "gei", "jcb", "jew", "pud",
@@ -317,7 +297,7 @@ fn token_hits_profanity_filter(token: &str) -> bool {
 ///
 /// This prevents open-redirect attacks while still letting beta/staging
 /// deployments pass `?origin=https://beta.uma.moe`.
-fn resolve_frontend_url(origin: Option<&str>) -> String {
+fn resolveFrontendUrl(origin: Option<&str>) -> String {
     let default = std::env::var("FRONTEND_URL").unwrap_or_else(|_| "https://uma.moe".to_string());
 
     let Some(raw) = origin else {
@@ -354,25 +334,14 @@ fn resolve_frontend_url(origin: Option<&str>) -> String {
 
 // ── Handlers ────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub struct LoginParams {
-    pub origin: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CallbackParams {
-    pub code: String,
-    pub state: String,
-}
-
 /// GET /api/auth/login/:provider — redirect user to SSO provider
 async fn login(
     State(state): State<AppState>,
     Path(provider): Path<String>,
     Query(params): Query<LoginParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let config = provider_config(&provider)?;
-    let client = build_oauth_client(&provider, &config, &state)?;
+    let config = providerConfig(&provider)?;
+    let client = buildOauthClient(&provider, &config, &state)?;
 
     let mut auth_request = client.authorize_url(CsrfToken::new_random);
     for scope in &config.scopes {
@@ -430,8 +399,8 @@ async fn callback(
     // Invalidate used state
     crate::cache::invalidate(&format!("oauth_state:{}", params.state));
 
-    let config = provider_config(&provider)?;
-    let client = build_oauth_client(&provider, &config, &state)?;
+    let config = providerConfig(&provider)?;
+    let client = buildOauthClient(&provider, &config, &state)?;
 
     // Exchange code for token
     let reqwest_client = state.search_client.clone();
@@ -467,14 +436,14 @@ async fn callback(
     let access_token = token_response.access_token().secret().to_owned();
 
     // Fetch user profile from provider
-    let userinfo = fetch_userinfo(&provider, &access_token, &state.search_client, &config).await?;
+    let userinfo = fetchUserinfo(&provider, &access_token, &state.search_client, &config).await?;
 
     if userinfo.provider_user_id.is_empty() {
         return Err(AppError::BadRequest(
             "Provider did not return a user ID".into(),
         ));
     }
-    require_verified_discord_email(&provider, &userinfo)?;
+    requireVerifiedDiscordEmail(&provider, &userinfo)?;
 
     // Upsert: look up existing identity or create new user + identity
     let existing_user_id = sqlx::query_scalar::<_, Uuid>(
@@ -498,7 +467,7 @@ async fn callback(
             "#,
         )
         .bind(&userinfo.display_name)
-        .bind(userinfo.verified_email().map(crate::auth::hash_email))
+        .bind(userinfo.verifiedEmail().map(crate::auth::hashEmail))
         .bind(&userinfo.avatar_url)
         .bind(&provider)
         .bind(&userinfo.provider_user_id)
@@ -535,7 +504,7 @@ async fn callback(
             "#,
         )
         .bind(&userinfo.display_name)
-        .bind(userinfo.verified_email().map(crate::auth::hash_email))
+        .bind(userinfo.verifiedEmail().map(crate::auth::hashEmail))
         .bind(&userinfo.avatar_url)
         .fetch_one(&mut *tx)
         .await?;
@@ -550,7 +519,7 @@ async fn callback(
         .bind(&provider)
         .bind(&userinfo.provider_user_id)
         .bind(&userinfo.display_name)
-        .bind(userinfo.verified_email().map(crate::auth::hash_email))
+        .bind(userinfo.verifiedEmail().map(crate::auth::hashEmail))
         .bind(&userinfo.avatar_url)
         .execute(&mut *tx)
         .await?;
@@ -560,7 +529,7 @@ async fn callback(
     };
 
     // Issue JWT
-    let token = crate::auth::create_token(user_id)
+    let token = crate::auth::createToken(user_id)
         .map_err(|e| AppError::BadRequest(format!("Failed to create token: {}", e)))?;
 
     info!(
@@ -571,7 +540,7 @@ async fn callback(
     );
 
     // Redirect to frontend with token
-    let frontend_url = resolve_frontend_url(login_origin.as_deref());
+    let frontend_url = resolveFrontendUrl(login_origin.as_deref());
     let redirect_url = format!(
         "{}/auth/callback?token={}",
         frontend_url,
@@ -582,11 +551,11 @@ async fn callback(
 }
 
 /// GET /api/auth/me — return current authenticated user
-async fn get_me(
+async fn getMe(
     user: AuthenticatedUser,
     State(state): State<AppState>,
 ) -> Result<Json<UserResponse>, AppError> {
-    let row = sqlx::query_as::<_, crate::models::auth::User>("SELECT * FROM users WHERE id = $1")
+    let row = sqlx::query_as::<_, crate::types::auth::User>("SELECT * FROM users WHERE id = $1")
         .bind(user.user_id)
         .fetch_optional(&state.db)
         .await?
@@ -608,7 +577,7 @@ async fn get_me(
 }
 
 /// GET /api/auth/accounts — list linked accounts for current user
-async fn list_accounts(
+async fn listAccounts(
     user: AuthenticatedUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<LinkedAccountResponse>>, AppError> {
@@ -621,7 +590,7 @@ async fn list_accounts(
     .await?;
 
     for id in &pending_ids {
-        let new_token = generate_verification_token();
+        let new_token = generateVerificationToken();
         sqlx::query(
             "UPDATE linked_accounts SET verification_token = $1, updated_at = NOW() WHERE id = $2",
         )
@@ -631,7 +600,7 @@ async fn list_accounts(
         .await?;
     }
 
-    let rows = sqlx::query_as::<_, crate::models::auth::LinkedAccount>(
+    let rows = sqlx::query_as::<_, crate::types::auth::LinkedAccount>(
         "SELECT * FROM linked_accounts WHERE user_id = $1 ORDER BY created_at",
     )
     .bind(user.user_id)
@@ -662,7 +631,7 @@ async fn list_accounts(
             Some(e) => (Some(e.name), e.main_parent_id),
             None => (None, None),
         };
-        responses.push(LinkedAccountResponse::from_linked(
+        responses.push(LinkedAccountResponse::fromLinked(
             la,
             trainer_name,
             representative_uma_id,
@@ -673,7 +642,7 @@ async fn list_accounts(
 }
 
 /// POST /api/auth/link — start linking a trainer account
-async fn link_account(
+async fn linkAccount(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Json(payload): Json<LinkAccountRequest>,
@@ -699,7 +668,7 @@ async fn link_account(
         ));
     }
 
-    let token = generate_verification_token();
+    let token = generateVerificationToken();
 
     // Upsert linked account (if user re-links same account, reset verification)
     sqlx::query(
@@ -733,7 +702,7 @@ async fn link_account(
 }
 
 /// POST /api/auth/verify — trigger bot verification and poll for result
-async fn verify_account(
+async fn verifyAccount(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Json(payload): Json<VerifyAccountRequest>,
@@ -750,7 +719,7 @@ async fn verify_account(
     let _ = crate::cache::set(&cooldown_key, &true, std::time::Duration::from_secs(30));
 
     // Look up the pending linked account
-    let linked = sqlx::query_as::<_, crate::models::auth::LinkedAccount>(
+    let linked = sqlx::query_as::<_, crate::types::auth::LinkedAccount>(
         "SELECT * FROM linked_accounts WHERE user_id = $1 AND account_id = $2 AND verification_status = 'pending'",
     )
     .bind(user.user_id)
@@ -809,7 +778,7 @@ async fn verify_account(
             }
             Some((ref s,)) if s == "failed" => {
                 // Rotate the token so the user gets a fresh one on retry
-                let new_token = generate_verification_token();
+                let new_token = generateVerificationToken();
                 sqlx::query(
                     "UPDATE linked_accounts SET verification_token = $1, verification_status = 'pending', updated_at = NOW() WHERE id = $2",
                 )
@@ -843,7 +812,7 @@ async fn verify_account(
 }
 
 /// DELETE /api/auth/link/:account_id — unlink an account
-async fn unlink_account(
+async fn unlinkAccount(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(account_id): Path<String>,
@@ -868,11 +837,11 @@ async fn unlink_account(
 // ── Multi-SSO: connect / disconnect / list identities ───────────
 
 /// GET /api/auth/identities — list all connected SSO providers
-async fn list_identities(
+async fn listIdentities(
     user: AuthenticatedUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<IdentityResponse>>, AppError> {
-    let rows = sqlx::query_as::<_, crate::models::auth::UserIdentity>(
+    let rows = sqlx::query_as::<_, crate::types::auth::UserIdentity>(
         "SELECT * FROM user_identities WHERE user_id = $1 ORDER BY created_at",
     )
     .bind(user.user_id)
@@ -891,7 +860,7 @@ async fn list_identities(
 }
 
 /// GET /api/auth/connect/:provider — redirect authenticated user to SSO to link a new provider
-async fn connect_provider(
+async fn connectProvider(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -913,8 +882,8 @@ async fn connect_provider(
         )));
     }
 
-    let config = provider_config(&provider)?;
-    let client = build_oauth_client(&provider, &config, &state)?;
+    let config = providerConfig(&provider)?;
+    let client = buildOauthClient(&provider, &config, &state)?;
 
     // Use a different redirect URL for connect callbacks
     let redirect_url = format!(
@@ -956,7 +925,7 @@ async fn connect_provider(
 }
 
 /// GET /api/auth/connect/callback/:provider — handle SSO callback for linking
-async fn connect_callback(
+async fn connectCallback(
     State(state): State<AppState>,
     Path(provider): Path<String>,
     Query(params): Query<CallbackParams>,
@@ -984,7 +953,7 @@ async fn connect_callback(
 
     crate::cache::invalidate(&format!("oauth_connect:{}", params.state));
 
-    let config = provider_config(&provider)?;
+    let config = providerConfig(&provider)?;
 
     // Build client with connect redirect URL
     let redirect_url = format!(
@@ -1045,14 +1014,14 @@ async fn connect_callback(
         .map_err(|e| AppError::BadRequest(format!("Token exchange failed: {}", e)))?;
 
     let access_token = token_response.access_token().secret().to_owned();
-    let userinfo = fetch_userinfo(&provider, &access_token, &state.search_client, &config).await?;
+    let userinfo = fetchUserinfo(&provider, &access_token, &state.search_client, &config).await?;
 
     if userinfo.provider_user_id.is_empty() {
         return Err(AppError::BadRequest(
             "Provider did not return a user ID".into(),
         ));
     }
-    require_verified_discord_email(&provider, &userinfo)?;
+    requireVerifiedDiscordEmail(&provider, &userinfo)?;
 
     // Check if this SSO identity is already linked to another user
     let existing_owner = sqlx::query_scalar::<_, Uuid>(
@@ -1065,7 +1034,7 @@ async fn connect_callback(
 
     if let Some(owner) = existing_owner {
         if owner != user_id {
-            let frontend_url = resolve_frontend_url(connect_origin.as_deref());
+            let frontend_url = resolveFrontendUrl(connect_origin.as_deref());
             let redirect_url = format!(
                 "{}/auth/connect?error={}",
                 frontend_url,
@@ -1086,7 +1055,7 @@ async fn connect_callback(
         .bind(&provider)
         .bind(&userinfo.provider_user_id)
         .bind(&userinfo.display_name)
-        .bind(userinfo.verified_email().map(crate::auth::hash_email))
+        .bind(userinfo.verifiedEmail().map(crate::auth::hashEmail))
         .bind(&userinfo.avatar_url)
         .execute(&state.db)
         .await?;
@@ -1094,7 +1063,7 @@ async fn connect_callback(
         info!("🔗 User {} connected {} identity", user_id, provider);
     }
 
-    let frontend_url = resolve_frontend_url(connect_origin.as_deref());
+    let frontend_url = resolveFrontendUrl(connect_origin.as_deref());
     let redirect_url = format!(
         "{}/auth/connect?success={}",
         frontend_url,
@@ -1104,7 +1073,7 @@ async fn connect_callback(
 }
 
 /// DELETE /api/auth/disconnect/:provider — remove an SSO identity (must keep at least one)
-async fn disconnect_provider(
+async fn disconnectProvider(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(provider): Path<String>,
@@ -1145,7 +1114,7 @@ async fn disconnect_provider(
 // ── API Key management ──────────────────────────────────────────
 
 /// Generate a random API key: "uma_k_" + 48 random alphanumeric chars
-fn generate_api_key() -> String {
+fn generateApiKey() -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
     let random: String = (0..48)
@@ -1155,7 +1124,7 @@ fn generate_api_key() -> String {
 }
 
 /// SHA-256 hash of a key, returned as hex string
-fn hash_api_key(key: &str) -> String {
+fn hashApiKey(key: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(key.as_bytes());
@@ -1163,7 +1132,7 @@ fn hash_api_key(key: &str) -> String {
 }
 
 /// POST /api/auth/api-keys — create a new API key
-async fn create_api_key(
+async fn createApiKey(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Json(payload): Json<CreateApiKeyRequest>,
@@ -1187,8 +1156,8 @@ async fn create_api_key(
         ));
     }
 
-    let raw_key = generate_api_key();
-    let key_hash = hash_api_key(&raw_key);
+    let raw_key = generateApiKey();
+    let key_hash = hashApiKey(&raw_key);
     let key_prefix = raw_key[..14].to_string(); // "uma_k_" + first 8 random chars
 
     let id = sqlx::query_scalar::<_, Uuid>(
@@ -1216,7 +1185,7 @@ async fn create_api_key(
 }
 
 /// GET /api/auth/api-keys — list all API keys for current user
-async fn list_api_keys(
+async fn listApiKeys(
     user: AuthenticatedUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ApiKeyResponse>>, AppError> {
@@ -1231,7 +1200,7 @@ async fn list_api_keys(
 }
 
 /// DELETE /api/auth/api-keys/:key_id — revoke an API key
-async fn revoke_api_key(
+async fn revokeApiKey(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(key_id): Path<Uuid>,
@@ -1260,7 +1229,7 @@ async fn revoke_api_key(
 /// carries an `is_stale` flag that is true when the visible inheritance/support
 /// combo has changed since the user bookmarked it. Legacy content-hash
 /// bookmarks are accepted while they still match and then lazily upgraded.
-async fn list_bookmarks(
+async fn listBookmarks(
     user: AuthenticatedUser,
     State(state): State<AppState>,
 ) -> Result<Json<Vec<UnifiedAccountRecord>>, AppError> {
@@ -1409,7 +1378,7 @@ async fn list_bookmarks(
                 affinity_score: row.try_get("affinity_score").ok(),
             });
             let current_hash =
-                borrow_key::key_from_profile(inheritance.as_ref(), support_card.as_ref());
+                borrow_key::keyFromProfile(inheritance.as_ref(), support_card.as_ref());
             let has_borrow_key = bookmarked_borrow_key.is_some();
             let matches_current = bookmarked_borrow_key
                 .as_deref()
@@ -1500,33 +1469,13 @@ async fn list_bookmarks(
     Ok(Json(records))
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct AddBookmarkRequest {
-    borrow_key: Option<String>,
-    support_card_id: Option<i32>,
-    support_card_limit_break: Option<i32>,
-    support_card_experience: Option<i32>,
-}
-
-#[derive(Clone, Debug)]
-struct BookmarkHashUpgrade {
-    account_id: String,
-    previous_hash: Option<String>,
-    previous_borrow_key: Option<String>,
-    next_hash: String,
-    legacy_hash: Option<String>,
-    support_card_id: Option<i32>,
-    support_card_limit_break: Option<i32>,
-    support_card_experience: Option<i32>,
-}
-
 /// POST /api/auth/bookmarks/:account_id — add a bookmark.
 ///
 /// Snapshots both the legacy content hash and the stable `bk1:` combo key used
 /// by borrow tracking. The legacy hash keeps rollback safe; the borrow key lets
 /// new code detect when the visible inheritance/support-card combo changes.
 /// Idempotent: re-bookmarking refreshes both snapshots.
-async fn add_bookmark(
+async fn addBookmark(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(account_id): Path<String>,
@@ -1610,8 +1559,8 @@ async fn add_bookmark(
         .await?
     };
 
-    let current_borrow_key = borrow_key::normalize_stable_borrow_key(payload.borrow_key.as_deref())
-        .unwrap_or_else(|| borrow_key::key_from_profile(Some(&inheritance), support_card.as_ref()));
+    let current_borrow_key = borrow_key::normalizeStableBorrowKey(payload.borrow_key.as_deref())
+        .unwrap_or_else(|| borrow_key::keyFromProfile(Some(&inheritance), support_card.as_ref()));
     let saved_support_card_id = payload
         .support_card_id
         .or_else(|| support_card.as_ref().map(|card| card.support_card_id));
@@ -1660,7 +1609,7 @@ async fn add_bookmark(
 }
 
 /// DELETE /api/auth/bookmarks/:account_id — remove a bookmark
-async fn remove_bookmark(
+async fn removeBookmark(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Path(account_id): Path<String>,
@@ -1680,21 +1629,11 @@ async fn remove_bookmark(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct BulkRemoveBookmarksRequest {
-    /// Specific account_ids to remove. Ignored when `all` is true.
-    #[serde(default)]
-    pub account_ids: Vec<String>,
-    /// When true, remove every bookmark for the user.
-    #[serde(default)]
-    pub all: bool,
-}
-
 /// POST /api/auth/bookmarks/bulk-delete — remove many bookmarks at once.
 ///
 /// Body: `{ "account_ids": ["123", "456"] }` to remove specific bookmarks,
 /// or `{ "all": true }` to clear every bookmark for the user.
-async fn bulk_remove_bookmarks(
+async fn bulkRemoveBookmarks(
     user: AuthenticatedUser,
     State(state): State<AppState>,
     Json(payload): Json<BulkRemoveBookmarksRequest>,
@@ -1734,7 +1673,7 @@ async fn bulk_remove_bookmarks(
 mod tests {
     use super::*;
 
-    fn provider_userinfo(email: Option<&str>, email_verified: bool) -> ProviderUserInfo {
+    fn providerUserinfo(email: Option<&str>, email_verified: bool) -> ProviderUserInfo {
         ProviderUserInfo {
             provider_user_id: "provider-user-id".into(),
             display_name: None,
@@ -1745,28 +1684,26 @@ mod tests {
     }
 
     #[test]
-    fn discord_requires_a_verified_email() {
-        assert!(require_verified_discord_email(
+    fn discordRequiresAVerifiedEmail() {
+        assert!(requireVerifiedDiscordEmail(
             "discord",
-            &provider_userinfo(Some("victim@example.com"), false),
+            &providerUserinfo(Some("victim@example.com"), false),
         )
         .is_err());
-        assert!(
-            require_verified_discord_email("discord", &provider_userinfo(None, false)).is_err()
-        );
-        assert!(require_verified_discord_email(
+        assert!(requireVerifiedDiscordEmail("discord", &providerUserinfo(None, false)).is_err());
+        assert!(requireVerifiedDiscordEmail(
             "discord",
-            &provider_userinfo(Some("owner@example.com"), true),
+            &providerUserinfo(Some("owner@example.com"), true),
         )
         .is_ok());
     }
 
     #[test]
-    fn unverified_provider_email_is_never_trusted() {
-        let unverified = provider_userinfo(Some("victim@example.com"), false);
-        let verified = provider_userinfo(Some("owner@example.com"), true);
+    fn unverifiedProviderEmailIsNeverTrusted() {
+        let unverified = providerUserinfo(Some("victim@example.com"), false);
+        let verified = providerUserinfo(Some("owner@example.com"), true);
 
-        assert_eq!(unverified.verified_email(), None);
-        assert_eq!(verified.verified_email(), Some("owner@example.com"));
+        assert_eq!(unverified.verifiedEmail(), None);
+        assert_eq!(verified.verifiedEmail(), Some("owner@example.com"));
     }
 }

@@ -3,11 +3,11 @@ use sqlx::{Postgres, QueryBuilder, Row};
 
 use crate::{
     errors::Result,
-    models::{Inheritance, SearchResponse, SupportCard, UnifiedAccountRecord, UnifiedSearchParams},
+    types::{Inheritance, SearchResponse, SupportCard, UnifiedAccountRecord, UnifiedSearchParams},
     AppState,
 };
 
-fn get_affinity_expression(player_chara_id: Option<i32>) -> String {
+fn getAffinityExpression(player_chara_id: Option<i32>) -> String {
     match player_chara_id {
         None => "(COALESCE(i.base_affinity, 0) + COALESCE(i.race_affinity, 0))".to_string(),
         Some(p_val) => {
@@ -21,7 +21,7 @@ fn get_affinity_expression(player_chara_id: Option<i32>) -> String {
     }
 }
 
-fn add_main_parent_spark_conditions<'a>(
+fn addMainParentSparkConditions<'a>(
     query_builder: &mut QueryBuilder<'a, Postgres>,
     column: &str,
     sparks: &[i32],
@@ -68,7 +68,7 @@ fn add_main_parent_spark_conditions<'a>(
     query_builder.push(")");
 }
 
-fn add_spark_range_conditions<'a>(
+fn addSparkRangeConditions<'a>(
     query_builder: &mut QueryBuilder<'a, Postgres>,
     column: &str,
     sparks: &[i32],
@@ -129,7 +129,7 @@ fn add_spark_range_conditions<'a>(
     query_builder.push(")");
 }
 
-fn add_9star_spark_conditions<'a>(
+fn add9starSparkConditions<'a>(
     query_builder: &mut QueryBuilder<'a, Postgres>,
     column: &str,
     desired_star: i32,
@@ -151,7 +151,7 @@ fn add_9star_spark_conditions<'a>(
     query_builder.push("]::int[]");
 }
 
-fn process_spark_groups(groups: &[String]) -> Vec<Vec<i32>> {
+fn processSparkGroups(groups: &[String]) -> Vec<Vec<i32>> {
     groups
         .iter()
         .map(|s| {
@@ -163,7 +163,7 @@ fn process_spark_groups(groups: &[String]) -> Vec<Vec<i32>> {
         .collect()
 }
 
-fn add_multi_group_spark_conditions<'a>(
+fn addMultiGroupSparkConditions<'a>(
     query_builder: &mut QueryBuilder<'a, Postgres>,
     column: &str,
     groups: &[Vec<i32>],
@@ -173,13 +173,13 @@ fn add_multi_group_spark_conditions<'a>(
     }
 
     if groups.len() == 1 {
-        add_spark_range_conditions(query_builder, column, &groups[0]);
+        addSparkRangeConditions(query_builder, column, &groups[0]);
         return;
     }
 
     let mut group_values: Vec<Vec<i32>> = Vec::new();
     for group in groups {
-        let values = expand_spark_group(group);
+        let values = expandSparkGroup(group);
         group_values.push(values);
     }
 
@@ -316,7 +316,7 @@ fn add_multi_group_spark_conditions<'a>(
     }
 }
 
-fn expand_spark_group(sparks: &[i32]) -> Vec<i32> {
+fn expandSparkGroup(sparks: &[i32]) -> Vec<i32> {
     let mut result = Vec::new();
     let mut wildcard_levels = Vec::new();
 
@@ -344,11 +344,11 @@ fn expand_spark_group(sparks: &[i32]) -> Vec<i32> {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/search", get(unified_search))
-        .route("/count", get(get_unified_count))
+        .route("/search", get(unifiedSearch))
+        .route("/count", get(getUnifiedCount))
 }
 
-fn parse_search_params(query: &str) -> UnifiedSearchParams {
+fn parseSearchParams(query: &str) -> UnifiedSearchParams {
     let mut params_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
@@ -379,7 +379,7 @@ fn parse_search_params(query: &str) -> UnifiedSearchParams {
             .and_then(|s| s.parse().ok())
     };
 
-    let get_string =
+    let getString =
         |key: &str| -> Option<String> { params_map.get(key).and_then(|v| v.last()).cloned() };
 
     let get_vec = |key: &str| -> Vec<String> { params_map.get(key).cloned().unwrap_or_default() };
@@ -400,7 +400,7 @@ fn parse_search_params(query: &str) -> UnifiedSearchParams {
     UnifiedSearchParams {
         page: get_i64("page"),
         limit: get_i64("limit"),
-        search_type: get_string("search_type"),
+        search_type: getString("search_type"),
         main_parent_id: get_vec_i32("main_parent_id"),
         exclude_main_parent_id: get_vec_i32("exclude_main_parent_id"),
         parent_id: get_vec_i32("parent_id"),
@@ -448,11 +448,11 @@ fn parse_search_params(query: &str) -> UnifiedSearchParams {
         min_limit_break: get_i32("min_limit_break"),
         max_limit_break: get_i32("max_limit_break"),
         min_experience: get_i32("min_experience"),
-        trainer_id: get_string("trainer_id"),
-        trainer_name: get_string("trainer_name"),
+        trainer_id: getString("trainer_id"),
+        trainer_name: getString("trainer_name"),
         max_follower_num: get_i32("max_follower_num"),
-        sort_by: get_string("sort_by"),
-        sort_order: get_string("sort_order"),
+        sort_by: getString("sort_by"),
+        sort_order: getString("sort_order"),
         main_win_saddle: get_vec_i32("main_win_saddle"),
         player_chara_id: get_i32("player_chara_id"),
         player_chara_id_2: get_i32("player_chara_id_2"),
@@ -467,12 +467,12 @@ fn parse_search_params(query: &str) -> UnifiedSearchParams {
     }
 }
 
-pub async fn unified_search(
+pub async fn unifiedSearch(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Result<Json<SearchResponse<UnifiedAccountRecord>>> {
     let query_string = request.uri().query().unwrap_or("");
-    let mut params = parse_search_params(query_string);
+    let mut params = parseSearchParams(query_string);
 
     // Normalize max_follower_num: None means "< 1000" which is equivalent to "<= 999"
     // This ensures cache keys are consistent regardless of how the default is expressed
@@ -629,8 +629,8 @@ pub async fn unified_search(
                 query_string
             );
             let pg_t = std::time::Instant::now();
-            let total_count = execute_count_query(&state, &params).await?;
-            let records = execute_search_query(&state, &params, limit, offset).await?;
+            let total_count = executeCountQuery(&state, &params).await?;
+            let records = executeSearchQuery(&state, &params, limit, offset).await?;
             let pg_ms = pg_t.elapsed().as_millis();
 
             if pg_ms >= 150 {
@@ -679,7 +679,7 @@ pub async fn unified_search(
     Ok(Json(response))
 }
 
-async fn execute_search_query(
+async fn executeSearchQuery(
     state: &AppState,
     params: &UnifiedSearchParams,
     limit: i64,
@@ -697,7 +697,7 @@ async fn execute_search_query(
     // Use desired_main_chara_id for affinity calculation if provided, otherwise use player_chara_id
     // This allows filtering by main character AND calculating affinity for that character
     let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
-    let affinity_expr = get_affinity_expression(affinity_player_id);
+    let affinity_expr = getAffinityExpression(affinity_player_id);
 
     query_builder.push(
         r#"
@@ -953,56 +953,56 @@ async fn execute_search_query(
     }
 
     // Add spark filters (multi-group AND logic)
-    let blue_sparks_groups = process_spark_groups(&params.blue_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.blue_sparks", &blue_sparks_groups);
+    let blue_sparks_groups = processSparkGroups(&params.blue_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.blue_sparks", &blue_sparks_groups);
 
-    let pink_sparks_groups = process_spark_groups(&params.pink_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.pink_sparks", &pink_sparks_groups);
+    let pink_sparks_groups = processSparkGroups(&params.pink_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.pink_sparks", &pink_sparks_groups);
 
-    let green_sparks_groups = process_spark_groups(&params.green_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.green_sparks", &green_sparks_groups);
+    let green_sparks_groups = processSparkGroups(&params.green_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.green_sparks", &green_sparks_groups);
 
-    let white_sparks_groups = process_spark_groups(&params.white_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.white_sparks", &white_sparks_groups);
+    let white_sparks_groups = processSparkGroups(&params.white_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.white_sparks", &white_sparks_groups);
 
     // Add 9-star spark filters (search across all stat types)
     if let Some(true) = params.blue_sparks_9star {
-        add_9star_spark_conditions(&mut query_builder, "i.blue_sparks", 9);
+        add9starSparkConditions(&mut query_builder, "i.blue_sparks", 9);
     }
 
     if let Some(true) = params.pink_sparks_9star {
-        add_9star_spark_conditions(&mut query_builder, "i.pink_sparks", 9);
+        add9starSparkConditions(&mut query_builder, "i.pink_sparks", 9);
     }
 
     if let Some(true) = params.green_sparks_9star {
-        add_9star_spark_conditions(&mut query_builder, "i.green_sparks", 9);
+        add9starSparkConditions(&mut query_builder, "i.green_sparks", 9);
     }
 
     // Add main parent spark filters
-    let main_parent_blue_groups = process_spark_groups(&params.main_parent_blue_sparks);
+    let main_parent_blue_groups = processSparkGroups(&params.main_parent_blue_sparks);
     for group in main_parent_blue_groups {
-        add_main_parent_spark_conditions(&mut query_builder, "i.main_blue_factors", &group);
+        addMainParentSparkConditions(&mut query_builder, "i.main_blue_factors", &group);
     }
 
-    let main_parent_pink_groups = process_spark_groups(&params.main_parent_pink_sparks);
+    let main_parent_pink_groups = processSparkGroups(&params.main_parent_pink_sparks);
     for group in main_parent_pink_groups {
-        add_main_parent_spark_conditions(&mut query_builder, "i.main_pink_factors", &group);
+        addMainParentSparkConditions(&mut query_builder, "i.main_pink_factors", &group);
     }
 
-    let main_parent_green_groups = process_spark_groups(&params.main_parent_green_sparks);
+    let main_parent_green_groups = processSparkGroups(&params.main_parent_green_sparks);
     for group in main_parent_green_groups {
-        add_main_parent_spark_conditions(&mut query_builder, "i.main_green_factors", &group);
+        addMainParentSparkConditions(&mut query_builder, "i.main_green_factors", &group);
     }
 
     // main_parent_white_sparks - REQUIRED filter for main parent's white factors
-    let main_parent_white_groups = process_spark_groups(&params.main_parent_white_sparks);
+    let main_parent_white_groups = processSparkGroups(&params.main_parent_white_sparks);
     if !main_parent_white_groups.is_empty() {
         tracing::debug!(
             "🔍 MAIN_PARENT_WHITE_SPARKS filter (SEARCH): {:?}",
             main_parent_white_groups
         );
     }
-    add_multi_group_spark_conditions(
+    addMultiGroupSparkConditions(
         &mut query_builder,
         "i.main_white_factors",
         &main_parent_white_groups,
@@ -1072,8 +1072,8 @@ async fn execute_search_query(
     }
 
     // main_white_factors - REQUIRED filter for specific white factors on main parent (SEARCH)
-    let main_white_factors_groups = process_spark_groups(&params.main_white_factors);
-    add_multi_group_spark_conditions(
+    let main_white_factors_groups = processSparkGroups(&params.main_white_factors);
+    addMultiGroupSparkConditions(
         &mut query_builder,
         "i.main_white_factors",
         &main_white_factors_groups,
@@ -1191,7 +1191,7 @@ async fn execute_search_query(
             // Affinity-based sorting - uses expression index
             // Use desired_main_chara_id for affinity if provided
             let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
-            let affinity_expr = get_affinity_expression(affinity_player_id);
+            let affinity_expr = getAffinityExpression(affinity_player_id);
             if has_optional_scoring {
                 // Optional scoring takes priority, then affinity as tiebreaker
                 format!(
@@ -1366,7 +1366,7 @@ async fn execute_search_query(
             // Default: use affinity ordering for best results
             // Use desired_main_chara_id for affinity if provided
             let affinity_player_id = params.desired_main_chara_id.or(params.player_chara_id);
-            let affinity_expr = get_affinity_expression(affinity_player_id);
+            let affinity_expr = getAffinityExpression(affinity_player_id);
             if has_optional_scoring {
                 format!(
                     " ORDER BY {} DESC, {} {}",
@@ -1497,7 +1497,7 @@ async fn execute_search_query(
     Ok(records)
 }
 
-async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> Result<i64> {
+async fn executeCountQuery(state: &AppState, params: &UnifiedSearchParams) -> Result<i64> {
     // For blank queries with no filters, use approximate count from stats table
     let is_blank_query = params.trainer_id.is_none()
         && params.trainer_name.is_none()
@@ -1775,50 +1775,50 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
     }
 
     // Add spark filters (multi-group AND logic)
-    let blue_sparks_groups = process_spark_groups(&params.blue_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.blue_sparks", &blue_sparks_groups);
+    let blue_sparks_groups = processSparkGroups(&params.blue_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.blue_sparks", &blue_sparks_groups);
 
-    let pink_sparks_groups = process_spark_groups(&params.pink_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.pink_sparks", &pink_sparks_groups);
+    let pink_sparks_groups = processSparkGroups(&params.pink_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.pink_sparks", &pink_sparks_groups);
 
-    let green_sparks_groups = process_spark_groups(&params.green_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.green_sparks", &green_sparks_groups);
+    let green_sparks_groups = processSparkGroups(&params.green_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.green_sparks", &green_sparks_groups);
 
-    let white_sparks_groups = process_spark_groups(&params.white_sparks);
-    add_multi_group_spark_conditions(&mut query_builder, "i.white_sparks", &white_sparks_groups);
+    let white_sparks_groups = processSparkGroups(&params.white_sparks);
+    addMultiGroupSparkConditions(&mut query_builder, "i.white_sparks", &white_sparks_groups);
 
     // Add 9-star spark filters (search across all stat types)
     if let Some(true) = params.blue_sparks_9star {
-        add_9star_spark_conditions(&mut query_builder, "i.blue_sparks", 9);
+        add9starSparkConditions(&mut query_builder, "i.blue_sparks", 9);
     }
 
     if let Some(true) = params.pink_sparks_9star {
-        add_9star_spark_conditions(&mut query_builder, "i.pink_sparks", 9);
+        add9starSparkConditions(&mut query_builder, "i.pink_sparks", 9);
     }
 
     if let Some(true) = params.green_sparks_9star {
-        add_9star_spark_conditions(&mut query_builder, "i.green_sparks", 9);
+        add9starSparkConditions(&mut query_builder, "i.green_sparks", 9);
     }
 
     // Add main parent spark filters
-    let main_parent_blue_groups = process_spark_groups(&params.main_parent_blue_sparks);
+    let main_parent_blue_groups = processSparkGroups(&params.main_parent_blue_sparks);
     for group in main_parent_blue_groups {
-        add_main_parent_spark_conditions(&mut query_builder, "i.main_blue_factors", &group);
+        addMainParentSparkConditions(&mut query_builder, "i.main_blue_factors", &group);
     }
 
-    let main_parent_pink_groups = process_spark_groups(&params.main_parent_pink_sparks);
+    let main_parent_pink_groups = processSparkGroups(&params.main_parent_pink_sparks);
     for group in main_parent_pink_groups {
-        add_main_parent_spark_conditions(&mut query_builder, "i.main_pink_factors", &group);
+        addMainParentSparkConditions(&mut query_builder, "i.main_pink_factors", &group);
     }
 
-    let main_parent_green_groups = process_spark_groups(&params.main_parent_green_sparks);
+    let main_parent_green_groups = processSparkGroups(&params.main_parent_green_sparks);
     for group in main_parent_green_groups {
-        add_main_parent_spark_conditions(&mut query_builder, "i.main_green_factors", &group);
+        addMainParentSparkConditions(&mut query_builder, "i.main_green_factors", &group);
     }
 
     // main_parent_white_sparks - REQUIRED filter for main parent's white factors (COUNT)
-    let main_parent_white_groups = process_spark_groups(&params.main_parent_white_sparks);
-    add_multi_group_spark_conditions(
+    let main_parent_white_groups = processSparkGroups(&params.main_parent_white_sparks);
+    addMultiGroupSparkConditions(
         &mut query_builder,
         "i.main_white_factors",
         &main_parent_white_groups,
@@ -1888,8 +1888,8 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
     }
 
     // main_white_factors - REQUIRED filter for specific white factors on main parent (COUNT)
-    let main_white_factors_groups = process_spark_groups(&params.main_white_factors);
-    add_multi_group_spark_conditions(
+    let main_white_factors_groups = processSparkGroups(&params.main_white_factors);
+    addMultiGroupSparkConditions(
         &mut query_builder,
         "i.main_white_factors",
         &main_white_factors_groups,
@@ -2015,7 +2015,7 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
     Ok(count)
 }
 
-pub async fn get_unified_count(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+pub async fn getUnifiedCount(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let total_inheritance_count = sqlx::query("SELECT COUNT(*) FROM inheritance")
         .fetch_one(&state.db)
         .await?

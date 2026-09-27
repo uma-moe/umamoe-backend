@@ -8,14 +8,14 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::borrow_key;
-use crate::club_rank::{monthly_club_rank_joins, monthly_club_rank_selects};
+use crate::club_rank::{monthlyClubRankJoins, monthlyClubRankSelects};
 use crate::errors::AppError;
 use crate::middleware::auth::AuthenticatedUser;
-use crate::models::profile::{
+pub use crate::types::profile::{
     BorrowStats, CircleHistoryEntry, CircleInfo, FanHistory, ProfileResponse, ProfileVisibility,
     TeamStadiumMember, TrainerInfo, VeteranCharacter,
 };
-use crate::models::{
+pub use crate::types::{
     Inheritance, SupportCard, UserFanRankingAlltime, UserFanRankingGains, UserFanRankingMonthly,
     INHERITANCE_SELECT_COLUMNS, SUPPORT_CARD_SELECT_COLUMNS,
 };
@@ -23,26 +23,26 @@ use crate::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/veterans/:veteran_id", get(get_veteran))
-        .route("/:account_id", get(get_profile))
+        .route("/veterans/:veteran_id", get(getVeteran))
+        .route("/:account_id", get(getProfile))
         .route(
             "/:account_id/visibility",
-            get(get_visibility).put(update_visibility),
+            get(getVisibility).put(updateVisibility),
         )
         .route(
             "/:account_id/veterans/:trained_chara_id/pin",
-            put(pin_veteran).delete(unpin_veteran),
+            put(pinVeteran).delete(unpinVeteran),
         )
 }
 
 /// GET /api/v4/user/profile/:account_id — single call returning everything for a user profile
-async fn get_profile(
+async fn getProfile(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
     auth_user: Option<AuthenticatedUser>,
 ) -> Result<Json<ProfileResponse>, AppError> {
-    let is_owner = check_is_owner(&state.db, auth_user.as_ref(), &account_id).await?;
-    let visibility = get_privacy_settings(&state.db, &account_id).await?;
+    let is_owner = checkIsOwner(&state.db, auth_user.as_ref(), &account_id).await?;
+    let visibility = getPrivacySettings(&state.db, &account_id).await?;
 
     if visibility.profile_hidden && !is_owner {
         return Err(AppError::Forbidden("This profile is hidden".into()));
@@ -164,8 +164,8 @@ async fn get_profile(
     .await?;
 
     // 4) Fan history — monthly rankings (graceful fallback if views have old schema)
-    let club_rank_joins = monthly_club_rank_joins("r");
-    let (club_rank_expr, club_rank_name_expr) = monthly_club_rank_selects("r");
+    let club_rank_joins = monthlyClubRankJoins("r");
+    let (club_rank_expr, club_rank_name_expr) = monthlyClubRankSelects("r");
     let monthly_sql = format!(
         r#"
          SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score,
@@ -248,7 +248,7 @@ async fn get_profile(
     let support_card_experience = support_card
         .as_ref()
         .map(|support_card| support_card.experience);
-    let borrow_key = borrow_key::key_from_profile(inheritance.as_ref(), support_card.as_ref());
+    let borrow_key = borrow_key::keyFromProfile(inheritance.as_ref(), support_card.as_ref());
     let borrow_stats = sqlx::query_as::<_, BorrowStats>(
         r#"
         WITH matched AS (
@@ -312,7 +312,7 @@ async fn get_profile(
     .await?;
 
     // 10) Veteran characters with pinned status
-    let veteran_sql = veteran_select_sql(
+    let veteran_sql = veteranSelectSql(
         "vc.account_id = $1",
         "ORDER BY is_pinned DESC, vc.rank_score DESC NULLS LAST",
     );
@@ -377,20 +377,20 @@ async fn get_profile(
 }
 
 /// GET /api/v4/user/profile/veterans/:veteran_id — lightweight veteran payload for sharing
-async fn get_veteran(
+async fn getVeteran(
     State(state): State<AppState>,
     Path(veteran_id): Path<Uuid>,
     auth_user: Option<AuthenticatedUser>,
 ) -> Result<Json<VeteranCharacter>, AppError> {
-    let veteran_sql = veteran_select_sql("vc.id = $1", "");
+    let veteran_sql = veteranSelectSql("vc.id = $1", "");
     let veteran = sqlx::query_as::<_, VeteranCharacter>(&veteran_sql)
         .bind(veteran_id)
         .fetch_optional(&state.db)
         .await?
         .ok_or_else(|| AppError::NotFound("Veteran not found".into()))?;
 
-    let is_owner = check_is_owner(&state.db, auth_user.as_ref(), &veteran.account_id).await?;
-    let visibility = get_privacy_settings(&state.db, &veteran.account_id).await?;
+    let is_owner = checkIsOwner(&state.db, auth_user.as_ref(), &veteran.account_id).await?;
+    let visibility = getPrivacySettings(&state.db, &veteran.account_id).await?;
     if !is_owner && visibility.profile_hidden {
         return Err(AppError::Forbidden("This profile is hidden".into()));
     }
@@ -404,22 +404,22 @@ async fn get_veteran(
 }
 
 /// GET /api/v4/user/profile/:account_id/visibility
-async fn get_visibility(
+async fn getVisibility(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
 ) -> Result<Json<ProfileVisibility>, AppError> {
-    let vis = get_privacy_settings(&state.db, &account_id).await?;
+    let vis = getPrivacySettings(&state.db, &account_id).await?;
     Ok(Json(vis))
 }
 
 /// PUT /api/v4/user/profile/:account_id/visibility
-async fn update_visibility(
+async fn updateVisibility(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
     auth_user: AuthenticatedUser,
     Json(body): Json<ProfileVisibility>,
 ) -> Result<Json<ProfileVisibility>, AppError> {
-    let is_owner = check_is_owner(&state.db, Some(&auth_user), &account_id).await?;
+    let is_owner = checkIsOwner(&state.db, Some(&auth_user), &account_id).await?;
     if !is_owner {
         return Err(AppError::Forbidden(
             "You don't have permission to edit this profile".into(),
@@ -444,12 +444,12 @@ async fn update_visibility(
 }
 
 /// PUT /api/v4/user/profile/:account_id/veterans/:trained_chara_id/pin
-async fn pin_veteran(
+async fn pinVeteran(
     State(state): State<AppState>,
     Path((account_id, trained_chara_id)): Path<(String, i64)>,
     auth_user: AuthenticatedUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let is_owner = check_is_owner(&state.db, Some(&auth_user), &account_id).await?;
+    let is_owner = checkIsOwner(&state.db, Some(&auth_user), &account_id).await?;
     if !is_owner {
         return Err(AppError::Forbidden(
             "You don't have permission to pin veterans on this profile".into(),
@@ -470,12 +470,12 @@ async fn pin_veteran(
 }
 
 /// DELETE /api/v4/user/profile/:account_id/veterans/:trained_chara_id/pin
-async fn unpin_veteran(
+async fn unpinVeteran(
     State(state): State<AppState>,
     Path((account_id, trained_chara_id)): Path<(String, i64)>,
     auth_user: AuthenticatedUser,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let is_owner = check_is_owner(&state.db, Some(&auth_user), &account_id).await?;
+    let is_owner = checkIsOwner(&state.db, Some(&auth_user), &account_id).await?;
     if !is_owner {
         return Err(AppError::Forbidden(
             "You don't have permission to unpin veterans on this profile".into(),
@@ -493,7 +493,7 @@ async fn unpin_veteran(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn veteran_select_sql(where_clause: &str, order_clause: &str) -> String {
+fn veteranSelectSql(where_clause: &str, order_clause: &str) -> String {
     format!(
         r#"
         SELECT vc.id, vc.account_id, vc.trained_chara_id, vc.card_id, vc.scenario_id, vc.route_id,
@@ -519,7 +519,7 @@ fn veteran_select_sql(where_clause: &str, order_clause: &str) -> String {
     )
 }
 
-async fn get_privacy_settings(
+async fn getPrivacySettings(
     db: &sqlx::PgPool,
     account_id: &str,
 ) -> Result<ProfileVisibility, AppError> {
@@ -536,7 +536,7 @@ async fn get_privacy_settings(
     }))
 }
 
-async fn check_is_owner(
+async fn checkIsOwner(
     db: &sqlx::PgPool,
     auth_user: Option<&AuthenticatedUser>,
     account_id: &str,

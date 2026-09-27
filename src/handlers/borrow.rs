@@ -1,3 +1,4 @@
+use crate::tasks::fixTaskSequence;
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
@@ -14,14 +15,12 @@ use tokio::sync::Semaphore;
 
 use crate::borrow_key;
 use crate::errors::AppError;
-use crate::middleware::turnstile::require_turnstile_browser_proof;
+use crate::middleware::turnstile::requireTurnstileBrowserProof;
 use crate::AppState;
 
-const MAX_BORROW_VIEW_BATCH_SIZE: usize = 100;
-const BORROW_VIEW_DB_CONCURRENCY: usize = 2;
-static BORROW_VIEW_DB_SLOTS: Semaphore = Semaphore::const_new(BORROW_VIEW_DB_CONCURRENCY);
+include!("../types/handlers/borrow.rs");
 
-fn shed_borrow_view_batch(submitted_count: usize) -> Json<serde_json::Value> {
+fn shedBorrowViewBatch(submitted_count: usize) -> Json<serde_json::Value> {
     Json(json!({
         "success": true,
         "submitted_count": submitted_count,
@@ -32,22 +31,8 @@ fn shed_borrow_view_batch(submitted_count: usize) -> Json<serde_json::Value> {
     }))
 }
 
-async fn fix_task_sequence(pool: &PgPool) {
-    let _ = sqlx::query(
-        "SELECT setval(pg_get_serial_sequence('tasks','id'), COALESCE((SELECT MAX(id) FROM tasks),0)+1, false)",
-    )
-    .execute(pool)
-    .await;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BorrowInteraction {
-    View,
-    Copy,
-}
-
 impl BorrowInteraction {
-    fn from_path(value: &str) -> Option<Self> {
+    fn fromPath(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "view" | "views" => Some(Self::View),
             "copy" | "copied" | "copies" => Some(Self::Copy),
@@ -55,7 +40,7 @@ impl BorrowInteraction {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    fn asStr(self) -> &'static str {
         match self {
             Self::View => "view",
             Self::Copy => "copy",
@@ -63,53 +48,10 @@ impl BorrowInteraction {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct BorrowInteractionPayload {
-    borrow_key: Option<String>,
-    inheritance_id: Option<i64>,
-    support_card_id: Option<i32>,
-    support_card_limit_break: Option<i32>,
-    support_card_experience: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BorrowViewBatchPayload {
-    views: Vec<BorrowViewPayload>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BorrowViewPayload {
-    trainer_id: String,
-    borrow_key: Option<String>,
-    inheritance_id: Option<i64>,
-    support_card_id: Option<i32>,
-    support_card_limit_break: Option<i32>,
-    support_card_experience: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-struct BorrowViewBatchRow {
-    trainer_id: String,
-    borrow_key: String,
-    inheritance_id: i64,
-    support_card_id: i32,
-    support_card_limit_break: Option<i32>,
-    support_card_experience: Option<i32>,
-}
-
-#[derive(Clone, Debug)]
-struct BorrowContext {
-    borrow_key: String,
-    inheritance_id: i64,
-    support_card_id: i32,
-    support_card_limit_break: Option<i32>,
-    support_card_experience: Option<i32>,
-}
-
 impl BorrowContext {
-    fn from_payload(payload: Option<BorrowInteractionPayload>) -> Self {
+    fn fromPayload(payload: Option<BorrowInteractionPayload>) -> Self {
         let payload = payload.unwrap_or_default();
-        Self::from_parts(
+        Self::fromParts(
             payload.borrow_key,
             payload.inheritance_id,
             payload.support_card_id,
@@ -118,7 +60,7 @@ impl BorrowContext {
         )
     }
 
-    fn from_parts(
+    fn fromParts(
         borrow_key: Option<String>,
         inheritance_id: Option<i64>,
         support_card_id: Option<i32>,
@@ -128,7 +70,7 @@ impl BorrowContext {
         let inheritance_id = inheritance_id.unwrap_or(0).max(0);
         let support_card_id = support_card_id.unwrap_or(0).max(0);
         Self {
-            borrow_key: borrow_key::normalize_borrow_key(
+            borrow_key: borrow_key::normalizeBorrowKey(
                 borrow_key.as_deref(),
                 inheritance_id,
                 support_card_id,
@@ -141,28 +83,15 @@ impl BorrowContext {
     }
 }
 
-#[derive(Debug)]
-struct BorrowCounts {
-    view_count: i64,
-    copy_count: i64,
-    theoretical_copy_count: i32,
-}
-
-#[derive(Clone, Debug)]
-struct BorrowActor {
-    hash: String,
-    bucket_start: chrono::DateTime<Utc>,
-}
-
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/views", post(track_borrow_view_batch))
-        .route("/track-copy/:trainer_id", post(track_trainer_copy))
-        .route("/trainer/:trainer_id/status", get(get_trainer_status))
-        .route("/:trainer_id/:interaction", post(track_borrow_interaction))
+        .route("/views", post(trackBorrowViewBatch))
+        .route("/track-copy/:trainer_id", post(trackTrainerCopy))
+        .route("/trainer/:trainer_id/status", get(getTrainerStatus))
+        .route("/:trainer_id/:interaction", post(trackBorrowInteraction))
 }
 
-async fn track_borrow_view_batch(
+async fn trackBorrowViewBatch(
     State(state): State<AppState>,
     headers: HeaderMap,
     AxumJson(payload): AxumJson<BorrowViewBatchPayload>,
@@ -186,8 +115,8 @@ async fn track_borrow_view_batch(
 
     let mut rows = Vec::with_capacity(payload.views.len());
     for view in payload.views {
-        let trainer_id = validate_trainer_id(&view.trainer_id)?.to_string();
-        let context = BorrowContext::from_parts(
+        let trainer_id = validateTrainerId(&view.trainer_id)?.to_string();
+        let context = BorrowContext::fromParts(
             view.borrow_key,
             view.inheritance_id,
             view.support_card_id,
@@ -209,14 +138,14 @@ async fn track_borrow_view_batch(
         tracing::error!("Failed to encode borrow view batch: {}", error);
         AppError::DatabaseError("Failed to track borrow views".to_string())
     })?;
-    let actor = require_borrow_browser_actor(&state, &headers).await?;
+    let actor = requireBorrowBrowserActor(&state, &headers).await?;
     let Ok(_view_slot) = BORROW_VIEW_DB_SLOTS.try_acquire() else {
         tracing::debug!(submitted_count, "Load-shedding borrow view batch");
-        return Ok(shed_borrow_view_batch(submitted_count));
+        return Ok(shedBorrowViewBatch(submitted_count));
     };
     let Some(mut conn) = state.db.try_acquire() else {
         tracing::debug!(submitted_count, "DB pool busy; dropping borrow view batch");
-        return Ok(shed_borrow_view_batch(submitted_count));
+        return Ok(shedBorrowViewBatch(submitted_count));
     };
 
     let (received_count, accepted_count, duplicate_count) = sqlx::query_as::<_, (i64, i64, i64)>(
@@ -347,52 +276,52 @@ async fn track_borrow_view_batch(
     })))
 }
 
-async fn track_borrow_interaction(
+async fn trackBorrowInteraction(
     State(state): State<AppState>,
     Path((trainer_id, interaction)): Path<(String, String)>,
     headers: HeaderMap,
     payload: Option<AxumJson<BorrowInteractionPayload>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let Some(action) = BorrowInteraction::from_path(&interaction) else {
+    let Some(action) = BorrowInteraction::fromPath(&interaction) else {
         return Err(AppError::BadRequest(
             "Invalid borrow interaction type".to_string(),
         ));
     };
 
-    track_borrow(
+    trackBorrow(
         &state,
         &trainer_id,
-        BorrowContext::from_payload(payload.map(|AxumJson(payload)| payload)),
+        BorrowContext::fromPayload(payload.map(|AxumJson(payload)| payload)),
         action,
         &headers,
     )
     .await
 }
 
-async fn track_trainer_copy(
+async fn trackTrainerCopy(
     State(state): State<AppState>,
     Path(trainer_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    track_borrow(
+    trackBorrow(
         &state,
         &trainer_id,
-        BorrowContext::from_payload(None),
+        BorrowContext::fromPayload(None),
         BorrowInteraction::Copy,
         &headers,
     )
     .await
 }
 
-async fn track_borrow(
+async fn trackBorrow(
     state: &AppState,
     trainer_id: &str,
     context: BorrowContext,
     action: BorrowInteraction,
     headers: &HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let trainer_id = validate_trainer_id(trainer_id)?;
-    let actor = require_borrow_browser_actor(state, headers).await?;
+    let trainer_id = validateTrainerId(trainer_id)?;
+    let actor = requireBorrowBrowserActor(state, headers).await?;
     let _view_slot = if action == BorrowInteraction::View {
         match BORROW_VIEW_DB_SLOTS.try_acquire() {
             Ok(permit) if state.db.num_idle() > 0 => Some(permit),
@@ -405,7 +334,7 @@ async fn track_borrow(
                     "borrow_key": &context.borrow_key,
                     "inheritance_id": context.inheritance_id,
                     "support_card_id": context.support_card_id,
-                    "action": action.as_str(),
+                    "action": action.asStr(),
                     "total_count": 0,
                     "view_count": 0,
                     "copy_count": 0,
@@ -434,7 +363,7 @@ async fn track_borrow(
     .bind(&context.borrow_key)
     .bind(context.inheritance_id)
     .bind(context.support_card_id)
-    .bind(action.as_str())
+    .bind(action.asStr())
     .bind(&actor.hash)
     .bind(actor.bucket_start)
     .fetch_optional(&state.db)
@@ -459,7 +388,7 @@ async fn track_borrow(
         )
         .bind(trainer_id)
         .bind(&context.borrow_key)
-        .bind(action.as_str())
+        .bind(action.asStr())
         .bind(&actor.hash)
         .bind(actor.bucket_start)
         .execute(&state.db)
@@ -472,8 +401,8 @@ async fn track_borrow(
             AppError::DatabaseError("Failed to track borrow interaction".to_string())
         })?;
 
-        let counts = borrow_counts(&state.db, trainer_id, &context).await?;
-        let total_count = borrow_total_for_action(action, &counts);
+        let counts = borrowCounts(&state.db, trainer_id, &context).await?;
+        let total_count = borrowTotalForAction(action, &counts);
         return Ok(Json(json!({
             "success": true,
             "accepted": false,
@@ -481,7 +410,7 @@ async fn track_borrow(
             "borrow_key": &context.borrow_key,
             "inheritance_id": context.inheritance_id,
             "support_card_id": context.support_card_id,
-            "action": action.as_str(),
+            "action": action.asStr(),
             "total_count": total_count,
             "view_count": counts.view_count,
             "copy_count": counts.copy_count,
@@ -490,19 +419,19 @@ async fn track_borrow(
         })));
     }
 
-    let counts = increment_borrow_total(&state.db, trainer_id, &context, action).await?;
+    let counts = incrementBorrowTotal(&state.db, trainer_id, &context, action).await?;
     let task_created = if action == BorrowInteraction::Copy {
-        sync_legacy_copy_counter(&state.db, trainer_id).await?;
-        maybe_create_full_follower_recheck(&state.db, trainer_id, &context, &counts).await?
+        syncLegacyCopyCounter(&state.db, trainer_id).await?;
+        maybeCreateFullFollowerRecheck(&state.db, trainer_id, &context, &counts).await?
     } else {
         false
     };
     let counts = if action == BorrowInteraction::Copy {
-        borrow_counts(&state.db, trainer_id, &context).await?
+        borrowCounts(&state.db, trainer_id, &context).await?
     } else {
         counts
     };
-    let total_count = borrow_total_for_action(action, &counts);
+    let total_count = borrowTotalForAction(action, &counts);
 
     Ok(Json(json!({
         "success": true,
@@ -511,7 +440,7 @@ async fn track_borrow(
         "borrow_key": &context.borrow_key,
         "inheritance_id": context.inheritance_id,
         "support_card_id": context.support_card_id,
-        "action": action.as_str(),
+        "action": action.asStr(),
         "total_count": total_count,
         "view_count": counts.view_count,
         "copy_count": counts.copy_count,
@@ -520,14 +449,14 @@ async fn track_borrow(
     })))
 }
 
-fn borrow_total_for_action(action: BorrowInteraction, counts: &BorrowCounts) -> i64 {
+fn borrowTotalForAction(action: BorrowInteraction, counts: &BorrowCounts) -> i64 {
     match action {
         BorrowInteraction::View => counts.view_count,
         BorrowInteraction::Copy => counts.copy_count,
     }
 }
 
-async fn increment_borrow_total(
+async fn incrementBorrowTotal(
     pool: &PgPool,
     trainer_id: &str,
     context: &BorrowContext,
@@ -601,7 +530,7 @@ async fn increment_borrow_total(
             AppError::DatabaseError("Failed to track borrow interaction".to_string())
         })?;
 
-    increment_borrow_trend(&mut tx, trainer_id, context, action).await?;
+    incrementBorrowTrend(&mut tx, trainer_id, context, action).await?;
 
     tx.commit().await.map_err(|error| {
         tracing::error!("Failed to commit borrow total transaction: {}", error);
@@ -611,7 +540,7 @@ async fn increment_borrow_total(
     Ok(counts)
 }
 
-async fn increment_borrow_trend(
+async fn incrementBorrowTrend(
     tx: &mut Transaction<'_, Postgres>,
     trainer_id: &str,
     context: &BorrowContext,
@@ -657,7 +586,7 @@ async fn increment_borrow_trend(
     })
 }
 
-async fn borrow_counts(
+async fn borrowCounts(
     pool: &PgPool,
     trainer_id: &str,
     context: &BorrowContext,
@@ -694,10 +623,7 @@ async fn borrow_counts(
     })
 }
 
-async fn trainer_borrow_counts(
-    pool: &PgPool,
-    trainer_id: &str,
-) -> Result<(i64, i64, i64), AppError> {
+async fn trainerBorrowCounts(pool: &PgPool, trainer_id: &str) -> Result<(i64, i64, i64), AppError> {
     sqlx::query_as::<_, (i64, i64, i64)>(
         r#"
         SELECT
@@ -717,7 +643,7 @@ async fn trainer_borrow_counts(
     })
 }
 
-async fn sync_legacy_copy_counter(pool: &PgPool, trainer_id: &str) -> Result<(), AppError> {
+async fn syncLegacyCopyCounter(pool: &PgPool, trainer_id: &str) -> Result<(), AppError> {
     let copy_count = sqlx::query_scalar::<_, i64>(
         "SELECT COALESCE(SUM(copy_count), 0)::bigint FROM borrow_interaction_totals_v2 WHERE trainer_id = $1",
     )
@@ -749,7 +675,7 @@ async fn sync_legacy_copy_counter(pool: &PgPool, trainer_id: &str) -> Result<(),
     })
 }
 
-async fn maybe_create_full_follower_recheck(
+async fn maybeCreateFullFollowerRecheck(
     pool: &PgPool,
     trainer_id: &str,
     context: &BorrowContext,
@@ -805,7 +731,7 @@ async fn maybe_create_full_follower_recheck(
     let task_created = match insert().execute(pool).await {
         Ok(result) => result.rows_affected() > 0,
         Err(_) => {
-            fix_task_sequence(pool).await;
+            fixTaskSequence(pool).await;
             insert()
                 .execute(pool)
                 .await
@@ -817,11 +743,11 @@ async fn maybe_create_full_follower_recheck(
         }
     };
 
-    reset_theoretical_copy_count(pool, trainer_id, context, follower_num, task_created).await?;
+    resetTheoreticalCopyCount(pool, trainer_id, context, follower_num, task_created).await?;
     Ok(task_created)
 }
 
-async fn reset_theoretical_copy_count(
+async fn resetTheoreticalCopyCount(
     pool: &PgPool,
     trainer_id: &str,
     context: &BorrowContext,
@@ -853,7 +779,7 @@ async fn reset_theoretical_copy_count(
     })
 }
 
-fn validate_trainer_id(trainer_id: &str) -> Result<&str, AppError> {
+fn validateTrainerId(trainer_id: &str) -> Result<&str, AppError> {
     let trainer_id = trainer_id.trim();
     if trainer_id.is_empty()
         || !trainer_id.chars().all(|c| c.is_ascii_digit())
@@ -868,15 +794,15 @@ fn validate_trainer_id(trainer_id: &str) -> Result<&str, AppError> {
     Ok(trainer_id)
 }
 
-async fn require_borrow_browser_actor(
+async fn requireBorrowBrowserActor(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<BorrowActor, AppError> {
-    if has_api_key_header(headers) {
+    if hasApiKeyHeader(headers) {
         return Err(AppError::Forbidden("api_key_not_allowed".to_string()));
     }
 
-    let proof = require_turnstile_browser_proof(headers, state.redis_store.as_ref())
+    let proof = requireTurnstileBrowserProof(headers, state.redis_store.as_ref())
         .await
         .map_err(|error| match error {
             "browser_proof_unavailable" => {
@@ -884,8 +810,8 @@ async fn require_borrow_browser_actor(
             }
             other => AppError::Forbidden(other.to_string()),
         })?;
-    let material = format!("browser-proof:{}:{}", proof.subject(), proof.proof_id());
-    let issued_at = i64::try_from(proof.issued_at()).unwrap_or(i64::MAX);
+    let material = format!("browser-proof:{}:{}", proof.subject(), proof.proofId());
+    let issued_at = i64::try_from(proof.issuedAt()).unwrap_or(i64::MAX);
     let bucket_start = Utc
         .timestamp_opt(issued_at, 0)
         .single()
@@ -897,25 +823,25 @@ async fn require_borrow_browser_actor(
     })
 }
 
-fn has_api_key_header(headers: &HeaderMap) -> bool {
+fn hasApiKeyHeader(headers: &HeaderMap) -> bool {
     ["X-API-Key", "X-API-Token", "X-API-Tokens"]
         .iter()
         .any(|name| {
-            header_str(headers, name)
+            headerStr(headers, name)
                 .map(|value| !value.trim().is_empty())
                 .unwrap_or(false)
         })
 }
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+fn headerStr<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-async fn get_trainer_status(
+async fn getTrainerStatus(
     State(state): State<AppState>,
     Path(trainer_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let trainer_id = validate_trainer_id(&trainer_id)?;
+    let trainer_id = validateTrainerId(&trainer_id)?;
     let status = sqlx::query_as::<
         _,
         (
@@ -962,7 +888,7 @@ async fn get_trainer_status(
         })))
     } else {
         let (view_count, copy_count, theoretical_copy_count) =
-            trainer_borrow_counts(&state.db, trainer_id).await?;
+            trainerBorrowCounts(&state.db, trainer_id).await?;
         Ok(Json(json!({
             "trainer_id": trainer_id,
             "available": true,

@@ -12,10 +12,12 @@ __pycache__
 *.filepart
 trainers.dump.filepart
 
-account_id_analysis.py
-affinity.py
-affinity_test.py
-apply_affinity_migration.py
-checker.js
-
-docker-image.yml
+*.py
+*.js
+*.png
+*.csv
+affinity_migration.sql
+scripts
+reports
+docs
+.vscode

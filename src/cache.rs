@@ -3,29 +3,15 @@ use serde::Serialize;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Maximum number of cache entries before eviction kicks in
-const MAX_CACHE_ENTRIES: usize = 1000;
+include!("types/cache.rs");
 
-/// Global cache storage
-static CACHE: OnceLock<DashMap<String, CacheEntry>> = OnceLock::new();
-
-/// Cache entry with expiration and access tracking
-#[derive(Clone)]
-struct CacheEntry {
-    data: String,
-    expires_at: Instant,
-    last_accessed: Instant,
-    #[allow(dead_code)]
-    size_bytes: usize,
-}
-
-fn get_cache() -> &'static DashMap<String, CacheEntry> {
+fn getCache() -> &'static DashMap<String, CacheEntry> {
     CACHE.get_or_init(|| DashMap::new())
 }
 
 /// Get cached data if it exists and hasn't expired
 pub fn get<T: for<'de> serde::Deserialize<'de>>(key: &str) -> Option<T> {
-    let cache = get_cache();
+    let cache = getCache();
 
     if let Some(mut entry) = cache.get_mut(key) {
         // Check if expired
@@ -49,11 +35,11 @@ pub fn get<T: for<'de> serde::Deserialize<'de>>(key: &str) -> Option<T> {
 
 /// Set cached data with TTL (time to live)
 pub fn set<T: Serialize>(key: &str, data: &T, ttl: Duration) -> Result<(), serde_json::Error> {
-    let cache = get_cache();
+    let cache = getCache();
 
     // Evict old entries if cache is too large
     if cache.len() >= MAX_CACHE_ENTRIES {
-        evict_lru_entries();
+        evictLruEntries();
     }
 
     let json_data = serde_json::to_string(data)?;
@@ -73,8 +59,8 @@ pub fn set<T: Serialize>(key: &str, data: &T, ttl: Duration) -> Result<(), serde
 
 /// Evict least recently used entries to free up space
 /// Removes 20% of entries (sorted by last_accessed time)
-fn evict_lru_entries() {
-    let cache = get_cache();
+fn evictLruEntries() {
+    let cache = getCache();
     let current_size = cache.len();
     let target_remove = current_size / 5; // Remove 20%
 
@@ -106,8 +92,8 @@ fn evict_lru_entries() {
 
 /// Clear all expired cache entries
 #[allow(dead_code)]
-pub fn cleanup_expired() {
-    let cache = get_cache();
+pub fn cleanupExpired() {
+    let cache = getCache();
     let now = Instant::now();
 
     let before_count = cache.len();
@@ -122,21 +108,21 @@ pub fn cleanup_expired() {
 /// Clear specific cache key
 #[allow(dead_code)]
 pub fn invalidate(key: &str) {
-    let cache = get_cache();
+    let cache = getCache();
     cache.remove(key);
 }
 
 /// Clear all cache
 #[allow(dead_code)]
-pub fn clear_all() {
-    let cache = get_cache();
+pub fn clearAll() {
+    let cache = getCache();
     cache.clear();
 }
 
 /// Get cache statistics
 #[allow(dead_code)]
 pub fn stats() -> CacheStats {
-    let cache = get_cache();
+    let cache = getCache();
     let now = Instant::now();
 
     let mut total_size = 0;
@@ -156,11 +142,26 @@ pub fn stats() -> CacheStats {
     }
 }
 
-/// Cache statistics
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct CacheStats {
-    pub entry_count: usize,
-    pub total_size_bytes: usize,
-    pub expired_count: usize,
+// Background task to clean up expired cache entries
+pub(crate) async fn cleanupTask() {
+    tracing::info!("🧹 Starting cache cleanup background task (runs every 10 minutes)");
+
+    // Wait before first run
+    tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+
+    loop {
+        // Clean up expired entries
+        cleanupExpired();
+
+        // Log cache stats
+        let stats = stats();
+        tracing::info!(
+            "📊 Cache stats: {} entries, {:.2} MB total, {} expired",
+            stats.entry_count,
+            stats.total_size_bytes as f64 / 1_048_576.0,
+            stats.expired_count
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(600)).await;
+    }
 }

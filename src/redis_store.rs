@@ -1,13 +1,9 @@
 use sha2::{Digest, Sha256};
 
-#[derive(Clone)]
-pub struct RedisStore {
-    client: redis::Client,
-    prefix: String,
-}
+include!("types/redis_store.rs");
 
 impl RedisStore {
-    pub fn from_env() -> Result<Option<Self>, String> {
+    pub fn fromEnv() -> Result<Option<Self>, String> {
         let Some(url) = std::env::var("REDIS_URL")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -24,12 +20,12 @@ impl RedisStore {
         Ok(Some(Self { client, prefix }))
     }
 
-    pub fn hashed_key(&self, namespace: &str, value: &str) -> String {
+    pub fn hashedKey(&self, namespace: &str, value: &str) -> String {
         let digest = Sha256::digest(value.as_bytes());
         format!("{}:{}:{}", self.prefix, namespace, hex::encode(digest))
     }
 
-    pub async fn get_string(&self, key: &str) -> Result<Option<String>, String> {
+    pub async fn getString(&self, key: &str) -> Result<Option<String>, String> {
         let mut connection = self
             .client
             .get_multiplexed_async_connection()
@@ -43,7 +39,7 @@ impl RedisStore {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn set_string_ex(
+    pub async fn setStringEx(
         &self,
         key: &str,
         value: &str,
@@ -65,7 +61,7 @@ impl RedisStore {
             .map_err(|error| error.to_string())
     }
 
-    pub async fn increment_with_expiry(&self, key: &str, ttl_seconds: u64) -> Result<u64, String> {
+    pub async fn incrementWithExpiry(&self, key: &str, ttl_seconds: u64) -> Result<u64, String> {
         let mut connection = self
             .client
             .get_multiplexed_async_connection()

@@ -10,26 +10,25 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use crate::errors::AppError;
-use crate::models::{
+pub use crate::types::{
     DailyVisitRequest, DataFreshness, FriendlistReportResponse, StatsResponse, TodayActivity,
 };
 use crate::AppState;
 
-const STATS_CACHE_KEY: &str = "stats:main:v2";
-const STATS_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+include!("../types/handlers/stats.rs");
 
-pub fn public_router() -> Router<AppState> {
+pub fn publicRouter() -> Router<AppState> {
     Router::new()
-        .route("/daily-visit", post(track_daily_visit))
-        .route("/", get(get_stats))
+        .route("/daily-visit", post(trackDailyVisit))
+        .route("/", get(getStats))
 }
 
-pub fn protected_router() -> Router<AppState> {
-    Router::new().route("/friendlist/:id", post(report_friendlist_full))
+pub fn protectedRouter() -> Router<AppState> {
+    Router::new().route("/friendlist/:id", post(reportFriendlistFull))
 }
 
 // New efficient daily visit tracking (only increments counter once per day per user)
-pub async fn track_daily_visit(
+pub async fn trackDailyVisit(
     State(state): State<AppState>,
     Json(_payload): Json<DailyVisitRequest>,
 ) -> Result<Json<Value>, AppError> {
@@ -59,18 +58,18 @@ pub async fn track_daily_visit(
     }
 }
 
-pub async fn get_stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, AppError> {
+pub async fn getStats(State(state): State<AppState>) -> Result<Json<StatsResponse>, AppError> {
     if let Some(cached) = crate::cache::get::<StatsResponse>(STATS_CACHE_KEY) {
         return Ok(Json(cached));
     }
 
-    let response = load_stats(&state.db).await?;
-    cache_stats(&response);
+    let response = loadStats(&state.db).await?;
+    cacheStats(&response);
 
     Ok(Json(response))
 }
 
-async fn load_stats(pool: &PgPool) -> Result<StatsResponse, AppError> {
+async fn loadStats(pool: &PgPool) -> Result<StatsResponse, AppError> {
     // Read the hourly aggregate instead of scanning trainer/tasks on every
     // cold-cache request. New blue/green containers otherwise cause a cache
     // stampede where many identical full-table counts pin the entire DB pool.
@@ -92,7 +91,7 @@ async fn load_stats(pool: &PgPool) -> Result<StatsResponse, AppError> {
         today: TodayActivity {
             tasks_24h: row.get::<i64, _>("tasks_24h"),
         },
-        freshness: DataFreshness::with_totals(
+        freshness: DataFreshness::withTotals(
             row.get::<i64, _>("accounts_24h"),
             row.get::<i64, _>("trainer_ids_tracked"),
             row.get::<i64, _>("umas_tracked"),
@@ -100,20 +99,20 @@ async fn load_stats(pool: &PgPool) -> Result<StatsResponse, AppError> {
     })
 }
 
-fn cache_stats(response: &StatsResponse) {
+fn cacheStats(response: &StatsResponse) {
     if let Err(error) = crate::cache::set(STATS_CACHE_KEY, response, STATS_CACHE_TTL) {
         tracing::warn!("Failed to cache stats response: {}", error);
     }
 }
 
 /// Rebuild the process-local response cache after the hourly database refresh.
-pub(crate) async fn refresh_cache(pool: &PgPool) -> Result<(), AppError> {
-    let response = load_stats(pool).await?;
-    cache_stats(&response);
+pub(crate) async fn refreshCache(pool: &PgPool) -> Result<(), AppError> {
+    let response = loadStats(pool).await?;
+    cacheStats(&response);
     Ok(())
 }
 
-pub async fn report_friendlist_full(
+pub async fn reportFriendlistFull(
     State(_state): State<AppState>,
     Path(_record_id): Path<String>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -125,4 +124,30 @@ pub async fn report_friendlist_full(
         success: true,
         message: "Report submitted successfully".to_string(),
     }))
+}
+
+impl DataFreshness {
+    pub fn withTotals(accounts_24h: i64, trainer_ids_tracked: i64, umas_tracked: i64) -> Self {
+        Self {
+            accounts_24h,
+            trainer_ids_tracked,
+            accounts_7d: trainer_ids_tracked,
+            umas_tracked,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataFreshness;
+
+    #[test]
+    fn legacySevenDayFieldUsesTheTrainerTotal() {
+        let freshness = DataFreshness::withTotals(12, 345, 678);
+
+        assert_eq!(freshness.accounts_24h, 12);
+        assert_eq!(freshness.trainer_ids_tracked, 345);
+        assert_eq!(freshness.accounts_7d, freshness.trainer_ids_tracked);
+        assert_eq!(freshness.umas_tracked, 678);
+    }
 }

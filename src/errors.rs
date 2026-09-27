@@ -5,29 +5,7 @@ use axum::{
 };
 use serde_json::json;
 
-#[derive(Debug, thiserror::Error)]
-pub enum AppError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("Database error: {0}")]
-    DatabaseError(String),
-
-    #[error("Bad request: {0}")]
-    BadRequest(String),
-
-    #[error("Not found: {0}")]
-    NotFound(String),
-
-    #[error("Unauthorized: {0}")]
-    Unauthorized(String),
-
-    #[error("Forbidden: {0}")]
-    Forbidden(String),
-
-    #[error("Service unavailable: {0}")]
-    ServiceUnavailable(String),
-}
+include!("types/errors.rs");
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
@@ -63,14 +41,12 @@ impl IntoResponse for AppError {
     }
 }
 
-pub type Result<T> = std::result::Result<T, AppError>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn pool_timeouts_are_retryable_service_unavailable_responses() {
+    fn poolTimeoutsAreRetryableServiceUnavailableResponses() {
         let response = AppError::Database(sqlx::Error::PoolTimedOut).into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

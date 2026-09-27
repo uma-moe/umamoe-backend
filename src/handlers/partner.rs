@@ -37,29 +37,27 @@ use tokio_stream::wrappers::ReceiverStream;
 use validator::Validate;
 
 use crate::errors::AppError;
-use crate::handlers::tasks::insert_or_get_active_task;
 use crate::middleware::auth::{AuthenticatedUser, OptionalUser};
-use crate::models::{
+use crate::tasks::insertOrGetActiveTask;
+pub use crate::types::{
     AnonMigrateEntry, Inheritance, PartnerDirectResult, PartnerInheritance, PartnerLookupRequest,
     PartnerLookupResponse, INHERITANCE_SELECT_COLUMNS,
 };
 use crate::AppState;
 
-const TASK_TYPE: &str = "practice_race/get_partner_info";
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-const ANONYMOUS_TASK_CLEANUP_DELAY: Duration = Duration::from_secs(30);
+include!("../types/handlers/partner.rs");
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/lookup", post(create_lookup))
-        .route("/lookup/:task_id/stream", get(stream_lookup))
-        .route("/saved", get(list_saved))
-        .route("/saved/id/:saved_id", delete(delete_saved_by_id))
-        .route("/saved/:account_id", delete(delete_saved_by_account))
-        .route("/saved/migrate", post(migrate_anon))
+        .route("/lookup", post(createLookup))
+        .route("/lookup/:task_id/stream", get(streamLookup))
+        .route("/saved", get(listSaved))
+        .route("/saved/id/:saved_id", delete(deleteSavedById))
+        .route("/saved/:account_id", delete(deleteSavedByAccount))
+        .route("/saved/migrate", post(migrateAnon))
 }
 
-fn completion_status(status: &str, task_data: &serde_json::Value) -> Option<&'static str> {
+fn completionStatus(status: &str, task_data: &serde_json::Value) -> Option<&'static str> {
     match status {
         "completed" => Some("completed"),
         "failed" => Some("failed"),
@@ -68,14 +66,12 @@ fn completion_status(status: &str, task_data: &serde_json::Value) -> Option<&'st
         // status update or NOTIFY cannot strand the SSE stream. Authenticated
         // lookups must still wait for their saved row to commit before the
         // stream reports completion.
-        _ if is_anonymous_lookup(task_data) && task_data.get("result").is_some() => {
-            Some("completed")
-        }
+        _ if isAnonymousLookup(task_data) && task_data.get("result").is_some() => Some("completed"),
         _ => None,
     }
 }
 
-fn is_anonymous_lookup(task_data: &serde_json::Value) -> bool {
+fn isAnonymousLookup(task_data: &serde_json::Value) -> bool {
     task_data
         .get("user_id")
         .and_then(|value| value.as_str())
@@ -84,7 +80,7 @@ fn is_anonymous_lookup(task_data: &serde_json::Value) -> bool {
 
 /// Queue a partner lookup task. Returns a task id that the client uses to
 /// open an SSE stream for the result.
-async fn create_lookup(
+async fn createLookup(
     State(state): State<AppState>,
     OptionalUser(user): OptionalUser,
     Json(payload): Json<PartnerLookupRequest>,
@@ -176,7 +172,7 @@ async fn create_lookup(
         "label": payload.label,
     });
 
-    let (task, _) = insert_or_get_active_task(&state.db, TASK_TYPE, &task_data, 0, None)
+    let (task, _) = insertOrGetActiveTask(&state.db, TASK_TYPE, &task_data, 0, None)
         .await
         .map_err(|e| {
             tracing::error!("Failed to insert or find active partner lookup task: {e}");
@@ -194,7 +190,7 @@ async fn create_lookup(
 /// SSE stream that emits a single completion event for the given task id.
 /// Anonymous lookups return the raw task result (`task_data.result`); logged-in
 /// lookups return the persisted `partner_inheritance` row.
-async fn stream_lookup(
+async fn streamLookup(
     State(state): State<AppState>,
     Path(task_id): Path<i32>,
 ) -> Result<Sse<ReceiverStream<Result<Event, Infallible>>>, AppError> {
@@ -215,7 +211,7 @@ async fn stream_lookup(
     }
 
     // Helper that wraps a single event in a one-shot ReceiverStream.
-    async fn one_shot(evt: Event) -> ReceiverStream<Result<Event, Infallible>> {
+    async fn oneShot(evt: Event) -> ReceiverStream<Result<Event, Infallible>> {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let _ = tx.send(Ok(evt)).await;
         ReceiverStream::new(rx)
@@ -223,9 +219,9 @@ async fn stream_lookup(
 
     // If already terminal (or the worker committed a result before its final
     // status update), emit immediately and close.
-    if let Some(status) = completion_status(&current_status, &current_task_data) {
-        let evt = build_terminal_event(&state, task_id, status).await;
-        return Ok(Sse::new(one_shot(evt).await).keep_alive(KeepAlive::default()));
+    if let Some(status) = completionStatus(&current_status, &current_task_data) {
+        let evt = buildTerminalEvent(&state, task_id, status).await;
+        return Ok(Sse::new(oneShot(evt).await).keep_alive(KeepAlive::default()));
     }
 
     // Subscribe before any await on the DB-state lookup so we don't miss an
@@ -241,9 +237,9 @@ async fn stream_lookup(
             .await?;
 
     if let Some((status, task_data)) = state_now {
-        if let Some(status) = completion_status(&status, &task_data) {
-            let evt = build_terminal_event(&state, task_id, status).await;
-            return Ok(Sse::new(one_shot(evt).await).keep_alive(KeepAlive::default()));
+        if let Some(status) = completionStatus(&status, &task_data) {
+            let evt = buildTerminalEvent(&state, task_id, status).await;
+            return Ok(Sse::new(oneShot(evt).await).keep_alive(KeepAlive::default()));
         }
     }
 
@@ -290,7 +286,7 @@ async fn stream_lookup(
                             break;
                         }
                     } else if matches!(notification.status.as_str(), "completed" | "failed") {
-                        let evt = build_terminal_event(
+                        let evt = buildTerminalEvent(
                             &state_clone,
                             notification.task_id,
                             &notification.status,
@@ -301,8 +297,8 @@ async fn stream_lookup(
                     }
                     }
                     Err(_) => {
-                        if let Some(status) = reconciled_completion_status(&state_clone, task_id).await {
-                            let evt = build_terminal_event(&state_clone, task_id, &status).await;
+                        if let Some(status) = reconciledCompletionStatus(&state_clone, task_id).await {
+                            let evt = buildTerminalEvent(&state_clone, task_id, &status).await;
                             let _ = tx.send(Ok(evt)).await;
                             break;
                         }
@@ -312,8 +308,8 @@ async fn stream_lookup(
                     }
                 },
                 _ = tokio::time::sleep(RECONCILE_INTERVAL) => {
-                    if let Some(status) = reconciled_completion_status(&state_clone, task_id).await {
-                        let evt = build_terminal_event(&state_clone, task_id, &status).await;
+                    if let Some(status) = reconciledCompletionStatus(&state_clone, task_id).await {
+                        let evt = buildTerminalEvent(&state_clone, task_id, &status).await;
                         let _ = tx.send(Ok(evt)).await;
                         break;
                     }
@@ -327,7 +323,7 @@ async fn stream_lookup(
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }
 
-async fn reconciled_completion_status(state: &AppState, task_id: i32) -> Option<String> {
+async fn reconciledCompletionStatus(state: &AppState, task_id: i32) -> Option<String> {
     let row: Result<Option<(String, serde_json::Value)>, sqlx::Error> =
         sqlx::query_as("SELECT status, task_data FROM tasks WHERE id = $1")
             .bind(task_id)
@@ -335,7 +331,7 @@ async fn reconciled_completion_status(state: &AppState, task_id: i32) -> Option<
             .await;
 
     match row {
-        Ok(Some((status, task_data))) => completion_status(&status, &task_data).map(str::to_string),
+        Ok(Some((status, task_data))) => completionStatus(&status, &task_data).map(str::to_string),
         Ok(None) => None,
         Err(error) => {
             tracing::warn!(task_id, %error, "Failed to reconcile partner lookup task");
@@ -344,13 +340,8 @@ async fn reconciled_completion_status(state: &AppState, task_id: i32) -> Option<
     }
 }
 
-struct BuiltCompletionEvent {
-    event: Event,
-    anonymous: bool,
-}
-
-async fn build_terminal_event(state: &AppState, task_id: i32, status: &str) -> Event {
-    let built = build_completion_event(state, task_id, status).await;
+async fn buildTerminalEvent(state: &AppState, task_id: i32, status: &str) -> Event {
+    let built = buildCompletionEvent(state, task_id, status).await;
     if built.anonymous && !state.user_writes_disabled {
         let db = state.db.clone();
         tokio::spawn(async move {
@@ -376,7 +367,7 @@ async fn build_terminal_event(state: &AppState, task_id: i32, status: &str) -> E
     built.event
 }
 
-async fn build_completion_event(
+async fn buildCompletionEvent(
     state: &AppState,
     task_id: i32,
     status: &str,
@@ -393,7 +384,7 @@ async fn build_completion_event(
 
     let anonymous = row
         .as_ref()
-        .map(|(task_data, _)| is_anonymous_lookup(task_data))
+        .map(|(task_data, _)| isAnonymousLookup(task_data))
         .unwrap_or(false);
     let (task_data, error_message) = row.unwrap_or((serde_json::Value::Null, None));
     let task_result = task_data.get("result");
@@ -480,7 +471,7 @@ async fn build_completion_event(
 /// List all partner inheritances saved by the authenticated user.
 /// Authentication failures are returned to the client rather than being
 /// disguised as an empty saved-history list.
-async fn list_saved(
+async fn listSaved(
     State(state): State<AppState>,
     user: AuthenticatedUser,
 ) -> Result<Json<Vec<PartnerInheritance>>, AppError> {
@@ -495,7 +486,7 @@ async fn list_saved(
 }
 
 /// Delete a single saved partner entry for the authenticated user.
-async fn delete_saved_by_id(
+async fn deleteSavedById(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(saved_id): Path<i32>,
@@ -513,7 +504,7 @@ async fn delete_saved_by_id(
 }
 
 /// Legacy delete route. Removes every saved partner entry for a trainer.
-async fn delete_saved_by_account(
+async fn deleteSavedByAccount(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Path(account_id): Path<String>,
@@ -540,7 +531,7 @@ async fn delete_saved_by_account(
 ///
 /// Entries that conflict on `(user_id, account_id)` are skipped (DO NOTHING)
 /// so that newer server-side data is never overwritten by stale local cache.
-async fn migrate_anon(
+async fn migrateAnon(
     State(state): State<AppState>,
     user: AuthenticatedUser,
     Json(entries): Json<Vec<AnonMigrateEntry>>,
@@ -644,11 +635,11 @@ async fn migrate_anon(
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_status, is_anonymous_lookup};
-    use crate::models::PartnerLookupRequest;
+    use super::{completionStatus, isAnonymousLookup};
+    pub use crate::types::PartnerLookupRequest;
 
     #[test]
-    fn persistence_requirement_is_backwards_compatible_and_explicit() {
+    fn persistenceRequirementIsBackwardsCompatibleAndExplicit() {
         let anonymous: PartnerLookupRequest = serde_json::from_value(serde_json::json!({
             "partner_id": "123456789",
             "label": null
@@ -666,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_result_is_terminal_even_before_status_update() {
+    fn committedResultIsTerminalEvenBeforeStatusUpdate() {
         let task_data = serde_json::json!({
             "partner_id": "123456789",
             "user_id": null,
@@ -674,70 +665,67 @@ mod tests {
         });
 
         assert_eq!(
-            completion_status("processing", &task_data),
+            completionStatus("processing", &task_data),
             Some("completed")
         );
-        assert_eq!(completion_status("pending", &task_data), Some("completed"));
-        assert_eq!(completion_status("failed", &task_data), Some("failed"));
+        assert_eq!(completionStatus("pending", &task_data), Some("completed"));
+        assert_eq!(completionStatus("failed", &task_data), Some("failed"));
     }
 
     #[test]
-    fn authenticated_result_waits_for_persistence_to_complete() {
+    fn authenticatedResultWaitsForPersistenceToComplete() {
         let task_data = serde_json::json!({
             "partner_id": "123456789",
             "user_id": "83d8a8f0-a1a1-4d9f-b7a8-c5f650ba27d6",
             "result": { "account_id": "123456789012" }
         });
 
-        assert_eq!(completion_status("pending", &task_data), None);
-        assert_eq!(completion_status("processing", &task_data), None);
-        assert_eq!(
-            completion_status("completed", &task_data),
-            Some("completed")
-        );
+        assert_eq!(completionStatus("pending", &task_data), None);
+        assert_eq!(completionStatus("processing", &task_data), None);
+        assert_eq!(completionStatus("completed", &task_data), Some("completed"));
     }
 
     #[test]
-    fn active_task_without_result_is_not_terminal() {
+    fn activeTaskWithoutResultIsNotTerminal() {
         let task_data = serde_json::json!({
             "partner_id": "123456789",
             "user_id": null
         });
 
-        assert_eq!(completion_status("pending", &task_data), None);
-        assert_eq!(completion_status("processing", &task_data), None);
+        assert_eq!(completionStatus("pending", &task_data), None);
+        assert_eq!(completionStatus("processing", &task_data), None);
     }
 
     #[test]
-    fn anonymous_lookup_has_no_usable_user_id() {
-        assert!(is_anonymous_lookup(&serde_json::json!({ "user_id": null })));
-        assert!(is_anonymous_lookup(&serde_json::json!({})));
-        assert!(!is_anonymous_lookup(&serde_json::json!({
+    fn anonymousLookupHasNoUsableUserId() {
+        assert!(isAnonymousLookup(&serde_json::json!({ "user_id": null })));
+        assert!(isAnonymousLookup(&serde_json::json!({})));
+        assert!(!isAnonymousLookup(&serde_json::json!({
             "user_id": "83d8a8f0-a1a1-4d9f-b7a8-c5f650ba27d6"
         })));
     }
 
     #[test]
-    fn partner_lookup_task_creation_is_idempotent() {
+    fn partnerLookupTaskCreationIsIdempotent() {
         let source = include_str!("partner.rs");
         let create_block = source
-            .split("async fn create_lookup(")
+            .split("async fn createLookup(")
             .nth(1)
-            .and_then(|tail| tail.split("async fn stream_lookup(").next())
+            .and_then(|tail| tail.split("async fn streamLookup(").next())
             .expect("partner lookup creation block should exist");
 
-        assert!(create_block.contains("insert_or_get_active_task("));
-        assert!(!create_block.contains("fix_task_sequence"));
+        assert!(create_block.contains("insertOrGetActiveTask("));
+        assert!(!create_block.contains("fixTaskSequence"));
         assert!(!create_block.contains("INSERT INTO tasks"));
     }
 
     #[test]
-    fn signed_in_lookups_cannot_take_non_persistent_fallbacks() {
+    fn signedInLookupsCannotTakeNonPersistentFallbacks() {
         let source = include_str!("partner.rs");
         let create_block = source
-            .split("async fn create_lookup(")
+            .split("async fn createLookup(")
             .nth(1)
-            .and_then(|tail| tail.split("async fn stream_lookup(").next())
+            .and_then(|tail| tail.split("async fn streamLookup(").next())
             .expect("partner lookup creation block should exist");
 
         assert!(create_block.contains("payload.require_persistence && !will_persist"));
@@ -746,12 +734,12 @@ mod tests {
     }
 
     #[test]
-    fn saved_history_requires_authentication() {
+    fn savedHistoryRequiresAuthentication() {
         let source = include_str!("partner.rs");
         let list_block = source
-            .split("async fn list_saved(")
+            .split("async fn listSaved(")
             .nth(1)
-            .and_then(|tail| tail.split("async fn delete_saved_by_id(").next())
+            .and_then(|tail| tail.split("async fn deleteSavedById(").next())
             .expect("saved-history block should exist");
 
         assert!(list_block.contains("user: AuthenticatedUser"));
@@ -760,17 +748,34 @@ mod tests {
     }
 
     #[test]
-    fn active_partner_stream_has_no_destructive_timeout() {
+    fn activePartnerStreamHasNoDestructiveTimeout() {
         let source = include_str!("partner.rs");
         let stream_block = source
-            .split("async fn stream_lookup(")
+            .split("async fn streamLookup(")
             .nth(1)
-            .and_then(|tail| tail.split("async fn reconciled_completion_status(").next())
+            .and_then(|tail| tail.split("async fn reconciledCompletionStatus(").next())
             .expect("partner lookup stream block should exist");
 
         assert!(stream_block.contains("tx.closed()"));
         assert!(!stream_block.contains("LOOKUP_TIMEOUT"));
         assert!(!stream_block.contains("build_timeout_event"));
         assert!(!stream_block.contains("DELETE FROM tasks"));
+    }
+}
+
+pub(crate) fn validatePartnerLookupId(value: &str) -> Result<(), validator::ValidationError> {
+    let trimmed = value.trim();
+    let is_valid = !trimmed.is_empty()
+        && trimmed.chars().all(|c| c.is_ascii_digit())
+        && (trimmed.len() == 9 || trimmed.len() == 12);
+
+    if is_valid {
+        Ok(())
+    } else {
+        let mut err = validator::ValidationError::new("partner_id_format");
+        err.message = Some(
+            "partner_id must be exactly 9 digits (practice partner) or 12 digits (trainer)".into(),
+        );
+        Err(err)
     }
 }

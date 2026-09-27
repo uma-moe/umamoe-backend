@@ -10,24 +10,19 @@ use uuid::Uuid;
 
 use crate::AppState;
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ApiKeyRecord {
-    pub id: Uuid,
-    pub user_id: Uuid,
-    pub name: String,
-}
+include!("../types/middleware/api_key.rs");
 
-pub fn hash_api_key(raw_key: &str) -> String {
+pub fn hashApiKey(raw_key: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw_key.as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-pub async fn resolve_api_key(
+pub async fn resolveApiKey(
     db: &sqlx::PgPool,
     raw_key: &str,
 ) -> Result<Option<ApiKeyRecord>, sqlx::Error> {
-    let key_hash = hash_api_key(raw_key);
+    let key_hash = hashApiKey(raw_key);
 
     sqlx::query_as::<_, ApiKeyRecord>(
         "SELECT id, user_id, name FROM api_keys WHERE key_hash = $1 AND revoked = FALSE",
@@ -37,7 +32,7 @@ pub async fn resolve_api_key(
     .await
 }
 
-pub async fn record_api_key_usage(
+pub async fn recordApiKeyUsage(
     db: &sqlx::PgPool,
     key: &ApiKeyRecord,
     endpoint: &str,
@@ -71,7 +66,7 @@ pub async fn record_api_key_usage(
 ///   logs the request.
 /// * If the header is absent or the key is unknown/revoked → the request
 ///   proceeds normally (no enforcement yet).
-pub async fn api_key_tracking_middleware(
+pub async fn apiKeyTrackingMiddleware(
     State(state): State<AppState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     request: Request,
@@ -98,10 +93,10 @@ pub async fn api_key_tracking_middleware(
 
     if let Some(raw_key) = api_key_raw {
         let db = state.db.clone();
-        let endpoint = normalize_endpoint(&method.to_string(), &path);
+        let endpoint = normalizeEndpoint(&method.to_string(), &path);
 
         tokio::spawn(async move {
-            let row = resolve_api_key(&db, &raw_key).await;
+            let row = resolveApiKey(&db, &raw_key).await;
 
             match row {
                 Ok(Some(key)) => {
@@ -114,7 +109,7 @@ pub async fn api_key_tracking_middleware(
                     );
 
                     // Bump counters (best-effort)
-                    let _ = record_api_key_usage(&db, &key, &endpoint).await;
+                    let _ = recordApiKeyUsage(&db, &key, &endpoint).await;
                 }
                 Ok(None) => {
                     warn!(
@@ -135,14 +130,14 @@ pub async fn api_key_tracking_middleware(
 
 /// Collapse path parameters into placeholders so endpoint grouping is useful.
 /// `/api/v4/circles/123` → `GET /api/v4/circles/:id`
-pub(crate) fn normalize_endpoint(method: &str, path: &str) -> String {
+pub(crate) fn normalizeEndpoint(method: &str, path: &str) -> String {
     let segments: Vec<&str> = path.split('/').collect();
     let normalized: Vec<&str> = segments
         .iter()
         .enumerate()
         .map(|(i, seg)| {
             // If this segment looks like a numeric ID or UUID, replace it
-            if i > 0 && (is_numeric(seg) || is_uuid(seg)) {
+            if i > 0 && (isNumeric(seg) || isUuid(seg)) {
                 ":id"
             } else {
                 seg
@@ -152,10 +147,10 @@ pub(crate) fn normalize_endpoint(method: &str, path: &str) -> String {
     format!("{} {}", method, normalized.join("/"))
 }
 
-fn is_numeric(s: &str) -> bool {
+fn isNumeric(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
-fn is_uuid(s: &str) -> bool {
+fn isUuid(s: &str) -> bool {
     s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }

@@ -11,18 +11,7 @@ use uuid::Uuid;
 
 use crate::AppState;
 
-/// Authenticated user extracted from a valid JWT `Authorization: Bearer <token>`
-/// header **or** a valid `X-API-Key` header (resolved to the key's owner).
-#[derive(Debug, Clone)]
-pub struct AuthenticatedUser {
-    pub user_id: Uuid,
-}
-
-/// Rejection returned when the JWT is missing or invalid.
-pub struct AuthRejection {
-    message: String,
-    status: StatusCode,
-}
+include!("../types/middleware/auth.rs");
 
 impl IntoResponse for AuthRejection {
     fn into_response(self) -> Response {
@@ -49,7 +38,7 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
             .and_then(|v| v.to_str().ok())
         {
             if let Some(token) = header.strip_prefix("Bearer ") {
-                if let Ok(claims) = crate::auth::verify_token(token) {
+                if let Ok(claims) = crate::auth::verifyToken(token) {
                     return Ok(AuthenticatedUser {
                         user_id: claims.sub,
                     });
@@ -85,13 +74,6 @@ impl FromRequestParts<AppState> for AuthenticatedUser {
         })
     }
 }
-
-/// Like [`AuthenticatedUser`] but does not reject when no credentials are
-/// supplied. Returns `Some(user)` if a valid JWT or API key is present,
-/// `None` otherwise. Useful for endpoints that have anonymous fallback
-/// behaviour (e.g. partner lookup without persistence).
-#[derive(Debug, Clone)]
-pub struct OptionalUser(pub Option<AuthenticatedUser>);
 
 #[async_trait]
 impl FromRequestParts<AppState> for OptionalUser {

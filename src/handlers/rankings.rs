@@ -6,74 +6,30 @@ use axum::{
 use serde::Deserialize;
 
 use crate::{
-    club_rank::{monthly_club_rank_joins, monthly_club_rank_selects},
+    club_rank::{monthlyClubRankJoins, monthlyClubRankSelects},
     errors::AppError,
-    models::{
+    types::{
         AlltimeRankingsResponse, GainsRankingsResponse, MonthlyRankingsResponse,
         UserFanRankingAlltime, UserFanRankingGains, UserFanRankingMonthly,
     },
     AppState,
 };
 
-#[derive(Debug, Deserialize)]
-pub struct MonthlyRankingsParams {
-    /// Month (1-12), defaults to current month in JST
-    pub month: Option<i32>,
-    /// Year, defaults to current year in JST
-    pub year: Option<i32>,
-    /// Page number (0-indexed)
-    #[serde(default)]
-    pub page: Option<i64>,
-    /// Results per page (default 100, max 100)
-    #[serde(default)]
-    pub limit: Option<i64>,
-    /// Search by viewer ID (exact), trainer name, or circle name (partial, case-insensitive)
-    pub query: Option<String>,
-    /// Sort by: monthly_gain (default), total_fans, active_days, avg_daily, avg_3d, avg_7d, avg_monthly
-    pub sort_by: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AlltimeRankingsParams {
-    /// Page number (0-indexed)
-    #[serde(default)]
-    pub page: Option<i64>,
-    /// Results per page (default 100, max 100)
-    #[serde(default)]
-    pub limit: Option<i64>,
-    /// Search by viewer ID (exact), trainer name, or circle name (partial, case-insensitive)
-    pub query: Option<String>,
-    /// Sort by: total_gain (default), total_fans, avg_day, avg_week, avg_month
-    pub sort_by: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct GainsRankingsParams {
-    /// Page number (0-indexed)
-    #[serde(default)]
-    pub page: Option<i64>,
-    /// Results per page (default 100, max 100)
-    #[serde(default)]
-    pub limit: Option<i64>,
-    /// Sort/rank by: gain_3d, gain_7d, gain_30d (default: gain_30d)
-    pub sort_by: Option<String>,
-    /// Search by viewer ID (exact), trainer name, or circle name (partial, case-insensitive)
-    pub query: Option<String>,
-}
+include!("../types/handlers/rankings.rs");
 
 /// Create the rankings router
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/monthly", get(get_monthly_rankings))
-        .route("/alltime", get(get_alltime_rankings))
-        .route("/gains", get(get_gains_rankings))
+        .route("/monthly", get(getMonthlyRankings))
+        .route("/alltime", get(getAlltimeRankings))
+        .route("/gains", get(getGainsRankings))
 }
 
 /// GET /api/v4/rankings/monthly - Fan rankings for a specific month
 ///
 /// All data comes from the `user_fan_rankings_monthly` materialized view
 /// which contains every month. Refreshed hourly.
-pub async fn get_monthly_rankings(
+pub async fn getMonthlyRankings(
     Query(params): Query<MonthlyRankingsParams>,
     State(state): State<AppState>,
 ) -> Result<Json<MonthlyRankingsResponse>, AppError> {
@@ -114,7 +70,7 @@ pub async fn get_monthly_rankings(
     };
 
     // Build search condition
-    let (extra_condition, search_id, search_pattern) = parse_search_query(&params.query, "$3");
+    let (extra_condition, search_id, search_pattern) = parseSearchQuery(&params.query, "$3");
 
     let where_clause = format!(
         "r.year = $1 AND r.month = $2{}",
@@ -139,7 +95,7 @@ pub async fn get_monthly_rankings(
             "SELECT COUNT(*) FROM {} r WHERE {}",
             table_name, where_clause
         );
-        let count = bind_search(
+        let count = bindSearch(
             sqlx::query_scalar(&count_sql)
                 .bind(target_year)
                 .bind(target_month),
@@ -162,8 +118,8 @@ pub async fn get_monthly_rankings(
     } else {
         ("$3", "$4")
     };
-    let club_rank_joins = monthly_club_rank_joins("r");
-    let (club_rank_expr, club_rank_name_expr) = monthly_club_rank_selects("r");
+    let club_rank_joins = monthlyClubRankJoins("r");
+    let (club_rank_expr, club_rank_name_expr) = monthlyClubRankSelects("r");
     let data_sql = format!(
         "SELECT r.viewer_id, r.trainer_name, s.suspicion_score AS shame_score, \
          r.year, r.month, r.total_fans, r.monthly_gain, r.active_days, \
@@ -178,7 +134,7 @@ pub async fn get_monthly_rankings(
          WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
         table_name, club_rank_joins, where_clause, order_by, lp, op
     );
-    let rankings: Vec<UserFanRankingMonthly> = bind_search_and_page(
+    let rankings: Vec<UserFanRankingMonthly> = bindSearchAndPage(
         sqlx::query_as(&data_sql)
             .bind(target_year)
             .bind(target_month),
@@ -212,7 +168,7 @@ pub async fn get_monthly_rankings(
 /// GET /api/v4/rankings/alltime - All-time fan rankings across all months
 ///
 /// Reads from the `user_fan_rankings_alltime` materialized view. Refreshed hourly.
-pub async fn get_alltime_rankings(
+pub async fn getAlltimeRankings(
     Query(params): Query<AlltimeRankingsParams>,
     State(state): State<AppState>,
 ) -> Result<Json<AlltimeRankingsResponse>, AppError> {
@@ -229,7 +185,7 @@ pub async fn get_alltime_rankings(
         _ => "rank_total_gain ASC",
     };
 
-    let (extra_condition, search_id, search_pattern) = parse_search_query(&params.query, "$1");
+    let (extra_condition, search_id, search_pattern) = parseSearchQuery(&params.query, "$1");
 
     let where_clause = if extra_condition.is_empty() {
         "TRUE".to_string()
@@ -249,7 +205,7 @@ pub async fn get_alltime_rankings(
             "SELECT COUNT(*) FROM user_fan_rankings_alltime r WHERE {}",
             where_clause
         );
-        let count = bind_search(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
+        let count = bindSearch(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
             .fetch_one(&state.db)
             .await?;
         let _ = crate::cache::set(
@@ -277,7 +233,7 @@ pub async fn get_alltime_rankings(
          WHERE {} ORDER BY {} LIMIT {} OFFSET {}",
         where_clause, order_by, lp, op
     );
-    let rankings: Vec<UserFanRankingAlltime> = bind_search_and_page(
+    let rankings: Vec<UserFanRankingAlltime> = bindSearchAndPage(
         sqlx::query_as(&data_sql),
         &search_id,
         &search_pattern,
@@ -307,7 +263,7 @@ pub async fn get_alltime_rankings(
 /// GET /api/v4/rankings/gains - Rolling 3d/7d/30d fan gain rankings
 ///
 /// Reads from the `user_fan_rankings_gains` materialized view. Refreshed hourly.
-pub async fn get_gains_rankings(
+pub async fn getGainsRankings(
     Query(params): Query<GainsRankingsParams>,
     State(state): State<AppState>,
 ) -> Result<Json<GainsRankingsResponse>, AppError> {
@@ -322,7 +278,7 @@ pub async fn get_gains_rankings(
         _ => "rank_30d",
     };
 
-    let (extra_condition, search_id, search_pattern) = parse_search_query(&params.query, "$1");
+    let (extra_condition, search_id, search_pattern) = parseSearchQuery(&params.query, "$1");
 
     let where_clause = if extra_condition.is_empty() {
         "TRUE".to_string()
@@ -342,7 +298,7 @@ pub async fn get_gains_rankings(
             "SELECT COUNT(*) FROM user_fan_rankings_gains r WHERE {}",
             where_clause
         );
-        let count = bind_search(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
+        let count = bindSearch(sqlx::query_scalar(&count_sql), &search_id, &search_pattern)
             .fetch_one(&state.db)
             .await?;
         let _ = crate::cache::set(
@@ -368,7 +324,7 @@ pub async fn get_gains_rankings(
          WHERE {} ORDER BY {} ASC LIMIT {} OFFSET {}",
         where_clause, rank_column, lp, op
     );
-    let rankings: Vec<UserFanRankingGains> = bind_search_and_page(
+    let rankings: Vec<UserFanRankingGains> = bindSearchAndPage(
         sqlx::query_as(&data_sql),
         &search_id,
         &search_pattern,
@@ -401,10 +357,7 @@ pub async fn get_gains_rankings(
 /// Parse an optional search query into a SQL condition fragment + typed value.
 /// Matches viewer_id (exact), trainer_name (ILIKE), or circle_name (ILIKE).
 /// Reuses the same bind param for both ILIKE checks via OR.
-fn parse_search_query(
-    query: &Option<String>,
-    param: &str,
-) -> (String, Option<i64>, Option<String>) {
+fn parseSearchQuery(query: &Option<String>, param: &str) -> (String, Option<i64>, Option<String>) {
     if let Some(q) = query {
         let q = q.trim();
         if !q.is_empty() {
@@ -427,7 +380,7 @@ fn parse_search_query(
 }
 
 /// Bind the search parameter (if any) to a query that returns a scalar.
-fn bind_search<'q>(
+fn bindSearch<'q>(
     query: sqlx::query::QueryScalar<'q, sqlx::Postgres, i64, sqlx::postgres::PgArguments>,
     search_id: &Option<i64>,
     search_pattern: &Option<String>,
@@ -442,7 +395,7 @@ fn bind_search<'q>(
 }
 
 /// Bind search param + LIMIT/OFFSET to a query_as.
-fn bind_search_and_page<'q, T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin>(
+fn bindSearchAndPage<'q, T: for<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin>(
     query: sqlx::query::QueryAs<'q, sqlx::Postgres, T, sqlx::postgres::PgArguments>,
     search_id: &Option<i64>,
     search_pattern: &Option<String>,

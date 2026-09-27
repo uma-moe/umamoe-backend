@@ -9,24 +9,24 @@ use sqlx::Row;
 
 use crate::{
     errors::Result,
-    models::{InheritanceShareData, SharePathParams, SupportCardShareData},
+    types::{InheritanceShareData, SharePathParams, SupportCardShareData},
     AppState,
 };
 
 pub fn router() -> Router<AppState> {
-    Router::new().route("/s/:share_type/:account_id", get(share_page))
+    Router::new().route("/s/:share_type/:account_id", get(sharePage))
 }
 
-pub async fn share_page(
+pub async fn sharePage(
     State(state): State<AppState>,
     Path(params): Path<SharePathParams>,
 ) -> Result<Response> {
     match params.share_type.as_str() {
-        "inheritance" => inheritance_share(&state, &params.account_id).await,
-        "support-card" => support_card_share(&state, &params.account_id).await,
+        "inheritance" => inheritanceShare(&state, &params.account_id).await,
+        "support-card" => supportCardShare(&state, &params.account_id).await,
         _ => {
             // Return a 404 for unknown share types
-            let html = generate_error_html(
+            let html = generateErrorHtml(
                 "Invalid share type",
                 "The requested share type is not supported.",
             );
@@ -35,7 +35,7 @@ pub async fn share_page(
     }
 }
 
-async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Response> {
+async fn inheritanceShare(state: &AppState, account_id: &str) -> Result<Response> {
     // Query to get inheritance data with character names
     let query = r#"
         SELECT 
@@ -71,7 +71,7 @@ async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Respons
     {
         Some(row) => row,
         None => {
-            let html = generate_error_html(
+            let html = generateErrorHtml(
                 "Inheritance Not Found",
                 "The requested inheritance record could not be found.",
             );
@@ -99,21 +99,21 @@ async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Respons
     let main_white_count: i32 = row.get("main_white_count");
 
     // Get character names (you'll need to create this mapping)
-    let character_name = get_character_name(main_parent_id);
-    let parent_left_name = get_character_name(parent_left_id);
-    let parent_right_name = get_character_name(parent_right_id);
+    let character_name = getCharacterName(main_parent_id);
+    let parent_left_name = getCharacterName(parent_left_id);
+    let parent_right_name = getCharacterName(parent_right_id);
 
     // Generate summaries
-    let blue_factors_summary = format_sparks_summary(&blue_sparks, "blue");
-    let pink_factors_summary = format_sparks_summary(&pink_sparks, "pink");
-    let green_factors_summary = format_sparks_summary(&green_sparks, "green");
-    let white_factors_summary = format_sparks_summary(&white_sparks, "white");
+    let blue_factors_summary = formatSparksSummary(&blue_sparks, "blue");
+    let pink_factors_summary = formatSparksSummary(&pink_sparks, "pink");
+    let green_factors_summary = formatSparksSummary(&green_sparks, "green");
+    let white_factors_summary = formatSparksSummary(&white_sparks, "white");
     let main_factors_summary = format!(
         "Blue: {} • Pink: {} • Green: {} • White: {} ({})",
         main_blue_factors,
         main_pink_factors,
         main_green_factors,
-        format_sparks_summary(&main_white_factors, "white"),
+        formatSparksSummary(&main_white_factors, "white"),
         main_white_count
     );
 
@@ -134,7 +134,7 @@ async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Respons
         main_factors_summary,
     };
 
-    let html = generate_inheritance_html(&share_data);
+    let html = generateInheritanceHtml(&share_data);
 
     // Set proper headers for HTML response
     let mut headers = HeaderMap::new();
@@ -146,7 +146,7 @@ async fn inheritance_share(state: &AppState, account_id: &str) -> Result<Respons
     Ok((headers, Html(html)).into_response())
 }
 
-async fn support_card_share(state: &AppState, account_id: &str) -> Result<Response> {
+async fn supportCardShare(state: &AppState, account_id: &str) -> Result<Response> {
     // Query to get the best support card for this account
     let query = r#"
         SELECT 
@@ -169,7 +169,7 @@ async fn support_card_share(state: &AppState, account_id: &str) -> Result<Respon
     {
         Some(row) => row,
         None => {
-            let html = generate_error_html(
+            let html = generateErrorHtml(
                 "Support Card Not Found",
                 "The requested support card record could not be found.",
             );
@@ -183,7 +183,7 @@ async fn support_card_share(state: &AppState, account_id: &str) -> Result<Respon
     let experience: i32 = row.get("experience");
 
     // Get card details (you'll need to create this mapping)
-    let (card_name, card_rarity, card_type) = get_support_card_details(support_card_id);
+    let (card_name, card_rarity, card_type) = getSupportCardDetails(support_card_id);
 
     let share_data = SupportCardShareData {
         account_id: account_id.to_string(),
@@ -195,7 +195,7 @@ async fn support_card_share(state: &AppState, account_id: &str) -> Result<Respon
         card_type,
     };
 
-    let html = generate_support_card_html(&share_data);
+    let html = generateSupportCardHtml(&share_data);
 
     // Set proper headers for HTML response
     let mut headers = HeaderMap::new();
@@ -207,7 +207,7 @@ async fn support_card_share(state: &AppState, account_id: &str) -> Result<Respon
     Ok((headers, Html(html)).into_response())
 }
 
-fn generate_inheritance_html(data: &InheritanceShareData) -> String {
+fn generateInheritanceHtml(data: &InheritanceShareData) -> String {
     let title = format!(
         "{}'s {} Inheritance",
         data.trainer_name, data.character_name
@@ -216,8 +216,8 @@ fn generate_inheritance_html(data: &InheritanceShareData) -> String {
         "Parents: {} × {} • Rank: {} • Rarity: {} • Wins: {} • White Skills: {} • {}",
         data.parent_left_name,
         data.parent_right_name,
-        get_rank_display(data.parent_rank),
-        get_rarity_display(data.parent_rarity),
+        getRankDisplay(data.parent_rank),
+        getRarityDisplay(data.parent_rarity),
         data.win_count,
         data.white_count,
         data.main_factors_summary
@@ -361,8 +361,8 @@ fn generate_inheritance_html(data: &InheritanceShareData) -> String {
         data.trainer_name,
         data.parent_left_name,
         data.parent_right_name,
-        get_rank_display(data.parent_rank),
-        get_rarity_display(data.parent_rarity),
+        getRankDisplay(data.parent_rank),
+        getRarityDisplay(data.parent_rarity),
         data.win_count,
         data.white_count,
         data.blue_factors_summary,
@@ -374,7 +374,7 @@ fn generate_inheritance_html(data: &InheritanceShareData) -> String {
     html
 }
 
-fn generate_support_card_html(data: &SupportCardShareData) -> String {
+fn generateSupportCardHtml(data: &SupportCardShareData) -> String {
     let title = format!("{}'s {} Support Card", data.trainer_name, data.card_name);
     let limit_break_display = match data.limit_break_count {
         Some(lb) => format!("★{}", lb),
@@ -509,7 +509,7 @@ fn generate_support_card_html(data: &SupportCardShareData) -> String {
     html
 }
 
-fn generate_error_html(title: &str, message: &str) -> String {
+fn generateErrorHtml(title: &str, message: &str) -> String {
     format!(
         "<!DOCTYPE html>
 <html lang=\"en\">
@@ -574,7 +574,7 @@ fn generate_error_html(title: &str, message: &str) -> String {
 }
 
 // Helper functions for mapping IDs to names (you'll need to implement these)
-fn get_character_name(character_id: i32) -> String {
+fn getCharacterName(character_id: i32) -> String {
     // This is a simplified mapping - you should load this from your data files
     match character_id {
         1 => "Special Week".to_string(),
@@ -675,7 +675,7 @@ fn get_character_name(character_id: i32) -> String {
     }
 }
 
-fn get_support_card_details(support_card_id: i32) -> (String, String, String) {
+fn getSupportCardDetails(support_card_id: i32) -> (String, String, String) {
     // This is a simplified mapping - you should load this from your data files
     // Return (name, rarity, type)
     match support_card_id {
@@ -688,7 +688,7 @@ fn get_support_card_details(support_card_id: i32) -> (String, String, String) {
     }
 }
 
-fn get_rank_display(rank: i32) -> String {
+fn getRankDisplay(rank: i32) -> String {
     match rank {
         1 => "G".to_string(),
         2 => "F".to_string(),
@@ -704,7 +704,7 @@ fn get_rank_display(rank: i32) -> String {
     }
 }
 
-fn get_rarity_display(rarity: i32) -> String {
+fn getRarityDisplay(rarity: i32) -> String {
     match rarity {
         1 => "★".to_string(),
         2 => "★★".to_string(),
@@ -713,7 +713,7 @@ fn get_rarity_display(rarity: i32) -> String {
     }
 }
 
-fn format_sparks_summary(sparks: &[i32], _spark_type: &str) -> String {
+fn formatSparksSummary(sparks: &[i32], _spark_type: &str) -> String {
     if sparks.is_empty() {
         return "None".to_string();
     }
@@ -731,7 +731,7 @@ fn format_sparks_summary(sparks: &[i32], _spark_type: &str) -> String {
     let mut summary_parts: Vec<String> = Vec::new();
 
     for (factor_id, levels) in factor_counts {
-        let factor_name = get_factor_name(factor_id);
+        let factor_name = getFactorName(factor_id);
         let max_level = levels.iter().max().unwrap_or(&0);
         summary_parts.push(format!("{} ★{}", factor_name, max_level));
     }
@@ -743,7 +743,7 @@ fn format_sparks_summary(sparks: &[i32], _spark_type: &str) -> String {
     }
 }
 
-fn get_factor_name(factor_id: i32) -> String {
+fn getFactorName(factor_id: i32) -> String {
     match factor_id {
         // Blue factors (stats)
         1 => "Speed".to_string(),

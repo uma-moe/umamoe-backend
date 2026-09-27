@@ -5,7 +5,7 @@ ARG RUST_VERSION=1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 WORKDIR /app
 
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY openapi.yaml ./openapi.yaml
@@ -13,16 +13,30 @@ COPY openapi.yaml ./openapi.yaml
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bin honsemoe-backend-v2 \
+    cargo build --locked --release --bin honsemoe-backend-v2 \
     && cp /app/target/release/honsemoe-backend-v2 /tmp/umamoe-backend
 
-FROM debian:bookworm-slim AS runtime
+FROM builder AS demo-builder
+COPY deploy/demo ./deploy/demo
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --locked --release --bin demo_database \
+    && cp /app/target/release/demo_database /tmp/demo-database
+
+FROM debian:bookworm-slim AS base
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin app
 
+FROM base AS demo
+COPY --from=demo-builder /tmp/demo-database /usr/local/bin/demo-database
+USER app
+ENTRYPOINT ["/usr/local/bin/demo-database"]
+
+FROM base AS runtime
 WORKDIR /app
 COPY --from=builder /tmp/umamoe-backend /usr/local/bin/umamoe-backend
 

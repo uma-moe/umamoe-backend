@@ -14,80 +14,13 @@ use tokio::sync::Semaphore;
 
 use crate::{
     errors::AppError,
-    models::{Circle, CircleMemberFansMonthly},
+    types::{Circle, CircleMemberFansMonthly},
     AppState,
 };
 
-const CIRCLE_TEXT_SEARCH_DB_CONCURRENCY: usize = 2;
-static CIRCLE_TEXT_SEARCH_DB_SLOTS: Semaphore =
-    Semaphore::const_new(CIRCLE_TEXT_SEARCH_DB_CONCURRENCY);
+include!("../types/handlers/circles.rs");
 
-#[derive(Debug, Deserialize)]
-pub struct CircleQueryParams {
-    /// Query by viewer ID - will find their circle
-    pub viewer_id: Option<i64>,
-    /// Query by circle ID directly
-    pub circle_id: Option<i64>,
-    /// Filter members by month (1-12)
-    pub month: Option<i32>,
-    /// Filter members by year
-    pub year: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CircleListParams {
-    /// Page number (0-indexed)
-    #[serde(default)]
-    pub page: Option<i64>,
-    /// Results per page
-    #[serde(default)]
-    pub limit: Option<i64>,
-    /// Search by circle name (partial match)
-    pub name: Option<String>,
-    /// Minimum member count
-    pub min_members: Option<i32>,
-    /// Minimum monthly rank (lower is better)
-    pub max_rank: Option<i32>,
-    /// Sort by field (name, member_count, monthly_rank, monthly_point)
-    pub sort_by: Option<String>,
-    /// Sort direction (asc, desc)
-    pub sort_dir: Option<String>,
-    /// General search query (circle ID/name, leader ID/name, member ID/name)
-    pub query: Option<String>,
-    /// Historical ranking year; must be supplied together with month
-    pub year: Option<i32>,
-    /// Historical ranking month; must be supplied together with year
-    pub month: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CircleResponse {
-    pub circle: Circle,
-    pub members: Vec<CircleMemberFansMonthly>,
-    pub club_rank: Option<i32>,
-    pub fans_to_next_tier: Option<i64>,
-    pub fans_to_lower_tier: Option<i64>,
-    pub yesterday_fans_to_next_tier: Option<i64>,
-    pub yesterday_fans_to_lower_tier: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CircleWithRank {
-    #[serde(flatten)]
-    pub circle: Circle,
-    pub club_rank: Option<i32>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct CircleListResponse {
-    pub circles: Vec<CircleWithRank>,
-    pub total: i64,
-    pub page: i64,
-    pub limit: i64,
-    pub total_pages: i64,
-}
-
-fn circle_search_sources_sql(query: &str) -> Option<String> {
+fn circleSearchSourcesSql(query: &str) -> Option<String> {
     let query = query.trim();
     if query.is_empty() {
         return None;
@@ -110,7 +43,7 @@ fn circle_search_sources_sql(query: &str) -> Option<String> {
     }
 
     let search_pattern = format!("%{}%", query.replace("'", "''"));
-    let circle_visibility = current_circle_visibility_sql("circle");
+    let circle_visibility = currentCircleVisibilitySql("circle");
     Some(format!(
         r#"
         SELECT circle.circle_id
@@ -139,51 +72,41 @@ fn circle_search_sources_sql(query: &str) -> Option<String> {
     ))
 }
 
-fn current_circle_visibility_sql(alias: &str) -> String {
+fn currentCircleVisibilitySql(alias: &str) -> String {
     format!(
         "{alias}.last_updated >= date_trunc('month', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days') \
          AND ({alias}.archived IS DISTINCT FROM true OR (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo')::timestamp < date_trunc('month', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') + interval '2 days')"
     )
 }
 
-fn sql_cache_key(prefix: &str, sql: &str) -> String {
+fn sqlCacheKey(prefix: &str, sql: &str) -> String {
     let mut hasher = DefaultHasher::new();
     sql.hash(&mut hasher);
     format!("{prefix}:{:016x}", hasher.finish())
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct HistoricalCircleMonth {
-    circle_name: Option<String>,
-    monthly_rank: Option<i32>,
-    monthly_point: Option<i64>,
-    member_count: Option<i32>,
-    last_month_rank: Option<i32>,
-    last_month_point: Option<i64>,
-}
-
 /// Create the circles router
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/", get(get_circle))
-        .route("/list", get(list_circles))
-        .route("/rank-thresholds", get(get_rank_thresholds))
+        .route("/", get(getCircle))
+        .route("/list", get(listCircles))
+        .route("/rank-thresholds", get(getRankThresholds))
 }
 
-fn is_rollover_display_window(now: DateTime<Utc>) -> bool {
+fn isRolloverDisplayWindow(now: DateTime<Utc>) -> bool {
     let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
     now.with_timezone(&jst).day() == 2
 }
 
-fn rollover_display_sql() -> &'static str {
-    if is_rollover_display_window(Utc::now()) {
+fn rolloverDisplaySql() -> &'static str {
+    if isRolloverDisplayWindow(Utc::now()) {
         "TRUE"
     } else {
         "FALSE"
     }
 }
 
-fn rollover_start_utc(now: DateTime<Utc>) -> chrono::NaiveDateTime {
+fn rolloverStartUtc(now: DateTime<Utc>) -> chrono::NaiveDateTime {
     let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
     let now_jst = now.with_timezone(&jst);
     let rollover_start_jst = NaiveDate::from_ymd_opt(now_jst.year(), now_jst.month(), 1)
@@ -195,35 +118,35 @@ fn rollover_start_utc(now: DateTime<Utc>) -> chrono::NaiveDateTime {
     rollover_start_jst - Duration::hours(9)
 }
 
-fn row_has_new_last_month_sql(alias: &str) -> String {
-    let rollover_start_utc = rollover_start_utc(Utc::now()).format("%Y-%m-%d %H:%M:%S");
+fn rowHasNewLastMonthSql(alias: &str) -> String {
+    let rolloverStartUtc = rolloverStartUtc(Utc::now()).format("%Y-%m-%d %H:%M:%S");
 
     format!(
         "{}.last_updated >= TIMESTAMP '{}' AND NOT COALESCE({}.archived, false)",
-        alias, rollover_start_utc, alias
+        alias, rolloverStartUtc, alias
     )
 }
 
-fn valid_live_sql(alias: &str) -> String {
+fn validLiveSql(alias: &str) -> String {
     format!("{}.live_rank > 0 AND {}.live_points > 0", alias, alias)
 }
 
-fn has_live_points_sql(alias: &str) -> String {
+fn hasLivePointsSql(alias: &str) -> String {
     format!("{}.live_points > 0", alias)
 }
 
-fn positive_rank_sql(expr: &str) -> String {
+fn positiveRankSql(expr: &str) -> String {
     format!("CASE WHEN {expr} > 0 THEN {expr} ELSE NULL END")
 }
 
-fn disbanded_name_sql(alias: &str) -> String {
+fn disbandedNameSql(alias: &str) -> String {
     format!(
         "CASE WHEN COALESCE({}.archived, false) AND {}.name NOT LIKE '% ( DISBANDED )' THEN {}.name || ' ( DISBANDED )' ELSE {}.name END",
         alias, alias, alias, alias
     )
 }
 
-fn effective_points_sql(alias: &str) -> String {
+fn effectivePointsSql(alias: &str) -> String {
     format!(
         "CASE \
             WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.monthly_point) \
@@ -231,13 +154,13 @@ fn effective_points_sql(alias: &str) -> String {
             WHEN {} THEN COALESCE(GREATEST({}.live_points, {}.monthly_point), {}.live_points, {}.monthly_point) \
             ELSE {}.monthly_point \
         END",
-        rollover_display_sql(),
-        row_has_new_last_month_sql(alias),
+        rolloverDisplaySql(),
+        rowHasNewLastMonthSql(alias),
         alias,
         alias,
-        rollover_display_sql(),
+        rolloverDisplaySql(),
         alias,
-        has_live_points_sql(alias),
+        hasLivePointsSql(alias),
         alias,
         alias,
         alias,
@@ -246,10 +169,10 @@ fn effective_points_sql(alias: &str) -> String {
     )
 }
 
-fn rank_fallback_sql(alias: &str) -> String {
-    let monthly_rank = positive_rank_sql(&format!("{}.monthly_rank", alias));
-    let live_rank = positive_rank_sql(&format!("{}.live_rank", alias));
-    let last_month_rank = positive_rank_sql(&format!("{}.last_month_rank", alias));
+fn rankFallbackSql(alias: &str) -> String {
+    let monthly_rank = positiveRankSql(&format!("{}.monthly_rank", alias));
+    let live_rank = positiveRankSql(&format!("{}.live_rank", alias));
+    let last_month_rank = positiveRankSql(&format!("{}.last_month_rank", alias));
     let display_last_month_rank = format!("COALESCE({last_month_rank}, {monthly_rank})");
 
     format!(
@@ -259,105 +182,105 @@ fn rank_fallback_sql(alias: &str) -> String {
             WHEN {} THEN {} \
             ELSE {} \
         END",
-        rollover_display_sql(),
-        row_has_new_last_month_sql(alias),
+        rolloverDisplaySql(),
+        rowHasNewLastMonthSql(alias),
         display_last_month_rank,
-        rollover_display_sql(),
+        rolloverDisplaySql(),
         monthly_rank,
-        valid_live_sql(alias),
+        validLiveSql(alias),
         live_rank,
         monthly_rank,
     )
 }
 
-fn rank_column_sql(alias: &str, live_rank_expr: &str) -> String {
-    let rank_fallback = rank_fallback_sql(alias);
-    let live_rank = positive_rank_sql(&format!("{live_rank_expr}::int"));
+fn rankColumnSql(alias: &str, live_rank_expr: &str) -> String {
+    let rank_fallback = rankFallbackSql(alias);
+    let live_rank = positiveRankSql(&format!("{live_rank_expr}::int"));
 
     format!(
         "CASE WHEN {} THEN {} ELSE COALESCE({}, {}) END",
-        rollover_display_sql(),
+        rolloverDisplaySql(),
         rank_fallback,
         live_rank,
         rank_fallback,
     )
 }
 
-fn display_monthly_point_sql(alias: &str) -> String {
+fn displayMonthlyPointSql(alias: &str) -> String {
     format!(
         "CASE WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.monthly_point) ELSE {}.monthly_point END",
-        rollover_display_sql(),
-        row_has_new_last_month_sql(alias),
+        rolloverDisplaySql(),
+        rowHasNewLastMonthSql(alias),
         alias,
         alias,
         alias,
     )
 }
 
-fn display_yesterday_points_sql(alias: &str) -> String {
+fn displayYesterdayPointsSql(alias: &str) -> String {
     format!(
         "CASE WHEN {} AND {} THEN COALESCE({}.last_month_point, {}.yesterday_points) ELSE {}.yesterday_points END",
-        rollover_display_sql(),
-        row_has_new_last_month_sql(alias),
+        rolloverDisplaySql(),
+        rowHasNewLastMonthSql(alias),
         alias,
         alias,
         alias,
     )
 }
 
-fn display_yesterday_rank_sql(alias: &str) -> String {
-    let yesterday_rank = positive_rank_sql(&format!("{}.yesterday_rank", alias));
-    let last_month_rank = positive_rank_sql(&format!("{}.last_month_rank", alias));
+fn displayYesterdayRankSql(alias: &str) -> String {
+    let yesterday_rank = positiveRankSql(&format!("{}.yesterday_rank", alias));
+    let last_month_rank = positiveRankSql(&format!("{}.last_month_rank", alias));
 
     format!(
         "CASE WHEN {} AND {} THEN COALESCE({}, {}) ELSE {} END",
-        rollover_display_sql(),
-        row_has_new_last_month_sql(alias),
+        rolloverDisplaySql(),
+        rowHasNewLastMonthSql(alias),
         last_month_rank,
         yesterday_rank,
         yesterday_rank,
     )
 }
 
-fn display_yesterday_rank_expr_sql(alias: &str, live_yesterday_rank_expr: &str) -> String {
-    let live_yesterday_rank = positive_rank_sql(&format!("{}::int", live_yesterday_rank_expr));
-    let fallback_rank = display_yesterday_rank_sql(alias);
+fn displayYesterdayRankExprSql(alias: &str, live_yesterday_rank_expr: &str) -> String {
+    let live_yesterday_rank = positiveRankSql(&format!("{}::int", live_yesterday_rank_expr));
+    let fallback_rank = displayYesterdayRankSql(alias);
 
     format!(
         "CASE WHEN {} THEN {} ELSE COALESCE({}, {}) END",
-        rollover_display_sql(),
+        rolloverDisplaySql(),
         fallback_rank,
         live_yesterday_rank,
         fallback_rank,
     )
 }
 
-fn display_live_points_sql(alias: &str) -> String {
+fn displayLivePointsSql(alias: &str) -> String {
     format!(
         "CASE WHEN {} OR {}.live_points <= 0 THEN NULL ELSE {}.live_points END",
-        rollover_display_sql(),
+        rolloverDisplaySql(),
         alias,
         alias,
     )
 }
 
-fn display_live_rank_expr_sql(live_rank_expr: &str) -> String {
+fn displayLiveRankExprSql(live_rank_expr: &str) -> String {
     format!(
         "CASE WHEN {} THEN NULL ELSE {} END",
-        rollover_display_sql(),
+        rolloverDisplaySql(),
         live_rank_expr,
     )
 }
 
-fn display_last_live_update_sql(alias: &str) -> String {
+fn displayLastLiveUpdateSql(alias: &str) -> String {
     format!(
         "CASE WHEN {} THEN NULL ELSE {}.last_live_update END",
-        rollover_display_sql(),
+        rolloverDisplaySql(),
         alias,
     )
 }
 
-fn effective_circle_points(circle: &Circle) -> i64 {
+fn effectiveCirclePoints(circle: &Circle) -> i64 {
     let jst_offset = FixedOffset::east_opt(9 * 3600).unwrap();
     let now_jst = Utc::now().with_timezone(&jst_offset);
     let month_start_jst = NaiveDate::from_ymd_opt(now_jst.year(), now_jst.month(), 1)
@@ -394,7 +317,7 @@ fn effective_circle_points(circle: &Circle) -> i64 {
     }
 }
 
-fn current_game_month_start(now: DateTime<Utc>) -> NaiveDate {
+fn currentGameMonthStart(now: DateTime<Utc>) -> NaiveDate {
     let jst = FixedOffset::east_opt(9 * 3600).expect("valid JST offset");
     (now.with_timezone(&jst) - Duration::days(1))
         .date_naive()
@@ -402,7 +325,7 @@ fn current_game_month_start(now: DateTime<Utc>) -> NaiveDate {
         .expect("first day exists")
 }
 
-fn resolve_circle_month(
+fn resolveCircleMonth(
     year: Option<i32>,
     month: Option<i32>,
 ) -> Result<Option<(i32, i32, bool)>, AppError> {
@@ -410,7 +333,7 @@ fn resolve_circle_month(
         return Ok(None);
     }
 
-    let current_month = current_game_month_start(Utc::now());
+    let current_month = currentGameMonthStart(Utc::now());
     let target_year = year.unwrap_or(current_month.year());
     let target_month = month.unwrap_or(current_month.month() as i32);
     let target_date = NaiveDate::from_ymd_opt(target_year, target_month as u32, 1)
@@ -428,7 +351,7 @@ fn resolve_circle_month(
     )))
 }
 
-async fn apply_historical_circle_month(
+async fn applyHistoricalCircleMonth(
     pool: &PgPool,
     circle: &mut Circle,
     year: i32,
@@ -490,7 +413,7 @@ async fn apply_historical_circle_month(
 /// - circle_id: Get circle by ID directly
 ///
 /// Returns circle info with all member fan count data
-pub async fn get_circle(
+pub async fn getCircle(
     Query(params): Query<CircleQueryParams>,
     State(state): State<AppState>,
 ) -> Result<Json<CircleResponse>, AppError> {
@@ -501,7 +424,7 @@ pub async fn get_circle(
         ));
     }
 
-    let requested_month = resolve_circle_month(params.year, params.month)?;
+    let requested_month = resolveCircleMonth(params.year, params.month)?;
     let historical_month = requested_month.filter(|(_, _, historical)| *historical);
 
     let mut circle = if let Some(viewer_id) = params.viewer_id {
@@ -521,11 +444,11 @@ pub async fn get_circle(
         match member_record {
             Some(circle_id) => {
                 // Viewer found, get their circle
-                fetch_circle_by_id(&state.db, circle_id).await?
+                fetchCircleById(&state.db, circle_id).await?
             }
             None => {
                 // Viewer not found - add to tasks for later fetching
-                add_viewer_to_tasks(&state.db, viewer_id).await?;
+                addViewerToTasks(&state.db, viewer_id).await?;
 
                 return Err(AppError::NotFound(format!(
                     "Viewer {} not found in any circle. Added to task queue for fetching.",
@@ -535,13 +458,13 @@ pub async fn get_circle(
         }
     } else if let Some(circle_id) = params.circle_id {
         // Query by circle_id directly
-        fetch_circle_by_id(&state.db, circle_id).await?
+        fetchCircleById(&state.db, circle_id).await?
     } else {
         unreachable!("Already validated at least one param exists");
     };
 
     if let Some((year, month, _)) = historical_month {
-        apply_historical_circle_month(&state.db, &mut circle, year, month).await?;
+        applyHistoricalCircleMonth(&state.db, &mut circle, year, month).await?;
     }
 
     // Get all members and their fan counts for this circle
@@ -549,17 +472,17 @@ pub async fn get_circle(
         .map(|(year, month, _)| (Some(year), Some(month)))
         .unwrap_or((None, None));
     let members =
-        fetch_circle_members(&state.db, circle.circle_id, member_year, member_month).await?;
+        fetchCircleMembers(&state.db, circle.circle_id, member_year, member_month).await?;
 
-    let points = effective_circle_points(&circle);
-    let club_rank = Some(compute_club_rank(circle.monthly_rank, Some(points)));
+    let points = effectiveCirclePoints(&circle);
+    let club_rank = Some(computeClubRank(circle.monthly_rank, Some(points)));
     let rank = circle.monthly_rank;
 
-    let fans_to_next_tier = if let Some(boundary) = next_tier_boundary(rank, points) {
+    let fans_to_next_tier = if let Some(boundary) = nextTierBoundary(rank, points) {
         let boundary_points = if let Some((year, month, _)) = historical_month {
-            fetch_historical_boundary_points(&state.db, year, month, boundary, true).await?
+            fetchHistoricalBoundaryPoints(&state.db, year, month, boundary, true).await?
         } else {
-            fetch_boundary_points(&state.db, boundary).await?
+            fetchBoundaryPoints(&state.db, boundary).await?
         };
         match boundary_points {
             Some(bp) => Some((bp - points).max(0)),
@@ -569,11 +492,11 @@ pub async fn get_circle(
         Some(0) // Already at SS
     };
 
-    let fans_to_lower_tier = if let Some(boundary) = lower_tier_boundary(rank, points) {
+    let fans_to_lower_tier = if let Some(boundary) = lowerTierBoundary(rank, points) {
         let boundary_points = if let Some((year, month, _)) = historical_month {
-            fetch_historical_boundary_points(&state.db, year, month, boundary, false).await?
+            fetchHistoricalBoundaryPoints(&state.db, year, month, boundary, false).await?
         } else {
-            fetch_boundary_points(&state.db, boundary).await?
+            fetchBoundaryPoints(&state.db, boundary).await?
         };
         match boundary_points {
             Some(bp) => Some((points - bp).max(0)),
@@ -593,18 +516,18 @@ pub async fn get_circle(
         let y_rank = circle.yesterday_rank;
         // Compare yesterday's points against today's tier, so crossing a tier line
         // does not make the displayed threshold appear to jump by an entire bracket.
-        let y_tier_gap_rank = historical_tier_gap_rank(rank, y_rank);
+        let y_tier_gap_rank = historicalTierGapRank(rank, y_rank);
 
-        let next = if let Some(boundary) = next_tier_boundary(y_tier_gap_rank, y_points) {
-            match fetch_boundary_points_yesterday(&state.db, boundary).await? {
+        let next = if let Some(boundary) = nextTierBoundary(y_tier_gap_rank, y_points) {
+            match fetchBoundaryPointsYesterday(&state.db, boundary).await? {
                 Some(bp) => Some((bp - y_points).max(0)),
                 None => Some(0),
             }
         } else {
             Some(0)
         };
-        let lower = if let Some(boundary) = lower_tier_boundary(y_tier_gap_rank, y_points) {
-            match fetch_boundary_points_yesterday(&state.db, boundary).await? {
+        let lower = if let Some(boundary) = lowerTierBoundary(y_tier_gap_rank, y_points) {
+            match fetchBoundaryPointsYesterday(&state.db, boundary).await? {
                 Some(bp) => Some((y_points - bp).max(0)),
                 None => Some(0),
             }
@@ -638,13 +561,13 @@ pub async fn get_circle(
 /// - year/month: Optional completed month; returns the same response shape from the archive
 ///
 /// Returns paginated list of circles
-pub async fn list_circles(
+pub async fn listCircles(
     Query(params): Query<CircleListParams>,
     State(state): State<AppState>,
 ) -> Result<Json<CircleListResponse>, AppError> {
     match (params.year, params.month) {
         (Some(year), Some(month)) => {
-            let current_month = current_game_month_start(Utc::now());
+            let current_month = currentGameMonthStart(Utc::now());
             let target_month = NaiveDate::from_ymd_opt(year, month as u32, 1)
                 .ok_or_else(|| AppError::BadRequest("invalid historical year/month".into()))?;
             if target_month > current_month {
@@ -653,7 +576,7 @@ pub async fn list_circles(
                 ));
             }
             if target_month < current_month {
-                return list_historical_circles(&state.db, &params, year, month).await;
+                return listHistoricalCircles(&state.db, &params, year, month).await;
             }
         }
         (None, None) => {}
@@ -700,7 +623,7 @@ pub async fn list_circles(
     // If search query is present, add MatchingCircles CTE to optimize search
     let mut join_matching_circles = String::new();
 
-    if let Some(search_sources) = params.query.as_deref().and_then(circle_search_sources_sql) {
+    if let Some(search_sources) = params.query.as_deref().and_then(circleSearchSourcesSql) {
         with_parts.push(format!("MatchingCircles AS ({search_sources})"));
         join_matching_circles =
             "INNER JOIN MatchingCircles mc ON c.circle_id = mc.circle_id".to_string();
@@ -712,20 +635,20 @@ pub async fn list_circles(
         format!("WITH {}", with_parts.join(", "))
     };
 
-    let points_column = effective_points_sql("c");
-    let rank_column = rank_column_sql("c", "lr.live_rank");
-    let name_column = disbanded_name_sql("c");
-    let monthly_point_column = display_monthly_point_sql("c");
-    let yesterday_points_column = display_yesterday_points_sql("c");
-    let yesterday_rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
-    let live_points_column = display_live_points_sql("c");
+    let points_column = effectivePointsSql("c");
+    let rank_column = rankColumnSql("c", "lr.live_rank");
+    let name_column = disbandedNameSql("c");
+    let monthly_point_column = displayMonthlyPointSql("c");
+    let yesterday_points_column = displayYesterdayPointsSql("c");
+    let yesterday_rank_column = displayYesterdayRankExprSql("c", "lr.live_yesterday_rank");
+    let live_points_column = displayLivePointsSql("c");
     let live_rank_expr = format!(
         "COALESCE({}, {})",
-        positive_rank_sql("lr.live_rank::int"),
-        positive_rank_sql("c.live_rank")
+        positiveRankSql("lr.live_rank::int"),
+        positiveRankSql("c.live_rank")
     );
-    let live_rank_column = display_live_rank_expr_sql(&live_rank_expr);
-    let last_live_update_column = display_last_live_update_sql("c");
+    let live_rank_column = displayLiveRankExprSql(&live_rank_expr);
+    let last_live_update_column = displayLastLiveUpdateSql("c");
     // Build dynamic query
     let count_rank_join = if params.max_rank.is_some() {
         "LEFT JOIN circle_live_ranks lr ON lr.circle_id = c.circle_id"
@@ -784,7 +707,7 @@ pub async fn list_circles(
 
     // Only show circles updated this month to ensure points are current
     // Use JST minus 2 days so the month flips at midnight JST on the 3rd (giving time for data collection)
-    conditions.push(current_circle_visibility_sql("c"));
+    conditions.push(currentCircleVisibilitySql("c"));
 
     // Name filter
     if let Some(name) = &params.name {
@@ -814,7 +737,7 @@ pub async fn list_circles(
     // Counts are identical across pages and change slowly. Keep them separate
     // from the row query so LIMIT/OFFSET can stop early, and cache the result
     // to avoid repeating the full count for pagination probes.
-    let count_cache_key = sql_cache_key("circle:list:count", &count_query);
+    let count_cache_key = sqlCacheKey("circle:list:count", &count_query);
     let total = if let Some(total) = crate::cache::get::<i64>(&count_cache_key) {
         total
     } else {
@@ -859,11 +782,8 @@ pub async fn list_circles(
     let circles_with_rank: Vec<CircleWithRank> = circles
         .into_iter()
         .map(|circle| {
-            let effective_points = effective_circle_points(&circle);
-            let club_rank = Some(compute_club_rank(
-                circle.monthly_rank,
-                Some(effective_points),
-            ));
+            let effective_points = effectiveCirclePoints(&circle);
+            let club_rank = Some(computeClubRank(circle.monthly_rank, Some(effective_points)));
             CircleWithRank { circle, club_rank }
         })
         .collect();
@@ -883,7 +803,7 @@ pub async fn list_circles(
     }))
 }
 
-async fn list_historical_circles(
+async fn listHistoricalCircles(
     pool: &PgPool,
     params: &CircleListParams,
     year: i32,
@@ -986,7 +906,7 @@ async fn list_historical_circles(
         .await?
         .into_iter()
         .map(|circle| CircleWithRank {
-            club_rank: Some(compute_club_rank(circle.monthly_rank, circle.monthly_point)),
+            club_rank: Some(computeClubRank(circle.monthly_rank, circle.monthly_point)),
             circle,
         })
         .collect();
@@ -1001,34 +921,7 @@ async fn list_historical_circles(
     }))
 }
 
-#[derive(Debug, Serialize)]
-pub struct RankThreshold {
-    pub rank_index: i32,
-    pub name: String,
-    pub ranking_from: Option<i32>,
-    pub ranking_to: Option<i32>,
-    pub current_min_fans: Option<i64>,
-    pub current_fans_per_day: Option<i64>,
-    pub yesterday_min_fans: Option<i64>,
-    pub yesterday_fans_per_day: Option<i64>,
-    pub daily_fans_delta: Option<i64>,
-    pub last_month_min_fans: Option<i64>,
-    pub last_month_fans_per_day: Option<i64>,
-    pub current_vs_last_month_delta: Option<i64>,
-}
-
-struct MonthProgress {
-    elapsed_days: i64,
-    yesterday_elapsed_days: i64,
-    previous_month_days: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RankThresholdsResponse {
-    pub thresholds: Vec<RankThreshold>,
-}
-
-fn month_progress_jst() -> MonthProgress {
+fn monthProgressJst() -> MonthProgress {
     let jst_offset = FixedOffset::east_opt(9 * 3600).unwrap();
     let now_jst = Utc::now().with_timezone(&jst_offset);
     let calendar_day = now_jst.day() as i64;
@@ -1052,7 +945,7 @@ fn month_progress_jst() -> MonthProgress {
     }
 }
 
-fn fans_per_day(total_fans: Option<i64>, days: i64) -> Option<i64> {
+fn fansPerDay(total_fans: Option<i64>, days: i64) -> Option<i64> {
     let total_fans = total_fans?;
     if days <= 0 || total_fans <= 0 {
         Some(0)
@@ -1061,12 +954,12 @@ fn fans_per_day(total_fans: Option<i64>, days: i64) -> Option<i64> {
     }
 }
 
-fn option_delta(current: Option<i64>, previous: Option<i64>) -> Option<i64> {
+fn optionDelta(current: Option<i64>, previous: Option<i64>) -> Option<i64> {
     Some(current? - previous?)
 }
 
 /// GET /api/v4/circles/rank-thresholds - Get the fan requirements for each circle rank tier
-pub async fn get_rank_thresholds(
+pub async fn getRankThresholds(
     State(state): State<AppState>,
 ) -> Result<Json<RankThresholdsResponse>, AppError> {
     let tiers: Vec<(&str, i32, Option<i32>, Option<i32>)> = vec![
@@ -1083,7 +976,7 @@ pub async fn get_rank_thresholds(
         ("D", 1, None, None),
     ];
 
-    let month_progress = month_progress_jst();
+    let month_progress = monthProgressJst();
     let mut thresholds = Vec::new();
 
     for (name, rank_index, ranking_from, ranking_to) in tiers {
@@ -1094,15 +987,15 @@ pub async fn get_rank_thresholds(
             daily_fans_delta,
             current_vs_last_month_delta,
         ) = if let Some(boundary) = ranking_to {
-            let current = fetch_boundary_points(&state.db, boundary).await?;
-            let yesterday = fetch_boundary_points_yesterday(&state.db, boundary).await?;
-            let last_month = fetch_boundary_points_last_month(&state.db, boundary).await?;
+            let current = fetchBoundaryPoints(&state.db, boundary).await?;
+            let yesterday = fetchBoundaryPointsYesterday(&state.db, boundary).await?;
+            let last_month = fetchBoundaryPointsLastMonth(&state.db, boundary).await?;
             (
                 current,
                 yesterday,
                 last_month,
-                option_delta(current, yesterday),
-                option_delta(current, last_month),
+                optionDelta(current, yesterday),
+                optionDelta(current, last_month),
             )
         } else {
             (None, None, None, None, None)
@@ -1114,15 +1007,15 @@ pub async fn get_rank_thresholds(
             ranking_from,
             ranking_to,
             current_min_fans,
-            current_fans_per_day: fans_per_day(current_min_fans, month_progress.elapsed_days),
+            current_fans_per_day: fansPerDay(current_min_fans, month_progress.elapsed_days),
             yesterday_min_fans,
-            yesterday_fans_per_day: fans_per_day(
+            yesterday_fans_per_day: fansPerDay(
                 yesterday_min_fans,
                 month_progress.yesterday_elapsed_days,
             ),
             daily_fans_delta,
             last_month_min_fans,
-            last_month_fans_per_day: fans_per_day(
+            last_month_fans_per_day: fansPerDay(
                 last_month_min_fans,
                 month_progress.previous_month_days,
             ),
@@ -1135,7 +1028,7 @@ pub async fn get_rank_thresholds(
 
 /// Convert a ranking position and monthly points to club rank index (1-11)
 /// 1=D, 2=D+, 3=C, 4=C+, 5=B, 6=B+, 7=A, 8=A+, 9=S, 10=S+, 11=SS
-fn compute_club_rank(rank: Option<i32>, monthly_point: Option<i64>) -> i32 {
+fn computeClubRank(rank: Option<i32>, monthly_point: Option<i64>) -> i32 {
     match rank {
         None | Some(..=0) => match monthly_point {
             None | Some(0) => 1,
@@ -1157,7 +1050,7 @@ fn compute_club_rank(rank: Option<i32>, monthly_point: Option<i64>) -> i32 {
 }
 
 /// Get the boundary rank for the next tier up (None if already SS)
-fn next_tier_boundary(rank: Option<i32>, points: i64) -> Option<i32> {
+fn nextTierBoundary(rank: Option<i32>, points: i64) -> Option<i32> {
     // D tier (0 points / unranked) -> next is D+ (rank 10000)
     if points == 0 || rank.is_none() {
         return Some(10000);
@@ -1178,7 +1071,7 @@ fn next_tier_boundary(rank: Option<i32>, points: i64) -> Option<i32> {
 
 /// Get the boundary rank for the lower tier (None if already at D)
 /// Returns the first rank of the tier below (i.e. the highest-ranked circle in that tier)
-fn lower_tier_boundary(rank: Option<i32>, points: i64) -> Option<i32> {
+fn lowerTierBoundary(rank: Option<i32>, points: i64) -> Option<i32> {
     if points == 0 || rank.is_none() {
         return None; // Already at D
     }
@@ -1197,17 +1090,14 @@ fn lower_tier_boundary(rank: Option<i32>, points: i64) -> Option<i32> {
     }
 }
 
-fn historical_tier_gap_rank(
-    current_rank: Option<i32>,
-    historical_rank: Option<i32>,
-) -> Option<i32> {
+fn historicalTierGapRank(current_rank: Option<i32>, historical_rank: Option<i32>) -> Option<i32> {
     current_rank
         .filter(|rank| *rank > 0)
         .or_else(|| historical_rank.filter(|rank| *rank > 0))
 }
 
 /// Fetch the effective current points of the circle at the given boundary rank
-async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
+async fn fetchBoundaryPoints(pool: &PgPool, boundary_rank: i32) -> Result<Option<i64>, AppError> {
     let cache_key = format!(
         "circle:boundary:current:{}:{boundary_rank}",
         Utc::now().date_naive()
@@ -1216,8 +1106,8 @@ async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Opti
         return Ok(points);
     }
 
-    let points_column = effective_points_sql("c");
-    let rank_column = rank_column_sql("c", "lr.live_rank");
+    let points_column = effectivePointsSql("c");
+    let rank_column = rankColumnSql("c", "lr.live_rank");
 
     let result: Option<Option<i64>> = sqlx::query_scalar(&format!(
         r#"
@@ -1243,7 +1133,7 @@ async fn fetch_boundary_points(pool: &PgPool, boundary_rank: i32) -> Result<Opti
 /// Fetch the monthly points at a historical tier boundary. For an upper-tier
 /// boundary we use the last rank still inside that tier; for a lower-tier
 /// boundary we use the first rank in the tier below.
-async fn fetch_historical_boundary_points(
+async fn fetchHistoricalBoundaryPoints(
     pool: &PgPool,
     year: i32,
     month: i32,
@@ -1278,7 +1168,7 @@ async fn fetch_historical_boundary_points(
 }
 
 /// Fetch the yesterday_points of the circle at the given boundary rank (using yesterday's rankings)
-async fn fetch_boundary_points_yesterday(
+async fn fetchBoundaryPointsYesterday(
     pool: &PgPool,
     boundary_rank: i32,
 ) -> Result<Option<i64>, AppError> {
@@ -1290,8 +1180,8 @@ async fn fetch_boundary_points_yesterday(
         return Ok(points);
     }
 
-    let points_column = display_yesterday_points_sql("c");
-    let rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
+    let points_column = displayYesterdayPointsSql("c");
+    let rank_column = displayYesterdayRankExprSql("c", "lr.live_yesterday_rank");
 
     let result: Option<Option<i64>> = sqlx::query_scalar(&format!(
         r#"
@@ -1315,7 +1205,7 @@ async fn fetch_boundary_points_yesterday(
 }
 
 /// Fetch the last_month_point of the circle at the given boundary rank.
-async fn fetch_boundary_points_last_month(
+async fn fetchBoundaryPointsLastMonth(
     pool: &PgPool,
     boundary_rank: i32,
 ) -> Result<Option<i64>, AppError> {
@@ -1348,20 +1238,20 @@ async fn fetch_boundary_points_last_month(
 }
 
 /// Fetch circle by ID
-async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, AppError> {
-    let rank_column = rank_column_sql("c", "lr.live_rank");
-    let name_column = disbanded_name_sql("c");
-    let monthly_point_column = display_monthly_point_sql("c");
-    let yesterday_points_column = display_yesterday_points_sql("c");
-    let yesterday_rank_column = display_yesterday_rank_expr_sql("c", "lr.live_yesterday_rank");
-    let live_points_column = display_live_points_sql("c");
+async fn fetchCircleById(pool: &PgPool, circle_id: i64) -> Result<Circle, AppError> {
+    let rank_column = rankColumnSql("c", "lr.live_rank");
+    let name_column = disbandedNameSql("c");
+    let monthly_point_column = displayMonthlyPointSql("c");
+    let yesterday_points_column = displayYesterdayPointsSql("c");
+    let yesterday_rank_column = displayYesterdayRankExprSql("c", "lr.live_yesterday_rank");
+    let live_points_column = displayLivePointsSql("c");
     let live_rank_expr = format!(
         "COALESCE({}, {})",
-        positive_rank_sql("lr.live_rank::int"),
-        positive_rank_sql("c.live_rank")
+        positiveRankSql("lr.live_rank::int"),
+        positiveRankSql("c.live_rank")
     );
-    let live_rank_column = display_live_rank_expr_sql(&live_rank_expr);
-    let last_live_update_column = display_last_live_update_sql("c");
+    let live_rank_column = displayLiveRankExprSql(&live_rank_expr);
+    let last_live_update_column = displayLastLiveUpdateSql("c");
 
     let circle = sqlx::query_as::<_, Circle>(&format!(
         r#"
@@ -1410,7 +1300,7 @@ async fn fetch_circle_by_id(pool: &PgPool, circle_id: i64) -> Result<Circle, App
 }
 
 /// Fetch all members and their fan counts for a circle
-async fn fetch_circle_members(
+async fn fetchCircleMembers(
     pool: &PgPool,
     circle_id: i64,
     year: Option<i32>,
@@ -1598,7 +1488,7 @@ async fn fetch_circle_members(
 }
 
 /// Add a viewer to the tasks queue for later fetching
-async fn add_viewer_to_tasks(pool: &PgPool, viewer_id: i64) -> Result<(), AppError> {
+async fn addViewerToTasks(pool: &PgPool, viewer_id: i64) -> Result<(), AppError> {
     // Insert into tasks table with viewer_id in task_data
     // account_id is for the worker that processes the task, so we leave it NULL
     sqlx::query(
@@ -1620,8 +1510,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn text_search_reuses_existing_indexed_rankings() {
-        let sql = circle_search_sources_sql("Sta").expect("search SQL");
+    fn textSearchReusesExistingIndexedRankings() {
+        let sql = circleSearchSourcesSql("Sta").expect("search SQL");
 
         assert!(sql.contains("FROM user_fan_rankings_monthly_current"));
         assert!(sql.contains("ILIKE '%Sta%'"));
@@ -1630,8 +1520,8 @@ mod tests {
     }
 
     #[test]
-    fn numeric_search_keeps_direct_indexable_lookups() {
-        let sql = circle_search_sources_sql(" 123 ").expect("search SQL");
+    fn numericSearchKeepsDirectIndexableLookups() {
+        let sql = circleSearchSourcesSql(" 123 ").expect("search SQL");
 
         assert!(sql.contains("circle_id = 123"));
         assert!(sql.contains("leader_viewer_id = 123"));
@@ -1640,36 +1530,36 @@ mod tests {
     }
 
     #[test]
-    fn yesterday_tier_gaps_are_anchored_to_current_rank() {
+    fn yesterdayTierGapsAreAnchoredToCurrentRank() {
         let current_rank = Some(501);
         let yesterday_rank = Some(484);
         let yesterday_points = 365_509_264;
 
-        let rank = historical_tier_gap_rank(current_rank, yesterday_rank);
+        let rank = historicalTierGapRank(current_rank, yesterday_rank);
 
         assert_eq!(rank, current_rank);
-        assert_eq!(next_tier_boundary(rank, yesterday_points), Some(500));
-        assert_eq!(lower_tier_boundary(rank, yesterday_points), Some(1001));
+        assert_eq!(nextTierBoundary(rank, yesterday_points), Some(500));
+        assert_eq!(lowerTierBoundary(rank, yesterday_points), Some(1001));
     }
 
     #[test]
-    fn yesterday_tier_gaps_fall_back_without_current_rank() {
-        let rank = historical_tier_gap_rank(None, Some(484));
+    fn yesterdayTierGapsFallBackWithoutCurrentRank() {
+        let rank = historicalTierGapRank(None, Some(484));
 
         assert_eq!(rank, Some(484));
-        assert_eq!(next_tier_boundary(rank, 365_509_264), Some(100));
-        assert_eq!(lower_tier_boundary(rank, 365_509_264), Some(501));
+        assert_eq!(nextTierBoundary(rank, 365_509_264), Some(100));
+        assert_eq!(lowerTierBoundary(rank, 365_509_264), Some(501));
     }
 
     #[test]
-    fn zero_ranks_are_treated_as_unranked() {
-        assert_eq!(compute_club_rank(Some(0), Some(0)), 1);
-        assert_eq!(compute_club_rank(Some(0), Some(1)), 2);
-        assert_eq!(historical_tier_gap_rank(Some(0), Some(484)), Some(484));
+    fn zeroRanksAreTreatedAsUnranked() {
+        assert_eq!(computeClubRank(Some(0), Some(0)), 1);
+        assert_eq!(computeClubRank(Some(0), Some(1)), 2);
+        assert_eq!(historicalTierGapRank(Some(0), Some(484)), Some(484));
     }
 
     #[test]
-    fn historical_rankings_use_the_same_tiers_as_live_circles() {
+    fn historicalRankingsUseTheSameTiersAsLiveCircles() {
         let cases = [
             (Some(1), Some(1), 11),
             (Some(100), Some(1), 9),
@@ -1679,13 +1569,13 @@ mod tests {
         ];
 
         for (rank, points, expected_rank) in cases {
-            let actual_rank = compute_club_rank(rank, points);
+            let actual_rank = computeClubRank(rank, points);
             assert_eq!(actual_rank, expected_rank);
         }
     }
 
     #[test]
-    fn ranking_migration_uses_monthly_summaries_instead_of_raw_arrays() {
+    fn rankingMigrationUsesMonthlySummariesInsteadOfRawArrays() {
         let migration =
             include_str!("../../migrations/20260711000000_optimize_fan_and_circle_rankings.sql");
         let alltime_definition = migration
@@ -1703,23 +1593,23 @@ mod tests {
     }
 
     #[test]
-    fn displayed_live_points_do_not_require_raw_live_rank() {
-        let sql = display_live_points_sql("c");
+    fn displayedLivePointsDoNotRequireRawLiveRank() {
+        let sql = displayLivePointsSql("c");
 
         assert!(sql.contains("c.live_points <= 0"));
         assert!(!sql.contains("c.live_rank"));
     }
 
     #[test]
-    fn effective_points_use_live_points_without_raw_live_rank() {
-        let sql = effective_points_sql("c");
+    fn effectivePointsUseLivePointsWithoutRawLiveRank() {
+        let sql = effectivePointsSql("c");
 
         assert!(sql.contains("c.live_points > 0"));
         assert!(!sql.contains("c.live_rank > 0 AND c.live_points > 0"));
     }
 
     #[test]
-    fn circle_rollover_is_limited_to_second_through_third_jst() {
+    fn circleRolloverIsLimitedToSecondThroughThirdJst() {
         let august_1 = DateTime::parse_from_rfc3339("2026-08-01T14:59:59Z")
             .expect("valid timestamp")
             .with_timezone(&Utc);
@@ -1730,21 +1620,18 @@ mod tests {
             .expect("valid timestamp")
             .with_timezone(&Utc);
 
-        assert!(!is_rollover_display_window(august_1));
-        assert!(is_rollover_display_window(august_2_start));
-        assert!(!is_rollover_display_window(august_3_start));
+        assert!(!isRolloverDisplayWindow(august_1));
+        assert!(isRolloverDisplayWindow(august_2_start));
+        assert!(!isRolloverDisplayWindow(august_3_start));
         assert_eq!(
-            current_game_month_start(august_1),
+            currentGameMonthStart(august_1),
             NaiveDate::from_ymd_opt(2026, 7, 1).expect("valid date")
         );
         assert_eq!(
-            current_game_month_start(august_2_start),
+            currentGameMonthStart(august_2_start),
             NaiveDate::from_ymd_opt(2026, 8, 1).expect("valid date")
         );
-        assert_eq!(
-            rollover_start_utc(august_2_start),
-            august_2_start.naive_utc()
-        );
+        assert_eq!(rolloverStartUtc(august_2_start), august_2_start.naive_utc());
 
         let migration =
             include_str!("../../migrations/20260801000000_use_api_clock_for_circle_rollover.sql");

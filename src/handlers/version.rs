@@ -4,28 +4,10 @@ use sqlx::FromRow;
 
 use crate::AppState;
 
-#[derive(Debug, Serialize, FromRow)]
-pub struct MasterVersion {
-    pub app_version: String,
-    pub resource_version: String,
-    pub updated_at: chrono::NaiveDateTime,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VersionResponse {
-    pub app_version: String,
-    pub resource_version: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct VersionHistoryResponse {
-    pub current: VersionResponse,
-    pub history: Vec<VersionResponse>,
-}
+include!("../types/handlers/version.rs");
 
 /// Handler for GET /api/ver - returns the latest app & resource versions from the database
-pub async fn get_version(
+pub async fn getVersion(
     State(state): State<AppState>,
 ) -> Result<Json<VersionResponse>, StatusCode> {
     let row: MasterVersion = sqlx::query_as(
@@ -44,7 +26,7 @@ pub async fn get_version(
 }
 
 /// Handler for GET /api/ver/history - returns the latest version plus full history
-pub async fn get_version_history(
+pub async fn getVersionHistory(
     State(state): State<AppState>,
 ) -> Result<Json<VersionHistoryResponse>, StatusCode> {
     let rows: Vec<MasterVersion> = sqlx::query_as(

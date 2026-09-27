@@ -18,19 +18,7 @@ use sqlx::PgPool;
 use tokio::sync::{broadcast, Mutex};
 use tracing::{error, info, warn};
 
-#[derive(Debug, Clone)]
-pub struct TaskCompletion {
-    pub task_id: i32,
-    pub status: String,
-}
-
-/// Per-task fan-out channels. We hand each subscriber a `broadcast::Receiver`
-/// so multiple SSE connections waiting on the same task all get notified
-/// (useful in dev when the dialog is opened twice).
-#[derive(Clone)]
-pub struct TaskNotifier {
-    inner: Arc<Mutex<HashMap<i32, broadcast::Sender<TaskCompletion>>>>,
-}
+include!("types/notify.rs");
 
 impl TaskNotifier {
     pub fn new() -> Self {
@@ -74,10 +62,10 @@ impl Default for TaskNotifier {
 
 /// Spawn a background task that maintains a Postgres LISTEN connection and
 /// forwards notifications to the supplied `TaskNotifier`. Reconnects on error.
-pub fn spawn_listener(database_url: String, notifier: TaskNotifier) {
+pub fn spawnListener(database_url: String, notifier: TaskNotifier) {
     tokio::spawn(async move {
         loop {
-            match run_listener(&database_url, &notifier).await {
+            match runListener(&database_url, &notifier).await {
                 Ok(()) => warn!("task_completion listener exited cleanly; reconnecting"),
                 Err(e) => error!("task_completion listener error: {e}; reconnecting in 5s"),
             }
@@ -86,7 +74,7 @@ pub fn spawn_listener(database_url: String, notifier: TaskNotifier) {
     });
 }
 
-async fn run_listener(database_url: &str, notifier: &TaskNotifier) -> sqlx::Result<()> {
+async fn runListener(database_url: &str, notifier: &TaskNotifier) -> sqlx::Result<()> {
     // Use a small dedicated pool — PgListener takes ownership of one connection
     // and never returns it.
     let connect_options =
