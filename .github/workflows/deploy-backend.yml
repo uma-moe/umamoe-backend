@@ -334,7 +334,8 @@ jobs:
 
           docker run "${docker_args[@]}" "$image_tag"
 
-          for _ in $(seq 1 45); do
+          # Allow startup migrations up to 15 minutes, plus health-check time.
+          for _ in $(seq 1 480); do
             running="$(docker inspect --format '{{.State.Running}}' "$new_container" 2>/dev/null || true)"
             health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$new_container" 2>/dev/null || true)"
 
@@ -671,7 +672,8 @@ jobs:
 
           docker run "${docker_args[@]}" "$image_tag"
 
-          for _ in $(seq 1 45); do
+          # Allow startup migrations up to 15 minutes, plus health-check time.
+          for _ in $(seq 1 480); do
             running="$(docker inspect --format '{{.State.Running}}' "$new_container" 2>/dev/null || true)"
             health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$new_container" 2>/dev/null || true)"
 
