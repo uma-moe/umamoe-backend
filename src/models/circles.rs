@@ -39,7 +39,7 @@ pub struct Circle {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CircleMemberFansMonthly {
-    pub id: i32,
+    pub id: i64,
     pub circle_id: i64,
     pub viewer_id: i64,
     pub trainer_name: Option<String>,

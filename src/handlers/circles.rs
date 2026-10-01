@@ -1433,7 +1433,7 @@ async fn fetch_circle_members(
 
     #[derive(sqlx::FromRow)]
     struct MemberRecord {
-        id: i32,
+        id: i64,
         circle_id: i64,
         viewer_id: i64,
         trainer_name: Option<String>,
@@ -1448,7 +1448,7 @@ async fn fetch_circle_members(
     let records = sqlx::query_as::<_, MemberRecord>(
         r#"
         SELECT 
-            cm.id,
+            cm.id::bigint AS id,
             cm.circle_id,
             cm.viewer_id,
             t.name as trainer_name,
@@ -1618,6 +1618,96 @@ async fn add_viewer_to_tasks(pool: &PgPool, viewer_id: i64) -> Result<(), AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires CIRCLE_MEMBER_TEST_DATABASE_URL pointing to local PostgreSQL"]
+    async fn circleMemberIdsSurviveIntegerSequenceExhaustion() -> anyhow::Result<()> {
+        let database_url = std::env::var("CIRCLE_MEMBER_TEST_DATABASE_URL")?;
+        let url = url::Url::parse(&database_url)?;
+        anyhow::ensure!(
+            matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
+            "this regression check requires a local database"
+        );
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        // Temporary relations shadow the real tables on this single connection.
+        sqlx::raw_sql(
+            r#"
+            CREATE TEMP TABLE circle_member_fans_monthly (
+                id SERIAL PRIMARY KEY, circle_id BIGINT NOT NULL,
+                viewer_id BIGINT NOT NULL, year INTEGER NOT NULL, month INTEGER NOT NULL,
+                daily_fans BIGINT[] NOT NULL, last_updated TIMESTAMP,
+                UNIQUE (circle_id, viewer_id, year, month)
+            );
+            CREATE TEMP TABLE trainer (account_id TEXT, name TEXT);
+            CREATE TEMP TABLE viewer_suspicion_scores (viewer_id BIGINT, suspicion_score INTEGER);
+            INSERT INTO circle_member_fans_monthly (id, circle_id, viewer_id, year, month, daily_fans)
+            VALUES (2147483647, 1, 10, 2026, 9, ARRAY[100]);
+            SELECT setval('pg_temp.circle_member_fans_monthly_id_seq', 2147483647);
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+        let upsert = "INSERT INTO circle_member_fans_monthly (circle_id, viewer_id, year, month, daily_fans) \
+            VALUES (1, 10, 2026, 9, ARRAY[200]), (1, 11, 2026, 9, ARRAY[300]) \
+            ON CONFLICT (circle_id, viewer_id, year, month) DO UPDATE SET daily_fans = EXCLUDED.daily_fans";
+        let error = sqlx::query(upsert).execute(&pool).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.code()).as_deref(),
+            Some("2200H")
+        );
+
+        // The new reader also works before the schema migration.
+        let members = fetch_circle_members(&pool, 1, Some(2026), Some(9)).await?;
+        assert_eq!(members[0].id, i64::from(i32::MAX));
+        let migration = include_str!("../../migrations/20261001000000_widen_circle_member_id.sql");
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(migration).execute(&mut *tx).await?;
+        tx.rollback().await?;
+        let (max_value, last_value): (i64, i64) = sqlx::query_as(
+            "SELECT s.seqmax, v.last_value FROM pg_sequence s \
+             CROSS JOIN pg_temp.circle_member_fans_monthly_id_seq v \
+             WHERE s.seqrelid = 'pg_temp.circle_member_fans_monthly_id_seq'::regclass",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            (max_value, last_value),
+            (i64::from(i32::MAX), i64::from(i32::MAX))
+        );
+
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(migration).execute(&mut *tx).await?;
+        tx.commit().await?;
+        sqlx::query(upsert).execute(&pool).await?;
+        let members = fetch_circle_members(&pool, 1, Some(2026), Some(9)).await?;
+        assert_eq!(members.len(), 2);
+        assert_eq!((members[0].id, members[0].daily_fans[0]), (2147483647, 200));
+        assert_eq!((members[1].id, members[1].daily_fans[0]), (2147483649, 300));
+        let json = serde_json::to_value(&members)?;
+        assert_eq!(json[1]["id"].as_i64(), Some(2147483649));
+        let decoded: Vec<CircleMemberFansMonthly> = serde_json::from_value(json)?;
+        assert_eq!(decoded[1].id, members[1].id);
+
+        // Reapplying must neither rewind nor retain an old explicit 32-bit cap.
+        sqlx::query("ALTER SEQUENCE pg_temp.circle_member_fans_monthly_id_seq MAXVALUE 2147483650")
+            .execute(&pool)
+            .await?;
+        let mut tx = pool.begin().await?;
+        sqlx::raw_sql(migration).execute(&mut *tx).await?;
+        tx.commit().await?;
+        let (max_value, next_value): (i64, i64) = sqlx::query_as(
+            "SELECT seqmax, nextval(seqrelid) FROM pg_sequence \
+             WHERE seqrelid = 'pg_temp.circle_member_fans_monthly_id_seq'::regclass",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!((max_value, next_value), (i64::MAX, 2147483650));
+        pool.close().await;
+        Ok(())
+    }
 
     #[test]
     fn text_search_reuses_existing_indexed_rankings() {

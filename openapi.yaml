@@ -271,6 +271,7 @@ components:
       properties:
         id:
           type: integer
+          format: int64
         circle_id:
           type: integer
           format: int64
