@@ -5,10 +5,10 @@ pub use crate::models::simulator::Simulator;
 use crate::{middleware::api_key, AppState};
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, FromRequest, Request, State},
+    extract::{DefaultBodyLimit, FromRequest, Path, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use sha2::{Digest, Sha256};
@@ -150,6 +150,26 @@ impl Simulator {
             }
         }
 
+        self.relay(request).await
+    }
+
+    /// One of the Skill Explorer's prebuilt files; `path` is checked by `explorerPath`. Only the
+    /// client's cached version is forwarded, so the simulator can answer 304.
+    async fn explorerFile(&self, path: &str, headers: &HeaderMap) -> Response {
+        let mut url = self.baseUrl.clone();
+        url.set_path(&format!("/sim/skill-explorer/{path}"));
+        let mut request = self.client.get(url);
+        for value in headers.get_all(header::IF_NONE_MATCH) {
+            request = request.header(header::IF_NONE_MATCH, value);
+        }
+
+        self.relay(request).await
+    }
+
+    /// Sends a request to the simulator and streams its answer back with its representation
+    /// headers. Responses are `no-store` unless the simulator sets their caching itself, as it
+    /// does for the Skill Explorer's files.
+    async fn relay(&self, request: reqwest::RequestBuilder) -> Response {
         let response = match request.send().await {
             Ok(response) => response,
             Err(err) => {
@@ -165,7 +185,8 @@ impl Simulator {
             }
         };
         let status = response.status();
-        if status.is_redirection() {
+        // 304 answers a cached explorer file's revalidation; any other 3xx is a redirect.
+        if status.is_redirection() && status != StatusCode::NOT_MODIFIED {
             return error(StatusCode::BAD_GATEWAY, "simulator returned a redirect");
         }
 
@@ -175,6 +196,8 @@ impl Simulator {
             header::CONTENT_ENCODING,
             header::VARY,
             header::RETRY_AFTER,
+            header::ETAG,
+            header::CACHE_CONTROL,
             header::HeaderName::from_static("server-timing"),
         ] {
             if let Some(value) = response.headers().get(&name) {
@@ -182,7 +205,9 @@ impl Simulator {
             }
         }
 
-        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if !headers.contains_key(header::CACHE_CONTROL) {
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
         if isEventStream(&headers) {
             // Set this here: the internal NGINX hop consumes upstream X-Accel headers.
             headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
@@ -196,10 +221,12 @@ impl Simulator {
 }
 
 /// The simulator's routes. `/race` and `/monte-carlo` accept game captures and `/batch`
-/// many races, which can be large; the simulator applies the same limits.
+/// many races, which can be large; the simulator applies the same limits. The Skill
+/// Explorer's files are public reads.
 pub fn routes() -> Router<AppState> {
     let large = || DefaultBodyLimit::max(8 * 1024 * 1024);
     Router::new()
+        .route("/api/sim/skill-explorer/*path", get(explorerFile))
         .route("/api/sim/race", post(proxy).layer(large()))
         .route("/api/sim/monte-carlo", post(proxy).layer(large()))
         .route("/api/sim/batch", post(proxy).layer(large()))
@@ -207,6 +234,41 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sim/optimize", post(proxy))
         .route("/api/sim/stamina", post(proxy))
         .layer(DefaultBodyLimit::max(256 * 1024))
+}
+
+/// The Skill Explorer's prebuilt files are public and cacheable: no key and no usage record.
+async fn explorerFile(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(simulator) = state.simulator.as_ref() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "simulator is not configured",
+        );
+    };
+    if !explorerPath(&path) {
+        return error(StatusCode::NOT_FOUND, "no such Skill Explorer file");
+    }
+
+    simulator.explorerFile(&path, &headers).await
+}
+
+/// Explorer files are named like `turf/medium/10506.json.gz`; anything else could reach
+/// another simulator route.
+fn explorerPath(path: &str) -> bool {
+    let Some(name) = path.strip_suffix(".json.gz") else {
+        return false;
+    };
+
+    name.len() <= 64
+        && name.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        })
 }
 
 async fn proxy(State(state): State<AppState>, request: Request) -> Response {
@@ -505,6 +567,68 @@ mod tests {
                 .status(),
             StatusCode::BAD_GATEWAY
         );
+        task.abort();
+    }
+
+    #[test]
+    fn explorerPathsStayUnderTheExplorer() {
+        for path in [
+            "index.json.gz",
+            "turf/medium.json.gz",
+            "turf/medium/10506.json.gz",
+        ] {
+            assert!(explorerPath(path), "{path}");
+        }
+
+        for path in [
+            "../metrics.json.gz",
+            "turf//medium.json.gz",
+            "turf/medium.json",
+            "Turf/medium.json.gz",
+            ".json.gz",
+        ] {
+            assert!(!explorerPath(path), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn explorerFilesKeepTheSimulatorsCaching() {
+        let app = Router::new().route(
+            "/sim/skill-explorer/*path",
+            get(|headers: HeaderMap| async move {
+                assert!(!headers.contains_key("x-api-key"));
+                let cached = [
+                    (header::ETAG, "\"v1\""),
+                    (header::CACHE_CONTROL, "public, max-age=600"),
+                ];
+                if headers.contains_key(header::IF_NONE_MATCH) {
+                    return (StatusCode::NOT_MODIFIED, cached).into_response();
+                }
+
+                (cached, [(header::CONTENT_TYPE, "application/gzip")], "gz").into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let simulator = Simulator::new(&format!("http://{address}"), "unused-keys.txt").unwrap();
+        let revalidation =
+            HeaderMap::from_iter([(header::IF_NONE_MATCH, HeaderValue::from_static("\"v1\""))]);
+
+        let file = simulator
+            .explorerFile("turf/medium.json.gz", &HeaderMap::new())
+            .await;
+        let current = simulator
+            .explorerFile("turf/medium.json.gz", &revalidation)
+            .await;
+
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(file.headers()[header::CONTENT_TYPE], "application/gzip");
+        assert_eq!(file.headers()[header::ETAG], "\"v1\"");
+        assert_eq!(file.headers()[header::CACHE_CONTROL], "public, max-age=600");
+        assert_eq!(current.status(), StatusCode::NOT_MODIFIED);
         task.abort();
     }
 
