@@ -3,19 +3,29 @@
 
 pub use crate::models::simulator::Simulator;
 use crate::{
-    middleware::{api_key, turnstile::TurnstileBrowser},
+    handlers::simulator_guard::{
+        cacheKey, routeShare, CacheKey, Refused, Run, SimulatorGuard, CACHE_ENTRY_BYTES,
+    },
+    middleware::{
+        api_key,
+        turnstile::{extract_client_ip, TurnstileBrowser},
+    },
     AppState,
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, FromRequest, Path, Request, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
-use std::time::{Duration, Instant};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 use tokio::io::AsyncReadExt;
 
 impl Simulator {
@@ -71,6 +81,7 @@ impl Simulator {
             client,
             baseUrl,
             allowedKeysFile,
+            guard: SimulatorGuard::fromEnv(),
         })
     }
 
@@ -136,7 +147,14 @@ impl Simulator {
         Ok(granted)
     }
 
-    async fn forward(&self, path: &str, headers: &HeaderMap, body: Bytes) -> Response {
+    /// Forwards a run and keeps a successful JSON answer under `key` for identical requests.
+    async fn forward(
+        &self,
+        path: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+        key: CacheKey,
+    ) -> Response {
         let mut url = self.baseUrl.clone();
         url.set_path(path);
         // Only forward representation headers and the client's User-Agent, which the
@@ -153,7 +171,7 @@ impl Simulator {
             }
         }
 
-        self.relay(request).await
+        self.relay(request, Some(key)).await
     }
 
     /// One of the Skill Explorer's prebuilt files; `path` is checked by `explorerPath`. Only the
@@ -166,14 +184,15 @@ impl Simulator {
             request = request.header(header::IF_NONE_MATCH, value);
         }
 
-        self.relay(request).await
+        self.relay(request, None).await
     }
 
     /// Sends a request to the simulator and streams its answer back with its representation
     /// headers. Responses are `no-store` unless the simulator sets their caching itself, as it
-    /// does for the Skill Explorer's files.
-    async fn relay(&self, request: reqwest::RequestBuilder) -> Response {
-        let response = match request.send().await {
+    /// does for the Skill Explorer's files. With `cache`, a successful answer that is not an
+    /// event stream is read whole and kept, unless it outgrows `CACHE_ENTRY_BYTES`.
+    async fn relay(&self, request: reqwest::RequestBuilder, cache: Option<CacheKey>) -> Response {
+        let mut response = match request.send().await {
             Ok(response) => response,
             Err(err) => {
                 tracing::warn!("Simulator request failed: {err}");
@@ -216,10 +235,35 @@ impl Simulator {
             headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
             headers.insert(header::VARY, HeaderValue::from_static("Accept"));
         }
-        let stream = futures::stream::try_unfold(response, |mut response| async {
+        let mut kept = Vec::new();
+        if let Some(key) = cache.filter(|_| status == StatusCode::OK && !isEventStream(&headers)) {
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        kept.extend_from_slice(&chunk);
+                        if kept.len() > CACHE_ENTRY_BYTES {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        let body = Bytes::from(kept);
+                        self.guard.store(key, &headers, body.clone());
+                        return (status, headers, body).into_response();
+                    }
+                    Err(err) => {
+                        tracing::warn!("Simulator answer failed: {err}");
+                        return error(StatusCode::BAD_GATEWAY, "simulator unavailable");
+                    }
+                }
+            }
+        }
+
+        // An answer that is not kept streams, starting with whatever was already read.
+        let read = futures::stream::iter((!kept.is_empty()).then(|| Ok(Bytes::from(kept))));
+        let rest = futures::stream::try_unfold(response, |mut response| async {
             Ok::<_, reqwest::Error>(response.chunk().await?.map(|chunk| (chunk, response)))
         });
-        (status, headers, Body::from_stream(stream)).into_response()
+        (status, headers, Body::from_stream(read.chain(rest))).into_response()
     }
 }
 
@@ -310,12 +354,36 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
         // The frontend answers this code with a Turnstile challenge and retries.
         return error(StatusCode::FORBIDDEN, "browser_proof_required");
     };
+    // Website users are limited by their address; API keys are not limited.
+    let browser = match key {
+        Some(_) => None,
+        None => {
+            let address = request.extensions().get::<ConnectInfo<SocketAddr>>();
+            Some(extract_client_ip(
+                request.headers(),
+                address.map(|info| info.0),
+            ))
+        }
+    };
     let authMs = started.elapsed().as_secs_f64() * 1000.0;
     let path = request.uri().path().to_owned();
     let requestHeaders = request.headers().clone();
     let body = match Bytes::from_request(request, &state).await {
         Ok(body) => body,
         Err(rejection) => return rejection.into_response(),
+    };
+    let answerKey = cacheKey(&path, &requestHeaders, &body);
+    let cached = simulator.guard.cached(&answerKey);
+    // A website user runs one request at a time and a few a minute on each route; resimulations
+    // and an identical request's cached answer cost no run.
+    let run = match (&cached, &browser, routeShare(&path)) {
+        (None, Some(address), Some(share)) => {
+            match simulator.guard.startRun(address, &path, share) {
+                Ok(run) => Some(run),
+                Err(refused) => return refusedRun(refused),
+            }
+        }
+        _ => None,
     };
     // Logging runs once and survives client disconnects; it must not hold SSE headers.
     let db = state.db.clone();
@@ -333,12 +401,50 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     });
     let forward = async {
         let started = Instant::now();
-        let response = simulator
-            .forward(path.strip_prefix("/api").unwrap(), &requestHeaders, body)
-            .await;
+        let response = match cached {
+            Some((mut headers, body)) => {
+                headers.insert("x-simulator-cache", HeaderValue::from_static("hit"));
+                (StatusCode::OK, headers, body).into_response()
+            }
+            None => {
+                let path = path.strip_prefix("/api").unwrap();
+                simulator
+                    .forward(path, &requestHeaders, body, answerKey)
+                    .await
+            }
+        };
         (response, started.elapsed().as_secs_f64() * 1000.0)
     };
-    finishProxyResponse(forward, usage, started, authMs).await
+    let response = finishProxyResponse(forward, usage, started, authMs).await;
+    match run {
+        Some(run) => holdUntilSent(response, run),
+        None => response,
+    }
+}
+
+/// A run that was not started: the user's last one is still going, or this minute's are used.
+fn refusedRun(refused: Refused) -> Response {
+    match refused {
+        Refused::Running => error(StatusCode::TOO_MANY_REQUESTS, "run_in_progress"),
+        Refused::TooMany { retryAfter } => {
+            let mut response = error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(retryAfter));
+            response
+        }
+    }
+}
+
+/// `response` holding `run` until its body is sent or dropped, so a streamed run counts until it
+/// ends.
+fn holdUntilSent(response: Response, run: Run) -> Response {
+    let (parts, body) = response.into_parts();
+    let body = body.into_data_stream().map(move |chunk| {
+        let _held = &run;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(body))
 }
 
 async fn finishProxyResponse(
@@ -560,6 +666,7 @@ mod tests {
                     HeaderValue::from_static("application/json"),
                 )]),
                 body.clone(),
+                [0; 32],
             )
             .await;
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -578,7 +685,7 @@ mod tests {
         );
         assert_eq!(
             simulator
-                .forward("/sim/optimize", &HeaderMap::new(), Bytes::new())
+                .forward("/sim/optimize", &HeaderMap::new(), Bytes::new(), [0; 32])
                 .await
                 .status(),
             StatusCode::BAD_GATEWAY
@@ -691,6 +798,7 @@ mod tests {
                     ),
                 ]),
                 Bytes::from_static(b"{}"),
+                [0; 32],
             )
             .await;
         assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
@@ -782,7 +890,12 @@ mod tests {
         let forward = async {
             (
                 simulator
-                    .forward("/sim/monte-carlo", &headers, Bytes::from_static(b"{}"))
+                    .forward(
+                        "/sim/monte-carlo",
+                        &headers,
+                        Bytes::from_static(b"{}"),
+                        [0; 32],
+                    )
                     .await,
                 1.0,
             )
@@ -972,6 +1085,78 @@ mod tests {
                 .unwrap(),
             "{\"exact\":1.00}"
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn aBrowserRunsOneAtATimeAndRepeatsComeFromTheCache() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let upstream = Router::new().route(
+            "/sim/optimize",
+            post({
+                let (calls, release) = (calls.clone(), release.clone());
+                move |body: Bytes| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    release.acquire().await.unwrap().forget();
+                    ([(header::CONTENT_TYPE, "application/json")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let app = routes().with_state(offlineState(&format!("http://{address}")));
+        let request = |body: &'static str| {
+            let mut request = Request::post("/api/sim/optimize")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(TurnstileBrowser);
+            request
+        };
+        let read = |response: Response| async move {
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+        };
+
+        let first = tokio::spawn(app.clone().oneshot(request("{\"seed\":1,\"mode\":\"cm\"}")));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = app.clone().oneshot(request("{\"seed\":2}")).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(read(second).await, "{\"error\":\"run_in_progress\"}");
+
+        release.add_permits(1);
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(!first.headers().contains_key("x-simulator-cache"));
+        assert_eq!(read(first).await, "{\"seed\":1,\"mode\":\"cm\"}");
+
+        // The same JSON in another order is answered without running again.
+        let repeat = app
+            .clone()
+            .oneshot(request("{ \"mode\": \"cm\", \"seed\": 1 }"))
+            .await
+            .unwrap();
+        assert_eq!(repeat.status(), StatusCode::OK);
+        assert_eq!(repeat.headers()["x-simulator-cache"], "hit");
+        assert_eq!(read(repeat).await, "{\"seed\":1,\"mode\":\"cm\"}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // The first run ended with its answer, so the browser may start another.
+        release.add_permits(1);
+        let next = app.oneshot(request("{\"seed\":3}")).await.unwrap();
+        assert_eq!(next.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         task.abort();
     }
 

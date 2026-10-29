@@ -1927,7 +1927,7 @@ fn expected_turnstile_action() -> String {
     std::env::var("TURNSTILE_ACTION").unwrap_or_else(|_| DEFAULT_TURNSTILE_ACTION.to_string())
 }
 
-fn extract_client_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> String {
+pub(crate) fn extract_client_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> String {
     if let Some(cf_ip) = header_str(headers, "CF-Connecting-IP") {
         return cf_ip.to_string();
     }
