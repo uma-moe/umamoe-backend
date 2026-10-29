@@ -2,7 +2,10 @@
 #![allow(non_snake_case)]
 
 pub use crate::models::simulator::Simulator;
-use crate::{middleware::api_key, AppState};
+use crate::{
+    middleware::{api_key, turnstile::TurnstileBrowser},
+    AppState,
+};
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, FromRequest, Path, Request, State},
@@ -220,13 +223,12 @@ impl Simulator {
     }
 }
 
-/// The simulator's routes. `/race` and `/monte-carlo` accept game captures and `/batch`
-/// many races, which can be large; the simulator applies the same limits. The Skill
-/// Explorer's files are public reads.
+/// The simulator's routes, served behind the API protection middleware so Turnstile-verified
+/// browsers pass. `/race` and `/monte-carlo` accept game captures and `/batch` many races,
+/// which can be large; the simulator applies the same limits.
 pub fn routes() -> Router<AppState> {
     let large = || DefaultBodyLimit::max(8 * 1024 * 1024);
     Router::new()
-        .route("/api/sim/skill-explorer/*path", get(explorerFile))
         .route("/api/sim/race", post(proxy).layer(large()))
         .route("/api/sim/monte-carlo", post(proxy).layer(large()))
         .route("/api/sim/batch", post(proxy).layer(large()))
@@ -234,6 +236,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sim/optimize", post(proxy))
         .route("/api/sim/stamina", post(proxy))
         .layer(DefaultBodyLimit::max(256 * 1024))
+}
+
+/// The Skill Explorer's files: public reads, served without the API protection middleware.
+pub fn explorerRoutes() -> Router<AppState> {
+    Router::new().route("/api/sim/skill-explorer/*path", get(explorerFile))
 }
 
 /// The Skill Explorer's prebuilt files are public and cacheable: no key and no usage record.
@@ -279,20 +286,29 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
             "simulator is not configured",
         );
     };
-    let rawKey = match simulator.allowedKey(request.headers()).await {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-    let key = match api_key::resolve_api_key(&state.db, rawKey).await {
-        Ok(Some(key)) => key,
-        Ok(None) => return error(StatusCode::UNAUTHORIZED, "invalid or revoked API key"),
-        Err(err) => {
-            tracing::warn!("Simulator API key lookup failed: {err}");
-            return error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authentication unavailable",
-            );
+    // API keys must be granted simulator access and have their usage recorded; browsers need a
+    // Turnstile-verified session, which the API protection middleware marks.
+    let key = if request.headers().contains_key("x-api-key") {
+        let rawKey = match simulator.allowedKey(request.headers()).await {
+            Ok(key) => key,
+            Err(response) => return response,
+        };
+        match api_key::resolve_api_key(&state.db, rawKey).await {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => return error(StatusCode::UNAUTHORIZED, "invalid or revoked API key"),
+            Err(err) => {
+                tracing::warn!("Simulator API key lookup failed: {err}");
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication unavailable",
+                );
+            }
         }
+    } else if request.extensions().get::<TurnstileBrowser>().is_some() {
+        None
+    } else {
+        // The frontend answers this code with a Turnstile challenge and retries.
+        return error(StatusCode::FORBIDDEN, "browser_proof_required");
     };
     let authMs = started.elapsed().as_secs_f64() * 1000.0;
     let path = request.uri().path().to_owned();
@@ -307,7 +323,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let endpoint = api_key::normalize_endpoint("POST", &path);
     let usage = tokio::spawn(async move {
         let started = Instant::now();
-        if !writesDisabled {
+        if let Some(key) = key.filter(|_| !writesDisabled) {
             if let Err(err) = api_key::record_api_key_usage(&db, &key, &endpoint).await {
                 tracing::warn!("Simulator usage recording failed: {err}");
             }
@@ -871,12 +887,12 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
-    async fn simulatorRoutesRequireAnApiKeyBeforeTouchingTheDatabase() {
+    /// State with a database that is never reached and the simulator at `url`.
+    fn offlineState(url: &str) -> AppState {
         let db = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .unwrap();
-        let state = AppState {
+        AppState {
             db,
             search_client: reqwest::Client::new(),
             search_url: String::new(),
@@ -884,11 +900,13 @@ mod tests {
             task_notifier: crate::notify::TaskNotifier::new(),
             redis_store: None,
             user_writes_disabled: false,
-            simulator: Some(Arc::new(
-                Simulator::new("http://127.0.0.1:1", "unused-keys.txt").unwrap(),
-            )),
-        };
-        let app = routes().with_state(state);
+            simulator: Some(Arc::new(Simulator::new(url, "unused-keys.txt").unwrap())),
+        }
+    }
+
+    #[tokio::test]
+    async fn simulatorRoutesRequireAKeyOrVerifiedBrowserBeforeTouchingTheDatabase() {
+        let app = routes().with_state(offlineState("http://127.0.0.1:1"));
         let post = |path: &str| {
             Request::post(path)
                 .header("content-type", "application/json")
@@ -904,7 +922,11 @@ mod tests {
             "/api/sim/stamina",
         ] {
             let response = app.clone().oneshot(post(path)).await.unwrap();
-            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(body, "{\"error\":\"browser_proof_required\"}", "{path}");
         }
 
         // The simulator removed these routes; they are not forwarded.
@@ -917,6 +939,40 @@ mod tests {
             let response = app.clone().oneshot(post(path)).await.unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn verifiedBrowsersReachTheSimulatorWithoutAKey() {
+        let upstream = Router::new().route(
+            "/sim/stamina",
+            post(|headers: HeaderMap, body: Bytes| async move {
+                assert!(!headers.contains_key("cookie"));
+                body
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let app = routes().with_state(offlineState(&format!("http://{address}")));
+        let mut request = Request::post("/api/sim/stamina")
+            .header("content-type", "application/json")
+            .header("cookie", "uma_browser_proof=must-not-forward")
+            .body(Body::from("{\"exact\":1.00}"))
+            .unwrap();
+        request.extensions_mut().insert(TurnstileBrowser);
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap(),
+            "{\"exact\":1.00}"
+        );
+        task.abort();
     }
 
     #[tokio::test]

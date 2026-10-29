@@ -561,8 +561,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_state(state.clone());
 
-    // Simulator routes enforce API-key grants and record usage themselves, exactly once.
+    // Simulator routes take Turnstile-verified browsers, or API keys whose grants they check and
+    // whose usage they record themselves, exactly once. The Skill Explorer's files are public.
     let simulator_routes = handlers::simulator::routes()
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::turnstile::api_protection_middleware,
+        ))
+        .merge(handlers::simulator::explorerRoutes())
         .layer(cors.clone())
         .with_state(state.clone());
 

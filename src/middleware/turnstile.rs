@@ -192,6 +192,12 @@ impl VerifiedBrowserProof {
     }
 }
 
+/// Request extension set by `api_protection_middleware` when a browser passed with a Turnstile
+/// proof or token, not a warmup proof or an API key. The simulator routes serve only these
+/// browsers and granted API keys.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TurnstileBrowser;
+
 #[derive(Debug)]
 enum TurnstileError {
     MissingSecret,
@@ -209,7 +215,7 @@ pub async fn api_protection_middleware(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     method: Method,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_string();
@@ -235,6 +241,10 @@ pub async fn api_protection_middleware(
                     &client_ip,
                     &authorization,
                 );
+            }
+
+            if authorization.proof_source.as_deref() == Some(BROWSER_PROOF_SOURCE_TURNSTILE) {
+                request.extensions_mut().insert(TurnstileBrowser);
             }
 
             let mut response = next.run(request).await;
