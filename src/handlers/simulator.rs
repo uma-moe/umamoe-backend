@@ -75,7 +75,8 @@ impl Simulator {
             .no_zstd()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(120))
+            // An optimize request answers only once its 20,000 races are done.
+            .timeout(Duration::from_secs(160))
             .build()?;
         Ok(Self {
             client,
