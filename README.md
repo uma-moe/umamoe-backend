@@ -76,6 +76,10 @@ SKIP_MIGRATIONS=false
    # The migrations will run automatically on startup
    # Or manually run: sqlx migrate run
    ```
+   The migrations build on an older base schema, so an empty database is not enough. For a
+   disposable local database with sample data, load `dev/demo-database.sql` into an empty one
+   (`psql -v ON_ERROR_STOP=1 -d uma_db -f dev/demo-database.sql`). The frontend's local stack
+   does this for you.
 
 4. **Start the server**
    ```bash
