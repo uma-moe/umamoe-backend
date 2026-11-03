@@ -1,6 +1,6 @@
 //! Keeps website users from flooding the simulator. Identical requests are answered from a short
 //! cache, and each website user runs one request at a time and, per route, a few a minute
-//! (`routeLimit`: a share of `SIMULATOR_RUNS_PER_MINUTE`, or a fixed few for the costliest).
+//! (`routeLimit`: a share of `SIMULATOR_RUNS_PER_MINUTE`, or a fixed number for the costliest).
 //! Authenticated API keys are not limited.
 #![allow(non_snake_case)]
 
@@ -28,8 +28,8 @@ const RUN_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_RUNS_PER_MINUTE: u32 = 8;
 
 /// A Skill Explorer build races about 1,500 times, 10–30 seconds of the simulator's workers: a
-/// website user values a few every ten minutes, however many runs a minute the other routes allow.
-const EXPLORER_BUILD_RUNS: u32 = 3;
+/// website user values 10 every ten minutes, however many runs a minute the other routes allow.
+const EXPLORER_BUILD_RUNS: u32 = 10;
 const EXPLORER_BUILD_WINDOW: Duration = Duration::from_secs(600);
 
 pub(crate) type CacheKey = [u8; 32];
@@ -346,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn explorerBuildsAllowAFewEveryTenMinutes() {
+    fn explorerBuildsHaveATenMinuteWindow() {
         const BUILD: &str = "/api/sim/skill-explorer-build";
         let guard = SimulatorGuard::new(100);
         let limit = routeLimit(BUILD).unwrap();
