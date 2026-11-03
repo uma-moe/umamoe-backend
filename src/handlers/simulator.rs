@@ -75,7 +75,7 @@ impl Simulator {
             .no_zstd()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(160))
             .build()?;
         Ok(Self {
             client,
