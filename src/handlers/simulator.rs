@@ -4,7 +4,7 @@
 pub use crate::models::simulator::Simulator;
 use crate::{
     handlers::simulator_guard::{
-        cacheKey, routeShare, CacheKey, Refused, Run, SimulatorGuard, CACHE_ENTRY_BYTES,
+        cacheKey, routeLimit, CacheKey, Refused, Run, SimulatorGuard, CACHE_ENTRY_BYTES,
     },
     middleware::{
         api_key,
@@ -279,6 +279,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sim/comparison", post(proxy))
         .route("/api/sim/optimize", post(proxy))
         .route("/api/sim/stamina", post(proxy))
+        .route("/api/sim/skill-explorer-build", post(proxy))
         .layer(DefaultBodyLimit::max(256 * 1024))
 }
 
@@ -374,11 +375,12 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     };
     let answerKey = cacheKey(&path, &requestHeaders, &body);
     let cached = simulator.guard.cached(&answerKey);
-    // A website user runs one request at a time and a few a minute on each route; resimulations
-    // and an identical request's cached answer cost no run.
-    let run = match (&cached, &browser, routeShare(&path)) {
-        (None, Some(address), Some(share)) => {
-            match simulator.guard.startRun(address, &path, share) {
+    // A website user runs one request at a time and a few a minute on each route (a few every ten
+    // minutes for Skill Explorer builds); resimulations and an identical request's cached answer
+    // cost no run.
+    let run = match (&cached, &browser, routeLimit(&path)) {
+        (None, Some(address), Some(limit)) => {
+            match simulator.guard.startRun(address, &path, limit) {
                 Ok(run) => Some(run),
                 Err(refused) => return refusedRun(refused),
             }
@@ -422,7 +424,7 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     }
 }
 
-/// A run that was not started: the user's last one is still going, or this minute's are used.
+/// A run that was not started: the user's last one is still going, or the route's window is used.
 fn refusedRun(refused: Refused) -> Response {
     match refused {
         Refused::Running => error(StatusCode::TOO_MANY_REQUESTS, "run_in_progress"),
@@ -1033,6 +1035,7 @@ mod tests {
             "/api/sim/comparison",
             "/api/sim/optimize",
             "/api/sim/stamina",
+            "/api/sim/skill-explorer-build",
         ] {
             let response = app.clone().oneshot(post(path)).await.unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
