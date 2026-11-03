@@ -1,6 +1,7 @@
 //! Keeps website users from flooding the simulator. Identical requests are answered from a short
 //! cache, and each website user runs one request at a time and, per route, a few a minute
-//! (`routeShare` of `SIMULATOR_RUNS_PER_MINUTE`). Authenticated API keys are not limited.
+//! (`routeLimit`: a share of `SIMULATOR_RUNS_PER_MINUTE`, or a fixed few for the costliest).
+//! Authenticated API keys are not limited.
 #![allow(non_snake_case)]
 
 use axum::{
@@ -25,6 +26,11 @@ const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 const RUN_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_RUNS_PER_MINUTE: u32 = 8;
+
+/// A Skill Explorer build races about 1,500 times, 10–30 seconds of the simulator's workers: a
+/// website user values a few every ten minutes, however many runs a minute the other routes allow.
+const EXPLORER_BUILD_RUNS: u32 = 3;
+const EXPLORER_BUILD_WINDOW: Duration = Duration::from_secs(600);
 
 pub(crate) type CacheKey = [u8; 32];
 
@@ -52,12 +58,22 @@ struct Cached {
     storedAt: Instant,
 }
 
+/// How many runs a website user may start on a route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteLimit {
+    /// `share` times `SIMULATOR_RUNS_PER_MINUTE` a minute.
+    PerMinute(u32),
+    /// `runs` in each `window`, whatever `SIMULATOR_RUNS_PER_MINUTE` allows.
+    Fixed { runs: u32, window: Duration },
+}
+
 /// Why a user's run was not started.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Refused {
     /// The user's previous run is still going.
     Running,
-    /// The user started every run this minute allows; the next may start in `retryAfter` seconds.
+    /// The user started every run the route's window allows; the next may start in `retryAfter`
+    /// seconds.
     TooMany { retryAfter: u64 },
 }
 
@@ -92,9 +108,14 @@ impl SimulatorGuard {
         Self::new(runsPerMinute)
     }
 
-    /// Starts `user`'s run on `path` unless one is still going or this minute's runs of the route,
-    /// `share` times `SIMULATOR_RUNS_PER_MINUTE`, are used up.
-    pub(crate) fn startRun(&self, user: &str, path: &str, share: u32) -> Result<Run, Refused> {
+    /// Starts `user`'s run on `path` unless one is still going or the runs `limit` allows in its
+    /// window are used up. With `SIMULATOR_RUNS_PER_MINUTE` 0 no route has a window.
+    pub(crate) fn startRun(
+        &self,
+        user: &str,
+        path: &str,
+        limit: RouteLimit,
+    ) -> Result<Run, Refused> {
         match self.running.entry(user.to_owned()) {
             Entry::Occupied(_) => return Err(Refused::Running),
             Entry::Vacant(slot) => {
@@ -110,6 +131,10 @@ impl SimulatorGuard {
             return Ok(run);
         }
 
+        let (allowed, length) = match limit {
+            RouteLimit::PerMinute(share) => (self.runsPerMinute.saturating_mul(share), RUN_WINDOW),
+            RouteLimit::Fixed { runs, window } => (runs, window),
+        };
         let now = Instant::now();
         if self.windows.len() > 10_000 {
             self.windows.retain(|_, window| window.resetAt > now);
@@ -120,14 +145,14 @@ impl SimulatorGuard {
             .entry(format!("{user} {path}"))
             .or_insert(RunWindow {
                 runs: 0,
-                resetAt: now + RUN_WINDOW,
+                resetAt: now + length,
             });
         if now >= window.resetAt {
             window.runs = 0;
-            window.resetAt = now + RUN_WINDOW;
+            window.resetAt = now + length;
         }
 
-        if window.runs >= self.runsPerMinute.saturating_mul(share) {
+        if window.runs >= allowed {
             let retryAfter = window
                 .resetAt
                 .saturating_duration_since(now)
@@ -195,17 +220,20 @@ impl SimulatorGuard {
     }
 }
 
-/// How many runs a minute a website user may start on `path`, as a multiple of
-/// `SIMULATOR_RUNS_PER_MINUTE`; None when the route is not limited at all.
-pub(crate) fn routeShare(path: &str) -> Option<u32> {
+/// How many runs a website user may start on `path`; None when the route is not limited at all.
+pub(crate) fn routeLimit(path: &str) -> Option<RouteLimit> {
     match path {
         // A resimulation replays one race, and a session replays its races one after another.
         "/api/sim/race" => None,
         // Skill impact compares 4 skills a request and team search sends its races in batches, so
         // one analysis sends several.
-        "/api/sim/comparison" | "/api/sim/batch" => Some(4),
+        "/api/sim/comparison" | "/api/sim/batch" => Some(RouteLimit::PerMinute(4)),
+        "/api/sim/skill-explorer-build" => Some(RouteLimit::Fixed {
+            runs: EXPLORER_BUILD_RUNS,
+            window: EXPLORER_BUILD_WINDOW,
+        }),
         // Monte Carlo, optimize and stamina: a request a click.
-        _ => Some(1),
+        _ => Some(RouteLimit::PerMinute(1)),
     }
 }
 
@@ -275,41 +303,64 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    const ONCE: RouteLimit = RouteLimit::PerMinute(1);
+    const FOUR: RouteLimit = RouteLimit::PerMinute(4);
+
     #[test]
     fn eachUserRunsOneAtATimeAndAFewAMinute() {
         const OPTIMIZE: &str = "/api/sim/optimize";
         let guard = SimulatorGuard::new(2);
-        let first = guard.startRun("ip:1", OPTIMIZE, 1).unwrap();
+        let first = guard.startRun("ip:1", OPTIMIZE, ONCE).unwrap();
         assert_eq!(
-            guard.startRun("ip:1", "/api/sim/stamina", 1).err(),
+            guard.startRun("ip:1", "/api/sim/stamina", ONCE).err(),
             Some(Refused::Running)
         );
-        let other = guard.startRun("ip:2", OPTIMIZE, 1).unwrap();
+        let other = guard.startRun("ip:2", OPTIMIZE, ONCE).unwrap();
         drop(first);
 
-        let second = guard.startRun("ip:1", OPTIMIZE, 1).unwrap();
+        let second = guard.startRun("ip:1", OPTIMIZE, ONCE).unwrap();
         drop(second);
-        match guard.startRun("ip:1", OPTIMIZE, 1).err() {
+        match guard.startRun("ip:1", OPTIMIZE, ONCE).err() {
             Some(Refused::TooMany { retryAfter }) => assert!((1..=60).contains(&retryAfter)),
             refused => panic!("expected the minute's limit, got {refused:?}"),
         }
 
         // A refused run holds no slot; each route and each user has its own minute.
         assert!(matches!(
-            guard.startRun("ip:1", OPTIMIZE, 1),
+            guard.startRun("ip:1", OPTIMIZE, ONCE),
             Err(Refused::TooMany { .. })
         ));
         for _ in 0..8 {
-            assert!(guard.startRun("ip:1", "/api/sim/comparison", 4).is_ok());
+            assert!(guard.startRun("ip:1", "/api/sim/comparison", FOUR).is_ok());
         }
 
-        assert!(guard.startRun("ip:1", "/api/sim/comparison", 4).is_err());
+        assert!(guard.startRun("ip:1", "/api/sim/comparison", FOUR).is_err());
         drop(other);
-        assert!(guard.startRun("ip:2", OPTIMIZE, 1).is_ok());
-        assert!(SimulatorGuard::new(0).startRun("ip:1", OPTIMIZE, 1).is_ok());
-        assert_eq!(routeShare("/api/sim/race"), None);
-        assert_eq!(routeShare("/api/sim/batch"), Some(4));
-        assert_eq!(routeShare(OPTIMIZE), Some(1));
+        assert!(guard.startRun("ip:2", OPTIMIZE, ONCE).is_ok());
+        assert!(SimulatorGuard::new(0)
+            .startRun("ip:1", OPTIMIZE, ONCE)
+            .is_ok());
+        assert_eq!(routeLimit("/api/sim/race"), None);
+        assert_eq!(routeLimit("/api/sim/batch"), Some(FOUR));
+        assert_eq!(routeLimit(OPTIMIZE), Some(ONCE));
+    }
+
+    #[test]
+    fn explorerBuildsAllowAFewEveryTenMinutes() {
+        const BUILD: &str = "/api/sim/skill-explorer-build";
+        let guard = SimulatorGuard::new(100);
+        let limit = routeLimit(BUILD).unwrap();
+        for _ in 0..EXPLORER_BUILD_RUNS {
+            drop(guard.startRun("ip:1", BUILD, limit).unwrap());
+        }
+
+        match guard.startRun("ip:1", BUILD, limit).err() {
+            Some(Refused::TooMany { retryAfter }) => assert!((61..=600).contains(&retryAfter)),
+            refused => panic!("expected the build limit, got {refused:?}"),
+        }
+
+        // The other routes keep their own minute.
+        assert!(guard.startRun("ip:1", "/api/sim/optimize", ONCE).is_ok());
     }
 
     #[test]
