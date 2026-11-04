@@ -278,6 +278,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/sim/batch", post(proxy).layer(large()))
         .route("/api/sim/comparison", post(proxy))
         .route("/api/sim/optimize", post(proxy))
+        .route("/api/sim/field", post(proxy))
         .route("/api/sim/stamina", post(proxy))
         .route("/api/sim/skill-explorer-build", post(proxy))
         .layer(DefaultBodyLimit::max(256 * 1024))
@@ -1034,6 +1035,7 @@ mod tests {
             "/api/sim/batch",
             "/api/sim/comparison",
             "/api/sim/optimize",
+            "/api/sim/field",
             "/api/sim/stamina",
             "/api/sim/skill-explorer-build",
         ] {
