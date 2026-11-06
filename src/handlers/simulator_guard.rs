@@ -232,6 +232,8 @@ pub(crate) fn routeLimit(path: &str) -> Option<RouteLimit> {
             runs: EXPLORER_BUILD_RUNS,
             window: EXPLORER_BUILD_WINDOW,
         }),
+        // Drawing a field fetches a published CM room and adapts its builds: a request a click.
+        "/api/sim/field" => Some(RouteLimit::PerMinute(1)),
         // Monte Carlo, optimize and stamina: a request a click.
         _ => Some(RouteLimit::PerMinute(1)),
     }
@@ -343,6 +345,7 @@ mod tests {
         assert_eq!(routeLimit("/api/sim/race"), None);
         assert_eq!(routeLimit("/api/sim/batch"), Some(FOUR));
         assert_eq!(routeLimit(OPTIMIZE), Some(ONCE));
+        assert_eq!(routeLimit("/api/sim/field"), Some(ONCE));
     }
 
     #[test]
