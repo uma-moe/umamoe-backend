@@ -224,7 +224,8 @@ impl SimulatorGuard {
 pub(crate) fn routeLimit(path: &str) -> Option<RouteLimit> {
     match path {
         // A resimulation replays one race, and a session replays its races one after another.
-        "/api/sim/race" => None,
+        // A field is drawn from rooms the simulator holds in memory, without racing or fetching.
+        "/api/sim/race" | "/api/sim/field" => None,
         // Skill impact compares 4 skills a request and team search sends its races in batches, so
         // one analysis sends several.
         "/api/sim/comparison" | "/api/sim/batch" => Some(RouteLimit::PerMinute(4)),
@@ -232,8 +233,6 @@ pub(crate) fn routeLimit(path: &str) -> Option<RouteLimit> {
             runs: EXPLORER_BUILD_RUNS,
             window: EXPLORER_BUILD_WINDOW,
         }),
-        // Drawing a field fetches a published CM room and adapts its builds: a request a click.
-        "/api/sim/field" => Some(RouteLimit::PerMinute(1)),
         // Monte Carlo, optimize and stamina: a request a click.
         _ => Some(RouteLimit::PerMinute(1)),
     }
@@ -345,7 +344,7 @@ mod tests {
         assert_eq!(routeLimit("/api/sim/race"), None);
         assert_eq!(routeLimit("/api/sim/batch"), Some(FOUR));
         assert_eq!(routeLimit(OPTIMIZE), Some(ONCE));
-        assert_eq!(routeLimit("/api/sim/field"), Some(ONCE));
+        assert_eq!(routeLimit("/api/sim/field"), None);
     }
 
     #[test]

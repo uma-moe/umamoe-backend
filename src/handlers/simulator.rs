@@ -377,8 +377,8 @@ async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let answerKey = cacheKey(&path, &requestHeaders, &body);
     let cached = simulator.guard.cached(&answerKey);
     // A website user runs one request at a time and a few a minute on each route (a few every ten
-    // minutes for Skill Explorer builds); resimulations and an identical request's cached answer
-    // cost no run.
+    // minutes for Skill Explorer builds); resimulations, field draws and an identical request's
+    // cached answer cost no run.
     let run = match (&cached, &browser, routeLimit(&path)) {
         (None, Some(address), Some(limit)) => {
             match simulator.guard.startRun(address, &path, limit) {
