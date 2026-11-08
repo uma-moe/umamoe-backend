@@ -268,14 +268,15 @@ impl Simulator {
 }
 
 /// The simulator's routes, served behind the API protection middleware so Turnstile-verified
-/// browsers pass. `/race` and `/monte-carlo` accept game captures and `/batch` many races,
-/// which can be large; the simulator applies the same limits.
+/// browsers pass. `/race`, `/monte-carlo` and `/skill-impact` accept game captures and `/batch`
+/// many races, which can be large; the simulator applies the same limits.
 pub fn routes() -> Router<AppState> {
     let large = || DefaultBodyLimit::max(8 * 1024 * 1024);
     Router::new()
         .route("/api/sim/race", post(proxy).layer(large()))
         .route("/api/sim/monte-carlo", post(proxy).layer(large()))
         .route("/api/sim/batch", post(proxy).layer(large()))
+        .route("/api/sim/skill-impact", post(proxy).layer(large()))
         .route("/api/sim/comparison", post(proxy))
         .route("/api/sim/optimize", post(proxy))
         .route("/api/sim/field", post(proxy))
@@ -1033,6 +1034,7 @@ mod tests {
             "/api/sim/race",
             "/api/sim/monte-carlo",
             "/api/sim/batch",
+            "/api/sim/skill-impact",
             "/api/sim/comparison",
             "/api/sim/optimize",
             "/api/sim/field",
@@ -1272,6 +1274,7 @@ mod tests {
             ("/api/sim/race", 300_000, StatusCode::OK),
             ("/api/sim/monte-carlo", 300_000, StatusCode::OK),
             ("/api/sim/batch", 300_000, StatusCode::OK),
+            ("/api/sim/skill-impact", 300_000, StatusCode::OK),
             (
                 "/api/sim/batch",
                 8 * 1024 * 1024 + 1,
