@@ -15,6 +15,7 @@ use tokio::sync::Semaphore;
 use crate::{
     errors::AppError,
     models::{Circle, CircleMemberFansMonthly},
+    name_search::name_contains_regex,
     AppState,
 };
 
@@ -109,19 +110,19 @@ fn circle_search_sources_sql(query: &str) -> Option<String> {
         ));
     }
 
-    let search_pattern = format!("%{}%", query.replace("'", "''"));
+    let search_regex = name_contains_regex(query).replace('\'', "''");
     let circle_visibility = current_circle_visibility_sql("circle");
     Some(format!(
         r#"
         SELECT circle.circle_id
         FROM circles circle
-        WHERE circle.name ILIKE '{search_pattern}'
+        WHERE circle.name ~* '{search_regex}'
           AND {circle_visibility}
         UNION
         SELECT circle.circle_id
         FROM circles circle
         JOIN trainer leader ON leader.account_id = circle.leader_viewer_id::text
-        WHERE leader.name ILIKE '{search_pattern}'
+        WHERE leader.name ~* '{search_regex}'
           AND {circle_visibility}
         UNION
         SELECT rankings.circle_id
@@ -130,7 +131,7 @@ fn circle_search_sources_sql(query: &str) -> Option<String> {
             FROM user_fan_rankings_monthly_current
             WHERE year = extract(year from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
               AND month = extract(month from (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Tokyo') - interval '2 days')::int
-              AND trainer_name ILIKE '{search_pattern}'
+              AND trainer_name ~* '{search_regex}'
               AND circle_id IS NOT NULL
         ) rankings
         JOIN circles circle ON circle.circle_id = rankings.circle_id
@@ -788,7 +789,8 @@ pub async fn list_circles(
 
     // Name filter
     if let Some(name) = &params.name {
-        conditions.push(format!("c.name ILIKE '%{}%'", name.replace("'", "''")));
+        let name_regex = name_contains_regex(name).replace('\'', "''");
+        conditions.push(format!("c.name ~* '{name_regex}'"));
     }
 
     // General Search Query - handled by CTE now, no extra conditions needed here
@@ -897,11 +899,11 @@ async fn list_historical_circles(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| format!("%{value}%"));
+        .map(name_contains_regex);
     let query = params.query.as_deref().map(str::trim).unwrap_or("");
     let query_id = query.parse::<i64>().ok();
     let query_pattern = if query.len() >= 2 && query_id.is_none() {
-        Some(format!("%{query}%"))
+        Some(name_contains_regex(query))
     } else {
         None
     };
@@ -918,9 +920,9 @@ async fn list_historical_circles(
     };
     let where_sql = r#"
         a.year = $1 AND a.month = $2
-        AND ($3::text IS NULL OR COALESCE(a.circle_name, c.name) ILIKE $3)
+        AND ($3::text IS NULL OR COALESCE(a.circle_name, c.name) ~* $3)
         AND ($4::bigint IS NULL OR a.circle_id = $4)
-        AND ($5::text IS NULL OR COALESCE(a.circle_name, c.name) ILIKE $5)
+        AND ($5::text IS NULL OR COALESCE(a.circle_name, c.name) ~* $5)
         AND ($6::int IS NULL OR a.member_count >= $6)
         AND ($7::int IS NULL OR a.rank <= $7)
     "#;
@@ -1714,7 +1716,7 @@ mod tests {
         let sql = circle_search_sources_sql("Sta").expect("search SQL");
 
         assert!(sql.contains("FROM user_fan_rankings_monthly_current"));
-        assert!(sql.contains("ILIKE '%Sta%'"));
+        assert!(sql.contains("~* 'Sta'"));
         assert!(!sql.contains("circle_member_fans_monthly"));
         assert!(!sql.contains("circle_search_documents"));
     }

@@ -12,6 +12,7 @@ use crate::{
         AlltimeRankingsResponse, GainsRankingsResponse, MonthlyRankingsResponse,
         UserFanRankingAlltime, UserFanRankingGains, UserFanRankingMonthly,
     },
+    name_search::name_contains_regex,
     AppState,
 };
 
@@ -399,8 +400,8 @@ pub async fn get_gains_rankings(
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// Parse an optional search query into a SQL condition fragment + typed value.
-/// Matches viewer_id (exact), trainer_name (ILIKE), or circle_name (ILIKE).
-/// Reuses the same bind param for both ILIKE checks via OR.
+/// Matches viewer_id (exact), trainer_name, or circle_name (width-insensitive regex).
+/// Reuses the same bind param for both name checks via OR.
 fn parse_search_query(
     query: &Option<String>,
     param: &str,
@@ -411,10 +412,10 @@ fn parse_search_query(
             if let Ok(id) = q.parse::<i64>() {
                 return (format!("r.viewer_id = {}", param), Some(id), None);
             } else if q.len() >= 2 {
-                let pat = format!("%{}%", q.replace('\'', "''"));
+                let pat = name_contains_regex(q);
                 return (
                     format!(
-                        "(r.trainer_name ILIKE {} OR r.circle_name ILIKE {})",
+                        "(r.trainer_name ~* {} OR r.circle_name ~* {})",
                         param, param
                     ),
                     None,

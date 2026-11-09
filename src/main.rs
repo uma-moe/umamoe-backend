@@ -22,6 +22,7 @@ mod errors;
 mod handlers;
 mod middleware;
 mod models;
+mod name_search;
 mod notify;
 mod redis_store;
 

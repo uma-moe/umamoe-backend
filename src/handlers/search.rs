@@ -4,6 +4,7 @@ use sqlx::{Postgres, QueryBuilder, Row};
 use crate::{
     errors::Result,
     models::{Inheritance, SearchResponse, SupportCard, UnifiedAccountRecord, UnifiedSearchParams},
+    name_search::name_contains_regex,
     AppState,
 };
 
@@ -881,8 +882,8 @@ async fn execute_search_query(
     }
 
     if let Some(trainer_name) = &params.trainer_name {
-        query_builder.push(" AND t.name ILIKE ");
-        query_builder.push_bind(format!("%{}%", trainer_name));
+        query_builder.push(" AND t.name ~* ");
+        query_builder.push_bind(name_contains_regex(trainer_name));
     }
 
     if !params.main_parent_id.is_empty() {
@@ -1708,8 +1709,8 @@ async fn execute_count_query(state: &AppState, params: &UnifiedSearchParams) -> 
     // Note: trainer_id already applied above, skipping duplicate
 
     if let Some(trainer_name) = &params.trainer_name {
-        query_builder.push(" AND t.name ILIKE ");
-        query_builder.push_bind(format!("%{}%", trainer_name));
+        query_builder.push(" AND t.name ~* ");
+        query_builder.push_bind(name_contains_regex(trainer_name));
     }
 
     if !params.main_parent_id.is_empty() {

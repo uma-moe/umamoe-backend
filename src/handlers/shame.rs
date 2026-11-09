@@ -16,6 +16,7 @@ use crate::{
     cache,
     cheat_analysis::{CareerRateBreakdown, SuspicionProbeMetrics, SUSPICIOUS_SCORE_THRESHOLD},
     errors::AppError,
+    name_search::{fold_name, name_contains_regex},
     AppState,
 };
 
@@ -1223,7 +1224,7 @@ async fn get_hall_of_shame(
             ));
         } else {
             where_clauses.push(format!(
-                "(s.trainer_name ILIKE ${0} OR s.circle_name ILIKE ${0})",
+                "(s.trainer_name ~* ${0} OR s.circle_name ~* ${0})",
                 bind_idx
             ));
         }
@@ -1297,7 +1298,7 @@ async fn get_hall_of_shame(
             let id: i64 = q.parse().unwrap_or(0);
             count_q = count_q.bind(id);
         } else {
-            count_q = count_q.bind(format!("%{}%", q));
+            count_q = count_q.bind(name_contains_regex(q));
         }
     }
     let total = count_q.fetch_one(&state.db).await?;
@@ -1310,7 +1311,7 @@ async fn get_hall_of_shame(
             let id: i64 = q.parse().unwrap_or(0);
             list_q = list_q.bind(id);
         } else {
-            list_q = list_q.bind(format!("%{}%", q));
+            list_q = list_q.bind(name_contains_regex(q));
         }
     }
     let entries = list_q.bind(limit).bind(offset).fetch_all(&state.db).await?;
@@ -1949,9 +1950,7 @@ impl ShameSnapshot {
         let query_numeric: Option<i64> = query
             .filter(|q| q.chars().all(|c| c.is_ascii_digit()))
             .and_then(|q| q.parse().ok());
-        let query_lower: Option<String> = query
-            .filter(|_| query_numeric.is_none())
-            .map(|q| q.to_lowercase());
+        let query_folded: Option<String> = query.filter(|_| query_numeric.is_none()).map(fold_name);
 
         let mut filtered: Vec<usize> = if sort_by.is_empty()
             && query.is_none()
@@ -1964,16 +1963,16 @@ impl ShameSnapshot {
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| e.suspicion_score >= min_score && e.days_observed >= min_days)
-                .filter(|(_, e)| match (&query_numeric, &query_lower) {
+                .filter(|(_, e)| match (&query_numeric, &query_folded) {
                     (Some(id), _) => e.viewer_id == *id || e.circle_id == Some(*id),
                     (_, Some(q)) => {
                         e.trainer_name
                             .as_deref()
-                            .map(|n| n.to_lowercase().contains(q))
+                            .map(|n| fold_name(n).contains(q))
                             .unwrap_or(false)
                             || e.circle_name
                                 .as_deref()
-                                .map(|n| n.to_lowercase().contains(q))
+                                .map(|n| fold_name(n).contains(q))
                                 .unwrap_or(false)
                     }
                     _ => true,
