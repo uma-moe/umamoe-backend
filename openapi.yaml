@@ -2200,6 +2200,14 @@ paths:
       tags: [System]
       summary: Get current server version
       operationId: getVersion
+      parameters:
+        - name: region
+          in: query
+          schema:
+            type: string
+            enum: [global, jp]
+            default: global
+          description: Game region the versions belong to
       responses:
         "200":
           description: Current version info
@@ -2217,6 +2225,14 @@ paths:
       summary: Get version history
       operationId: getVersionHistory
       description: Returns the current version as top-level fields and all previous versions in the history array.
+      parameters:
+        - name: region
+          in: query
+          schema:
+            type: string
+            enum: [global, jp]
+            default: global
+          description: Game region the versions belong to
       responses:
         "200":
           description: Current version with full history
