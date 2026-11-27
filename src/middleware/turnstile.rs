@@ -1675,7 +1675,7 @@ fn browser_rate_limit(method: &Method) -> u32 {
     }
 }
 
-fn check_rate_limit(key: String, limit: u32, window: Duration) -> Option<u64> {
+pub(crate) fn check_rate_limit(key: String, limit: u32, window: Duration) -> Option<u64> {
     if limit == 0 {
         return None;
     }
