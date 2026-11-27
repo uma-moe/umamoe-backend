@@ -13,5 +13,6 @@ pub mod sharing;
 pub mod simulator;
 pub mod simulator_guard;
 pub mod stats;
+pub mod suggestions;
 pub mod tasks;
 pub mod version;

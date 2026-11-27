@@ -119,7 +119,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Load environment variables
     dotenvy::dotenv().ok();
-    let simulator = Some(std::sync::Arc::new(handlers::simulator::Simulator::fromEnv()?));
+    let simulator = Some(std::sync::Arc::new(
+        handlers::simulator::Simulator::fromEnv()?,
+    ));
 
     // Database connection
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -573,6 +575,15 @@ async fn main() -> anyhow::Result<()> {
         .layer(cors.clone())
         .with_state(state.clone());
 
+    // Suggestions forward to a private Discord channel; the webhook URL stays on the server.
+    let suggestion_routes = handlers::suggestions::routes()
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::turnstile::api_protection_middleware,
+        ))
+        .layer(cors.clone())
+        .with_state(state.clone());
+
     let version_routes = version_api_routes()
         .layer(
             ServiceBuilder::new()
@@ -584,6 +595,7 @@ async fn main() -> anyhow::Result<()> {
     // Merge public and protected routes
     let app = version_routes
         .merge(simulator_routes)
+        .merge(suggestion_routes)
         .merge(open_routes)
         .merge(public_routes)
         .merge(protected_routes);
